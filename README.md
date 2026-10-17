@@ -160,7 +160,7 @@ on the development tree these patches were taken from.
 | | earlier release | 1017 | 1017 without the FP8 step | 1017, built from this repo |
 |---|---|---|---|---|
 | decode, Japanese prose, median tok/s | 30.01 | 30.62 | 30.76 | 31.26 |
-| prefill, 35,000 tokens: first / second prompt | 63.8 s / 44.5 s | 67.0 s / 51.1 s ¹ | 60.3 s / 44.4 s | 58.5 s / 47.4 s ² |
+| prefill, 35,000-token prompt, tok/s: first / second prompt | 549 / 786 | 522 / 685 ¹ | 580 / 788 | 598 / 738 ² |
 | mean NLL, 6,120 tokens of Japanese prose (24 × 256) | 3.0558 | 3.1369 | 3.1605 | 3.1557 |
 
 ¹ This launch came straight after copying the checkpoint onto the NVMe, with the page
