@@ -181,6 +181,18 @@ against the reference code, and not this measurement.
 The earlier release's NLL comes from different weights, so it is not a quality
 comparison between the releases.
 
+## Fixes from dsv41-flash-dual-epyc
+
+Two fixes by f-wunderlich for the earlier release's repo are in the tree patch here too:
+
+- **SM120 sparse MLA padding page** (dsv41-flash-dual-epyc#3). SGLang reserves
+  physical KV page 0 for padding, and FlashInfer maps index -1 to entry 0 before
+  it masks the score. The page-split scratch is persistent `torch.empty` storage,
+  so page 0 could hold NaN, and a masked NaN still reaches the attention output
+  through 0 × NaN. The page-split kernel now zeroes that page on every conversion.
+- **Zero resident experts with Marlin** (#2). `--kt-num-gpu-experts 0` no longer
+  asks Marlin to repack empty resident weights at load.
+
 ## Not done
 
 - The resident-expert placement (`placements/`) was recorded from the earlier

@@ -1,5 +1,5 @@
 diff --git a/python/sglang/kernels/ops/attention/flash_mla_sm120.py b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
-index 906d4aa2..3cb86e24 100644
+index 906d4aa2..1dcaec4c 100644
 --- a/python/sglang/kernels/ops/attention/flash_mla_sm120.py
 +++ b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
 @@ -246,6 +246,33 @@ def _flash_mla_sm120_prefill(
@@ -36,7 +36,29 @@ index 906d4aa2..3cb86e24 100644
      output = q2.new_empty((num_tokens, num_heads, head_dim_v), dtype=torch.bfloat16)
      out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=dev)
      _sparse_mla_sm120_paged_attention(
-@@ -449,6 +476,7 @@ def _split_kv_pages_to_64(
+@@ -391,6 +418,21 @@ def _page_split_kernel(
+     if page_idx >= N_pages:
+         return
+ 
++    # SGLang's paged allocator reserves page 0 for padding. FlashInfer maps
++    # negative indices to entry 0 before masking scores; a masked NaN value
++    # still poisons XV (0 * NaN). The touched-page optimization otherwise
++    # leaves this scratch page uninitialized, or copies dummy-token garbage.
++    # Clear it on every conversion, including captured replays, without an
++    # extra launch. Other sub-pages keep their existing conversion behavior.
++    # (dsv41-flash-dual-epyc#3)
++    if pid == 0:
++        sentinel = dst_ptr.to(tl.pointer_type(tl.uint64))
++        for start in tl.range(0, dst_stride0 // 8, BLOCK_SIZE):
++            offs = start + tl.arange(0, BLOCK_SIZE)
++            tl.store(sentinel + offs, tl.full((BLOCK_SIZE,), 0, tl.uint64),
++                     mask=offs < dst_stride0 // 8)
++        return
++
+     if HAS_MASK:
+         if tl.load(mask_ptr + page_idx) == 0:
+             return
+@@ -449,6 +491,7 @@ def _split_kv_pages_to_64(
      kv_u8: torch.Tensor,
      src_pbs: int,
      touched_indices: Optional[torch.Tensor] = None,
@@ -44,7 +66,7 @@ index 906d4aa2..3cb86e24 100644
  ) -> torch.Tensor:
      """Split pbs=N footer-format pages into pbs=64 footer-format pages.
  
-@@ -472,7 +500,7 @@ def _split_kv_pages_to_64(
+@@ -472,7 +515,7 @@ def _split_kv_pages_to_64(
      # Pre-allocated grow-only buffer for page-split output per device.
      dev = kv_u8.device
      buffers = get_resources().buffers
@@ -53,7 +75,7 @@ index 906d4aa2..3cb86e24 100644
      buf = buffers.get(key)
      if buf is None or buf.shape[0] < num_dst_pages:
          # The first allocation can happen under inference mode (autotune), but
-@@ -501,7 +529,7 @@ def _split_kv_pages_to_64(
+@@ -501,7 +544,7 @@ def _split_kv_pages_to_64(
      if use_mask:
          # Persistent per-device int8 mask, zeroed each call (cheap memset,
          # captured cleanly by CUDA graph). 1 = page is referenced this step.
@@ -895,7 +917,7 @@ index a1f0e7f0..bcd700b7 100644
  
          self._weight_loader_impl(
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 36c15cf1..584dc6d5 100644
+index 36c15cf1..4866bfb2 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -7,12 +7,14 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
@@ -1068,7 +1090,20 @@ index 36c15cf1..584dc6d5 100644
              )
  
      def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-@@ -255,7 +373,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -238,7 +356,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+             layer: The MoE layer module
+         """
+         # 1. Process GPU weights
+-        if hasattr(self.gpu_method, "process_weights_after_loading"):
++        # Empty resident weights need no GPU repacking; still load CPU experts below.
++        # (dsv41-flash-dual-epyc#2)
++        if self.num_gpu_experts > 0 and hasattr(
++            self.gpu_method, "process_weights_after_loading"
++        ):
+             self.gpu_method.process_weights_after_loading(layer)
+ 
+         # 2. Load CPU weights using KT wrapper
+@@ -255,7 +377,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                  .physical_to_logical_map_cpu[self.kt_config.layer_idx]
                  .contiguous()
              )
@@ -1088,7 +1123,7 @@ index 36c15cf1..584dc6d5 100644
  
      def create_moe_runner(
          self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
-@@ -297,6 +427,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -297,6 +431,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          topk_output = dispatch_output.topk_output
          topk_weights, topk_ids, _ = topk_output
  
@@ -1103,7 +1138,7 @@ index 36c15cf1..584dc6d5 100644
          # Submit forward task to CPU (non-blocking)
          self.wrapper.submit_forward(
              x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
-@@ -344,10 +482,55 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -344,10 +486,55 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
  
          x = dispatch_output.hidden_states
          topk_output = dispatch_output.topk_output
@@ -1161,7 +1196,7 @@ index 36c15cf1..584dc6d5 100644
  
          # Step 2: Prepare GPU computation by masking CPU expert IDs
          # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
-@@ -355,23 +538,69 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -355,23 +542,69 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
  
          # Create modified dispatch output for GPU computation
