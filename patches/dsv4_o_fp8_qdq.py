@@ -43,7 +43,9 @@ def _o_fp8_qdq_kernel(x_ptr, n_blocks, BLOCK: tl.constexpr, ROWS: tl.constexpr, 
         r = a / ulp  # exact: ulp is a power of two; r < 16
         r = (r + 12582912.0) - 12582912.0  # round half to even (1.5 * 2^23)
         q = r * ulp
-        q = tl.where(v.to(tl.int32, bitcast=True) < 0, -q, q)
+        # the sign by its bit: Triton's -q is 0 - q, which turns -0 into +0
+        sign = v.to(tl.int32, bitcast=True) & -2147483648
+        q = (q.to(tl.int32, bitcast=True) | sign).to(tl.float32, bitcast=True)
     y = q * s[:, None]
     tl.store(x_ptr + offs, y.to(x_ptr.dtype.element_ty), mask=mask)
 

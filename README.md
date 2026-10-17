@@ -1,19 +1,113 @@
 # DeepSeek-V4.1-Flash-1017 on SGLang + KTransformers (CPU/GPU hybrid inference)
 
-This repository adds support for
-[deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
-to an existing DeepSeek-V4.1-Flash setup on [SGLang](https://github.com/sgl-project/sglang)
-with [KTransformers](https://github.com/kvcache-ai/ktransformers). In that setup the
-routed experts run on the CPU through kt-kernel, and attention plus the hot experts
-run on the GPU.
+Run [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
+on one machine with a lot of RAM and ordinary GPUs. The 384 routed experts per layer
+run on the CPU in MXFP4 through [KTransformers](https://github.com/kvcache-ai/ktransformers)'
+kt-kernel. Attention, the hottest experts and the prefill run on the GPUs through
+[SGLang](https://github.com/sgl-project/sglang). The engram tables (about 200 GB) are
+read straight from the checkpoint on disk, with no extracted copy. The context is up
+to 1M tokens.
 
-If your machine already serves the earlier DeepSeek-V4.1-Flash this way, it can serve
-1017. The checkpoint has the same size, the same tensor layout, the same config and
-the same tokenizer. Only the weights are new. Running it correctly takes one small
-patch to SGLang. That patch is independent of the hardware: one or several GPUs, one
-or two CPU sockets, any tensor-parallel size.
+This repository is everything needed: patches against two public upstream commits, a
+setup script that builds them, a launcher that reads the machine it runs on, and tests.
 
-## The change: o in FP8 before `wo_a`
+```
+hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir /models/dsv41-1017
+MODEL=/models/dsv41-1017 ./setup.sh
+MODEL=/models/dsv41-1017 ./serve.sh
+```
+
+The server speaks SGLang's OpenAI-compatible API on port 8080. The same setup also
+serves the earlier DeepSeek-V4.1-Flash release: point `MODEL` at it.
+
+## What it needs
+
+- **RAM: a 512 GB class machine.** The server used 418 GiB, measured while running
+  1017:
+  - 313 GiB holds the MXFP4 CPU experts, on 2 MB pages.
+  - About 40 GiB is the rest of the shared memory: arena pages that ended up on 4 KB,
+    the prefill lend's mirror and the all-reduce buffers.
+  - Add the 8 GiB engram cache and the OS. 384 GB does not fit. 448 GB leaves no room
+    for the page cache the load passes through.
+
+  The launcher makes one expert pool per NUMA node and uses every physical core.
+  kt-kernel is built for the CPU it is built on (`CPUINFER_CPU_INSTRUCT=NATIVE`). Its
+  MXFP4 kernels need AVX2.
+- **VRAM: two 16 GB cards, nearly full, with the defaults.** Per card (tensor
+  parallel 2):
+  - 9.9 GB of weights: half of attention and the other dense layers, plus 5 resident
+    experts a layer.
+  - 1.9 GB for the 1M-token KV pool.
+  - 0.3 GB of CUDA graphs.
+  - 2.7 GB left for prefill work: the streamed experts' buffers and a 0.5 GB CUTLASS
+    workspace.
+
+  One GPU holds all of the dense part and the whole KV pool itself. By estimate, that
+  needs about 24 GB at a 1M context. A single 16 GB card might fit with
+  `KT_GPU_EXPERTS=0` and `SGLANG_CONTEXT_LENGTH` around 262144. Neither is measured.
+  `CUDA_VISIBLE_DEVICES` picks the GPUs, one tensor-parallel rank each.
+- **Disk: about 500 GB, NVMe.**
+  - The checkpoint is 476 GiB (510 GB).
+  - `.venv` is 8.6 GB and the upstream clones about 1 GB.
+  - The load runs at the drive's speed, and the engram rows are read from it during
+    inference, so a 1 TB NVMe drive is the practical choice.
+- **Software.** Linux, the CUDA toolkit (built and run with 13.1), git, gcc/g++, the
+  libnuma and hwloc headers (`libnuma-dev libhwloc-dev`), and `uv` or Python 3.12.
+  The Python packages are pinned in `requirements.txt` (torch 2.13 + cu130).
+- **Host settings.** Set these as root, persistently:
+  - `echo advise > /sys/kernel/mm/transparent_hugepage/shmem_enabled`. The expert
+    arenas want 2 MB pages; on 4 KB pages, pinning them takes most of an hour.
+  - `vm.min_free_kbytes = 8388608`. Without it, the CUDA JIT can hit a node-local OOM
+    while the experts fill the nodes.
+  - Swap off.
+
+## What setup.sh does
+
+1. Clones sgl-project/sglang at `1aa0e962` (the `dsv4.1` branch) and applies
+   `patches/sglang-dsv41-tree.patch`. The patch adds:
+   - the KTransformers expert wrapper's placement, streaming and lend paths
+   - host-memory all-reduce
+   - the KV pool on remappable memory (kv-vmm)
+   - the indexer and load fixes
+   - the 1017 step below
+2. Clones kvcache-ai/ktransformers at `95009ea` with its llama.cpp and pybind11
+   submodules, and applies `patches/kt-kernel-tree.patch` and
+   `patches/kt-kernel-llama-cpp.patch`.
+3. Creates `.venv` from `requirements.txt` and installs the patched SGLang.
+4. Builds kt-kernel for this CPU and the visible GPUs' compute capability, with
+   parallel expert loading (`patches/kt-kernel-load-prefetch.py`).
+5. Builds `engram-adapter/librow_store.so` and `build/libkv_vmm.so`.
+6. With `MODEL` set, writes the engram manifest from the checkpoint's headers
+   (`tools/make-engram-manifest.py`). It then runs the 1017 kernel's test on this GPU.
+
+Re-running skips the finished steps. If the libnuma or hwloc headers live outside the
+system paths, pass them in through `CPLUS_INCLUDE_PATH` and `LIBRARY_PATH`. CMake
+flags go in `CMAKE_ARGS`.
+
+## What serve.sh does
+
+At start it reads the GPUs, their compute capability, the NUMA nodes and the physical
+cores, and sets tensor parallelism, the CPU pools and the CUDA arch from them. The
+defaults are listed in the script. Each one can be overridden by the environment
+variable named next to it. Among them:
+
+- the prefill experts streamed to the GPU, in bf16
+- the resident experts through Marlin
+- a "hot lend": 16 more hot experts a layer kept in the KV pool's free pages outside
+  prefill, without taking any of the pool
+- a prefill chunk calibrated once, on the first launch of a setup (the server starts
+  one extra time for this)
+- FlashInfer autotune off, so outputs reproduce across launches
+
+Logs go to `logs/<model>/<timestamp>/`. `serve.sh --background` returns once the
+server process is started.
+
+The first launch in a new environment compiles SGLang's and FlashInfer's kernels. Here
+that took about 15 minutes, before the one-time chunk calibration. Later launches
+reuse the cache (`~/.cache/sglang-dsv41-1017`) and are ready in about 4 minutes, with
+the checkpoint on NVMe and loaded once before.
+
+## The 1017 change: o in FP8 before `wo_a`
 
 1017's reference inference code quantizes the attention output `o` to FP8 and back
 before the bf16 `wo_a` projection:
@@ -22,100 +116,83 @@ before the bf16 `wo_a` projection:
 act_quant(o, fp8_block_size, scale_fmt, scale_dtype, True)  # blocks of 32, power-of-two scales
 ```
 
-The earlier release did not have this step. The new weights (all 48 shards changed)
-were made with it, so a server that feeds `wo_a` an unrounded bf16 `o` runs 1017 off
-its own numerics. The step moves `o` by 1.8-2.6% (relative L2) in every layer.
+The earlier release did not have this step. The weights are new (all 48 shards
+changed) and were made with it. The step moves `o` by 1.8-2.6% (relative L2) in
+every layer.
 
 - `patches/dsv4_o_fp8_qdq.py`: an in-place Triton kernel. It is bit-exact against the
   checkpoint's own tilelang `act_quant`: 0 differing bf16 values at 1, 3, 37 and 4,096
   tokens (`tools/dsv4-o-fp8-qdq-test.py`).
-  - On sm89 and newer (RTX 40 / 50, Hopper, Blackwell), the e4m3 rounding uses the
-    hardware conversion.
-  - On Ampere and older (RTX 30, A100), Triton has no e4m3 type, so the kernel does
-    the same rounding in fp32 arithmetic. That emulation matches torch's
-    `float8_e4m3fn` cast bit for bit, signed zeros included, on 118,343,666 values:
-    every bf16 value at every power-of-two scale, plus random fp32
-    (`tools/e4m3-emulation-test.py`, runs on the CPU).
-- `patches/sglang-dsv4-o-fp8-qdq.py`: installs the kernel in an SGLang tree behind
-  `SGLANG_DSV4_O_FP8_QDQ_BLOCK=<n>` (0 or unset = off).
-  - It covers the bf16 / GGUF `wo_a` branch of `MQALayer` and the DSpark draft's
-    attention.
-  - The fp8 `wo_a` GEMM paths quantize `o` themselves and are left as they are. They
-    only run for checkpoints with 128 × 128 weight blocks; 1017's are 32 × 32, so
-    1017 always takes the bf16 path.
-  - It applies to SGLang's DeepSeek-V4.1 branch (sgl-project/sglang `dsv4.1`, at
-    `1aa0e962`), the tree KTransformers' kt-kernel runs inside here.
-- `tools/o-fp8-qdq-block.sh`: sourced by a launcher after it sets `$model`. It reads
-  the block size from the checkpoint's own `inference/model.py`. The step turns on for
-  1017 (block 32) and stays off for the earlier release, so one launcher serves both.
+  - On sm89 and newer, the e4m3 rounding uses the hardware conversion.
+  - On Ampere and older, Triton has no e4m3 type, so the kernel rounds in fp32
+    arithmetic. This emulation matches torch's `float8_e4m3fn` cast bit for bit,
+    signed zeros included, on 118,343,666 values (`tools/e4m3-emulation-test.py`).
+- The tree patch includes it, behind `SGLANG_DSV4_O_FP8_QDQ_BLOCK`.
+  `tools/o-fp8-qdq-block.sh` (sourced by `serve.sh`) reads the block size from the
+  checkpoint's own `inference/model.py`. The step therefore turns on for 1017 (block
+  32) and stays off for the earlier release.
+- `patches/sglang-dsv4-o-fp8-qdq.py` installs the same step in another SGLang tree on
+  its own. It applies to `dsv4.1` at `1aa0e962` unmodified.
 
-The step works at any tensor-parallel size. It touches one activation inside each
-attention layer, and its 32-value blocks lie inside a head (512 values), so splitting
-heads across GPUs never cuts a block. It runs on any CUDA GPU that Triton supports.
-ROCm is untested.
+It works the same at any tensor-parallel size. Its 32-value blocks lie inside a head
+(512 values), so splitting heads across GPUs never cuts a block.
 
 Everything else 1017 changes is in [docs/1017-changes.md](docs/1017-changes.md).
 None of it needs a server change:
-- The tokenizer and `config.json` are identical. The safetensors headers of the
-  engram shards are identical too, so an offset-based engram manifest carries over.
-- The reference indexer's `owns_k` fix does not apply to SGLang's port, which maps
-  index-key sources statically.
+- The tokenizer and `config.json` are identical.
+- The reference indexer's `owns_k` fix does not apply to SGLang's port.
 - The encoding changes only affect tool calls.
-- The card's sampling is `temperature` 1.0, `top_p` 1.0.
-
-## Using it
-
-1. Have a DeepSeek-V4.1-Flash setup on SGLang + KTransformers: SGLang's `dsv4.1`
-   branch with kt-kernel. Hardware needs are the same as for the earlier release, since the
-   checkpoint is the same size (476 GB on disk).
-2. Download the checkpoint:
-   `hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir <dir>`.
-3. Patch SGLang and check the kernel on your GPU:
-   ```
-   python patches/sglang-dsv4-o-fp8-qdq.py <sglang tree>
-   python tools/dsv4-o-fp8-qdq-test.py <dir>   # expects PASS; tilelang is optional
-   ```
-4. Start the server with `SGLANG_DSV4_O_FP8_QDQ_BLOCK=32` in its environment. A
-   launcher can instead source `tools/o-fp8-qdq-block.sh` after setting `$model`.
-   Then point `--model-path` (and kt-kernel's weight path) at the new directory.
-5. Sample at `temperature` 1.0, `top_p` 1.0. The checkpoint has no
-   `generation_config.json`, so these are already SGLang's defaults for a request
-   that sets neither.
+- The card's sampling is `temperature` 1.0, `top_p` 1.0. These are already SGLang's
+  defaults for a request that sets neither, since the checkpoint has no
+  `generation_config.json`.
 
 ## Results
 
-Measured on one machine, as an example (not a requirement):
-- 2 × AMD EPYC 7452
-- 512 GB DDR4
-- 2 × RTX 5070 Ti 16 GB
-- the checkpoint on NVMe
+One machine, as an example: 2 × AMD EPYC 7452 (Zen 2, AVX2), 512 GB DDR4, 2 × RTX
+5070 Ti 16 GB, the checkpoint on NVMe. It ran the `serve.sh` defaults: 5 resident
+experts a layer, a 1M-token context, one request at a time. Each column is one
+launch.
 
-The setup is SGLang `dsv4.1` + kt-kernel with MXFP4 CPU experts, 5 experts per layer
-resident on the GPUs, a 1M-token context and one request at a time. Each column is one
-launch, on the same day and with the same launcher.
+The last column was built from this repository alone: a new directory, a new venv,
+`setup.sh` cloning both upstreams from GitHub, then `serve.sh`. The other columns ran
+on the development tree these patches were taken from.
 
-| | DeepSeek-V4.1-Flash (earlier release) | DeepSeek-V4.1-Flash-1017, this patch |
-|---|---|---|
-| decode, Japanese prose, median of the server's tok/s | 30.01 tok/s | 30.62 tok/s |
-| prefill, 35,000 tokens: first / second prompt | 63.8 s / 44.5 s | 67.0 s / 51.1 s ¹ |
-| mean NLL, 6,120 tokens of Japanese prose (24 × 256) | 3.0558 | 3.1369 ² |
+| | earlier release | 1017 | 1017 without the FP8 step | 1017, built from this repo |
+|---|---|---|---|---|
+| decode, Japanese prose, median tok/s | 30.01 | 30.62 | 30.76 | 31.26 |
+| prefill, 35,000 tokens: first / second prompt | 63.8 s / 44.5 s | 67.0 s / 51.1 s ¹ | 60.3 s / 44.4 s | 58.5 s / 47.4 s ² |
+| mean NLL, 6,120 tokens of Japanese prose (24 × 256) | 3.0558 | 3.1369 | 3.1605 | 3.1557 |
 
-¹ The 1017 launch came straight after copying the 476 GB checkpoint onto the NVMe,
-with the page cache full. Single launches; not yet repeated.
+¹ This launch came straight after copying the checkpoint onto the NVMe, with the page
+cache full. Not repeated yet.
 
-² Different weights, so this is not a quality comparison between the releases. The
-comparison that tests the patch, 1017 with and without the FP8 step on the same
-text, is running and will be added here.
+² On its first launch the chunk calibration ran out of time while kernels compiled
+(fixed since: `SGLANG_WARMUP_TIMEOUT`), so the chunk stayed at its fallback.
+
+**Built from this repo vs the development tree** (same weights, same step): paired
+NLL +0.0188 (SE 0.0111, z +1.69). That is inside the launch-to-launch spread below.
+
+**Paired NLL, 1017 with the step minus without it:** −0.0237 (SE 0.0137, z −1.73,
+6,120 tokens). That is lower, but within what two launches of one configuration differ
+by on this machine (0.020-0.036, z up to −2.2). One launch each cannot tell the two
+apart. The reason for the step is that it is the model's own arithmetic, bit-exact
+against the reference code, and not this measurement.
+
+The earlier release's NLL comes from different weights, so it is not a quality
+comparison between the releases.
 
 ## Not done
 
-- The expert placement (which experts stay on the GPU) used for the numbers above
-  comes from the earlier release's routing. It loads and runs, but it is not 1017's
-  hottest set.
+- The resident-expert placement (`placements/`) was recorded from the earlier
+  release's routing on Japanese prose. It loads and runs with 1017, but it is not
+  1017's hottest set, and it fits no other workload better. To record your own, use
+  `KT_ROUTING_DUMP` and SGLang's `--init-expert-location`.
 - Tool namespaces and the new `drop_thinking` turn boundary are not in SGLang's
   DeepSeek-V4 chat encoding.
+- Not run here: one GPU, more than two GPUs, AMD GPUs, CPUs with AVX-512.
 
 ## License
 
-The patches and tools are under Apache-2.0 (see `LICENSE`). The model weights are under
-DeepSeek's license (see the model card).
+Apache-2.0 (see `LICENSE`), except `engram-adapter/`, which is derived from 0xSero's
+engram adapter under the MIT License (see the headers of its files). The model weights
+are under DeepSeek's license (see the model card).

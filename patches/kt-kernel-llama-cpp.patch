@@ -1,0 +1,571 @@
+diff --git a/ggml-common.h b/ggml-common.h
+index e8efceb76..290439214 100644
+--- a/ggml-common.h
++++ b/ggml-common.h
+@@ -186,6 +186,38 @@ typedef struct {
+ } block_q8_0;
+ static_assert(sizeof(block_q8_0) == sizeof(ggml_half) + QK8_0, "wrong q8_0 block size/padding");
+ 
++// MXFP4 (OCP microscaling FP4 E2M1, per-32 group, ue8m0 scale).
++// One byte E8M0 group exponent + 16 nibble-packed E2M1 codes (32 weights / block).
++// Block layout matches upstream llama.cpp: qs[j] low nibble = element j,
++// high nibble = element j+16 (half-block interleave).
++#define QK_MXFP4 32
++typedef struct {
++    uint8_t e;
++    uint8_t qs[QK_MXFP4/2];
++} block_mxfp4;
++static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
++
++// Q2_0 (upstream type 42): 64 weights per block, one fp16 scale, 2-bit codes
++// 00/01/10/11 = -1/0/+1/+2. Element j lives in byte j/4 at bits 2*(j%4).
++#define QK2_0 64
++typedef struct {
++    ggml_half d;            // delta (scale)
++    uint8_t qs[QK2_0 / 4];  // 2 bits per element
++} block_q2_0;
++static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
++
++// kt-internal decode repack of IQ2_S / IQ3_XXS / IQ3_S (see kt-kernel-iq4lut.py):
++// 256 weights, nibble = sign<<3 | index into the source grid's magnitude table (kvalues_iq4lut_*),
++// laid out like IQ4_XS
++// (16 bytes per 32 weights, low nibbles first), scales[2*ib32 + half] = 2s+1
++// for each 16 weights, d carries the source type's 1/4 (IQ3_XXS) or 1/8 (IQ2_S).
++typedef struct {
++    ggml_half d;
++    int8_t  scales[QK_K/16];
++    uint8_t qs[QK_K/2];
++} block_iq4_lut;
++static_assert(sizeof(block_iq4_lut) == sizeof(ggml_half) + QK_K/16 + QK_K/2, "wrong iq4_lut block size/padding");
++
+ #define QK8_1 32
+ typedef struct {
+     union {
+diff --git a/ggml-quants.c b/ggml-quants.c
+index 0b346c11e..fb9c6e312 100644
+--- a/ggml-quants.c
++++ b/ggml-quants.c
+@@ -3565,6 +3565,209 @@ void dequantize_row_iq4_nl(const block_iq4_nl * restrict x, float * restrict y,
+     }
+ }
+ 
++// MXFP4 (OCP microscaling FP4): E2M1 LUT scaled by two so the factor of one
++// half can be folded into the E8M0 scale conversion below.
++static const int8_t kvalues_mxfp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
++
++static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
++    uint32_t bits;
++    if (x < 2) {
++        bits = (uint32_t) 0x00200000 << x;
++    } else {
++        bits = (uint32_t) (x - 1) << 23;
++    }
++    float result;
++    memcpy(&result, &bits, sizeof(float));
++    return result;
++}
++#define GGML_E8M0_TO_FP32_HALF(x) ggml_e8m0_to_fp32_half(x)
++
++void dequantize_row_mxfp4(const block_mxfp4 * restrict x, float * restrict y, int64_t k) {
++    assert(k % QK_MXFP4 == 0);
++    const int64_t nb = k / QK_MXFP4;
++
++    for (int i = 0; i < nb; i++) {
++        const uint8_t * qs = x[i].qs;
++        const float d = GGML_E8M0_TO_FP32_HALF(x[i].e);
++        for (int j = 0; j < QK_MXFP4/2; ++j) {
++            y[j]              = d * kvalues_mxfp4[qs[j] & 0xf];
++            y[j + QK_MXFP4/2] = d * kvalues_mxfp4[qs[j] >> 4];
++        }
++        y += QK_MXFP4;
++    }
++}
++
++// Q2_0 (upstream type 42): codes 0..3 map to -1, 0, +1, +2 times the block scale.
++// ====================== kt IQ4_LUT: decode repack of IQ2_S / IQ3_XXS / IQ3_S
++// nibble = sign<<3 | index into the source grid's magnitude table; one type per grid
++
++const int8_t kvalues_iq4lut3s[16] = {1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15};
++const int8_t kvalues_iq4lut3x[16] = {4, 12, 20, 28, 36, 44, 52, 62, -4, -12, -20, -28, -36, -44, -52, -62};
++const int8_t kvalues_iq4lut2s[16] = {8, 25, 43, 0, 0, 0, 0, 0, -8, -25, -43, 0, 0, 0, 0, 0};
++
++static void dequantize_row_iq4_lut_impl(const block_iq4_lut * restrict x, float * restrict y, int64_t k, const int8_t * lut) {
++    assert(k % QK_K == 0);
++    const int64_t nb = k / QK_K;
++    for (int64_t i = 0; i < nb; i++) {
++        const float d = GGML_FP16_TO_FP32(x[i].d);
++        const uint8_t * qs = x[i].qs;
++        for (int ib = 0; ib < QK_K/32; ++ib) {
++            const float d0 = d * x[i].scales[2*ib], d1 = d * x[i].scales[2*ib+1];
++            for (int j = 0; j < 16; ++j) {
++                y[j]    = d0 * lut[qs[j] & 0xf];
++                y[j+16] = d1 * lut[qs[j] >> 4];
++            }
++            y += 32; qs += 16;
++        }
++    }
++}
++
++static void ggml_vec_dot_iq4_lut_impl(int n, float * restrict s, const void * restrict vx, const void * restrict vy, const int8_t * lut) {
++    const block_iq4_lut * restrict x = vx;
++    const block_q8_K    * restrict y = vy;
++    const int nb = n / QK_K;
++    float sumf = 0;
++    for (int i = 0; i < nb; i++) {
++        const float d = GGML_FP16_TO_FP32(x[i].d) * y[i].d;
++        const uint8_t * qs = x[i].qs;
++        const int8_t  * q8 = y[i].qs;
++        int32_t sumi = 0;
++        for (int ib = 0; ib < QK_K/32; ++ib) {
++            int32_t s0 = 0, s1 = 0;
++            for (int j = 0; j < 16; ++j) {
++                s0 += q8[j]    * lut[qs[j] & 0xf];
++                s1 += q8[j+16] * lut[qs[j] >> 4];
++            }
++            sumi += s0 * x[i].scales[2*ib] + s1 * x[i].scales[2*ib+1];
++            qs += 16; q8 += 32;
++        }
++        sumf += d * sumi;
++    }
++    *s = sumf;
++}
++
++#define KT_IQ4LUT_FUNCS(suffix, table) \
++    void dequantize_row_iq4_lut##suffix(const block_iq4_lut * restrict x, float * restrict y, int64_t k) { \
++        dequantize_row_iq4_lut_impl(x, y, k, table); \
++    } \
++    void ggml_vec_dot_iq4_lut##suffix##_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) { \
++        assert(nrc == 1); UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs); \
++        ggml_vec_dot_iq4_lut_impl(n, s, vx, vy, table); \
++    }
++KT_IQ4LUT_FUNCS(3s, kvalues_iq4lut3s)
++KT_IQ4LUT_FUNCS(3x, kvalues_iq4lut3x)
++KT_IQ4LUT_FUNCS(2s, kvalues_iq4lut2s)
++#undef KT_IQ4LUT_FUNCS
++
++enum ggml_type kt_iq4_lut_type_for(enum ggml_type src_type) {
++    switch (src_type) {
++        case GGML_TYPE_IQ3_S:   return GGML_TYPE_IQ4_LUT3S;
++        case GGML_TYPE_IQ3_XXS: return GGML_TYPE_IQ4_LUT3X;
++        case GGML_TYPE_IQ2_S:   return GGML_TYPE_IQ4_LUT2S;
++        default: return src_type;
++    }
++}
++
++// magnitude -> index in the (positive half of the) table; the grids hold only these values
++static inline uint8_t iq4lut_nibble(int v, const int8_t * lut) {
++    const int a = v < 0 ? -v : v;
++    for (int m = 0; m < 8; ++m) {
++        if (lut[m] == a) return (uint8_t)((v < 0 ? 8 : 0) | m);
++    }
++    GGML_ASSERT(false && "kt_repack_to_iq4_lut: grid value outside the magnitude table");
++    return 0;
++}
++
++void kt_repack_to_iq4_lut(const void * restrict src, enum ggml_type src_type, block_iq4_lut * restrict dst, int64_t k) {
++    assert(k % QK_K == 0);
++    const int64_t nb = k / QK_K;
++    const int8_t * lut = src_type == GGML_TYPE_IQ3_S ? kvalues_iq4lut3s : src_type == GGML_TYPE_IQ3_XXS ? kvalues_iq4lut3x : kvalues_iq4lut2s;
++    int8_t vals[QK_K];
++    for (int64_t i = 0; i < nb; i++) {
++        block_iq4_lut * o = dst + i;
++        if (src_type == GGML_TYPE_IQ3_XXS) {
++            const block_iq3_xxs * x = (const block_iq3_xxs *)src + i;
++            // y = d * (0.5 + s) * 0.5 * grid = d/4 * (2s+1) * grid
++            o->d = GGML_FP32_TO_FP16(GGML_FP16_TO_FP32(x->d) * 0.25f);
++            const uint8_t * qs = x->qs;
++            const uint8_t * sas = qs + QK_K/4;
++            for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
++                uint32_t aux32; memcpy(&aux32, sas + 4*ib32, sizeof(uint32_t));
++                o->scales[2*ib32] = o->scales[2*ib32+1] = (int8_t)(2*(aux32 >> 28) + 1);
++                for (int l = 0; l < 4; ++l) {
++                    const uint8_t signs = ksigns_iq2xs[(aux32 >> 7*l) & 127];
++                    const uint8_t * g1 = (const uint8_t *)(iq3xxs_grid + qs[2*l+0]);
++                    const uint8_t * g2 = (const uint8_t *)(iq3xxs_grid + qs[2*l+1]);
++                    int8_t * v = vals + 32*ib32 + 8*l;
++                    for (int j = 0; j < 4; ++j) {
++                        v[j]   = (signs & kmask_iq2xs[j])   ? -(int8_t)g1[j] : (int8_t)g1[j];
++                        v[j+4] = (signs & kmask_iq2xs[j+4]) ? -(int8_t)g2[j] : (int8_t)g2[j];
++                    }
++                }
++                qs += 8;
++            }
++        } else if (src_type == GGML_TYPE_IQ3_S) {
++            const block_iq3_s * x = (const block_iq3_s *)src + i;
++            // y = d * (1 + 2s) * grid
++            o->d = x->d;
++            const uint8_t * qs = x->qs;
++            const uint8_t * qh = x->qh;
++            const uint8_t * signs = x->signs;
++            for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
++                const int sc = (ib32 & 1) ? (x->scales[ib32/2] >> 4) : (x->scales[ib32/2] & 0xf);
++                o->scales[2*ib32] = o->scales[2*ib32+1] = (int8_t)(1 + 2*sc);
++                for (int l = 0; l < 4; ++l) {
++                    const uint8_t * g1 = (const uint8_t *)(iq3s_grid + (qs[2*l+0] | ((qh[ib32] << (8-2*l)) & 256)));
++                    const uint8_t * g2 = (const uint8_t *)(iq3s_grid + (qs[2*l+1] | ((qh[ib32] << (7-2*l)) & 256)));
++                    int8_t * v = vals + 32*ib32 + 8*l;
++                    for (int j = 0; j < 4; ++j) {
++                        v[j]   = (signs[l] & kmask_iq2xs[j])   ? -(int8_t)g1[j] : (int8_t)g1[j];
++                        v[j+4] = (signs[l] & kmask_iq2xs[j+4]) ? -(int8_t)g2[j] : (int8_t)g2[j];
++                    }
++                }
++                qs += 8; signs += 4;
++            }
++        } else if (src_type == GGML_TYPE_IQ2_S) {
++            const block_iq2_s * x = (const block_iq2_s *)src + i;
++            // y = d * (0.5 + s) * 0.25 * grid = d/8 * (2s+1) * grid, s per 16 weights
++            o->d = GGML_FP32_TO_FP16(GGML_FP16_TO_FP32(x->d) * 0.125f);
++            const uint8_t * qs = x->qs;
++            const uint8_t * qh = x->qh;
++            const uint8_t * signs = qs + QK_K/8;
++            for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
++                o->scales[2*ib32]   = (int8_t)(2*(x->scales[ib32] & 0xf) + 1);
++                o->scales[2*ib32+1] = (int8_t)(2*(x->scales[ib32] >>  4) + 1);
++                for (int l = 0; l < 4; ++l) {
++                    const uint8_t * g = (const uint8_t *)(iq2s_grid + (qs[l] | ((qh[ib32] << (8-2*l)) & 0x300)));
++                    int8_t * v = vals + 32*ib32 + 8*l;
++                    for (int j = 0; j < 8; ++j) v[j] = (signs[l] & kmask_iq2xs[j]) ? -(int8_t)g[j] : (int8_t)g[j];
++                }
++                qs += 4; signs += 4;
++            }
++        } else {
++            GGML_ASSERT(false && "kt_repack_to_iq4_lut: unsupported source type");
++        }
++        for (int ib = 0; ib < QK_K/32; ++ib) {
++            const int8_t * v = vals + 32*ib;
++            for (int j = 0; j < 16; ++j) {
++                o->qs[16*ib + j] = (uint8_t)(iq4lut_nibble(v[j], lut) | (iq4lut_nibble(v[j+16], lut) << 4));
++            }
++        }
++    }
++}
++
++void dequantize_row_q2_0(const block_q2_0 * restrict x, float * restrict y, int64_t k) {
++    assert(k % QK2_0 == 0);
++    const int64_t nb = k / QK2_0;
++    for (int64_t i = 0; i < nb; i++) {
++        const float d = GGML_FP16_TO_FP32(x[i].d);
++        for (int j = 0; j < QK2_0; ++j) {
++            const uint8_t q = (x[i].qs[j / 4] >> ((j % 4) * 2)) & 0x03;
++            y[i*QK2_0 + j] = ((int)q - 1) * d;
++        }
++    }
++}
++
+ void dequantize_row_iq4_xs(const block_iq4_xs * restrict x, float * restrict y, int64_t k) {
+     assert(k % QK_K == 0);
+     const int64_t nb = k / QK_K;
+@@ -11289,6 +11492,132 @@ void ggml_vec_dot_iq4_nl_q8_0(int n, float * restrict s, size_t bs, const void *
+ #endif
+ }
+ 
++// MXFP4 (E2M1 + ue8m0) weights multiplied by Q8_0 activations. The AArch64
++// path uses NEON dot products and deliberately avoids SVE/i8mm requirements so
++// it can run on Kunpeng 920. Other architectures use the scalar fallback.
++void ggml_vec_dot_mxfp4_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
++    assert(nrc == 1);
++    UNUSED(nrc);
++    UNUSED(bx);
++    UNUSED(by);
++    UNUSED(bs);
++    assert(n % QK_MXFP4 == 0);
++    static_assert(QK_MXFP4 == QK8_0, "QK_MXFP4 and QK8_0 must be the same");
++
++    const block_mxfp4 * restrict x = vx;
++    const block_q8_0  * restrict y = vy;
++    const int nb = n / QK_MXFP4;
++    int ib = 0;
++    float sumf = 0;
++
++#if defined __ARM_NEON
++    const int8x16_t values = vld1q_s8(kvalues_mxfp4);
++    const uint8x16_t m4b = vdupq_n_u8(0x0f);
++    uint8x16x2_t q4bits;
++    int8x16x4_t q4b;
++    int8x16x4_t q8b;
++    int32x4_t prod_1, prod_2;
++    float32x4_t sumv0 = vdupq_n_f32(0.0f);
++    float32x4_t sumv1 = vdupq_n_f32(0.0f);
++
++    for (; ib + 1 < nb; ib += 2) {
++        __builtin_prefetch((const char *) &x[ib] + 512, 0, 0);
++        q4bits.val[0] = vld1q_u8(x[ib + 0].qs);
++        q4bits.val[1] = vld1q_u8(x[ib + 1].qs);
++        q8b.val[0]    = vld1q_s8(y[ib + 0].qs);
++        q8b.val[1]    = vld1q_s8(y[ib + 0].qs + 16);
++        q8b.val[2]    = vld1q_s8(y[ib + 1].qs);
++        q8b.val[3]    = vld1q_s8(y[ib + 1].qs + 16);
++
++        q4b.val[0] = ggml_vqtbl1q_s8(values, vandq_u8(q4bits.val[0], m4b));
++        q4b.val[1] = ggml_vqtbl1q_s8(values, vshrq_n_u8(q4bits.val[0], 4));
++        q4b.val[2] = ggml_vqtbl1q_s8(values, vandq_u8(q4bits.val[1], m4b));
++        q4b.val[3] = ggml_vqtbl1q_s8(values, vshrq_n_u8(q4bits.val[1], 4));
++
++        prod_1 = ggml_vdotq_s32(ggml_vdotq_s32(vdupq_n_s32(0), q4b.val[0], q8b.val[0]), q4b.val[1], q8b.val[1]);
++        prod_2 = ggml_vdotq_s32(ggml_vdotq_s32(vdupq_n_s32(0), q4b.val[2], q8b.val[2]), q4b.val[3], q8b.val[3]);
++
++        sumv0 = vfmaq_n_f32(sumv0, vcvtq_f32_s32(prod_1),
++                            GGML_E8M0_TO_FP32_HALF(x[ib + 0].e) * GGML_FP16_TO_FP32(y[ib + 0].d));
++        sumv1 = vfmaq_n_f32(sumv1, vcvtq_f32_s32(prod_2),
++                            GGML_E8M0_TO_FP32_HALF(x[ib + 1].e) * GGML_FP16_TO_FP32(y[ib + 1].d));
++    }
++    sumf = vaddvq_f32(vaddq_f32(sumv0, sumv1));
++#endif
++    for (; ib < nb; ++ib) {
++        const float d = GGML_FP16_TO_FP32(y[ib].d) * GGML_E8M0_TO_FP32_HALF(x[ib].e);
++        int sumi1 = 0;
++        int sumi2 = 0;
++        for (int j = 0; j < QK_MXFP4/2; ++j) {
++            sumi1 += y[ib].qs[j] * kvalues_mxfp4[x[ib].qs[j] & 0xf];
++            sumi2 += y[ib].qs[j + QK_MXFP4/2] * kvalues_mxfp4[x[ib].qs[j] >> 4];
++        }
++        sumf += d * (sumi1 + sumi2);
++    }
++    *s = sumf;
++}
++
++// Q2_0 weights x Q8_0 activations. One 64-wide Q2_0 block pairs with two
++// Q8_0 blocks. AVX2 unpacks the codes to element order through 16-bit lanes
++// (a per-position left shift by multiplication, then a common right shift),
++// subtracts one, and uses the usual sign/maddubs dot. Other targets take the
++// scalar loop.
++void ggml_vec_dot_q2_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
++    assert(nrc == 1);
++    UNUSED(nrc);
++    UNUSED(bx);
++    UNUSED(by);
++    UNUSED(bs);
++    assert(n % QK2_0 == 0);
++    static_assert(QK2_0 == 2*QK8_0, "QK2_0 must be twice QK8_0");
++
++    const block_q2_0 * restrict x = vx;
++    const block_q8_0 * restrict y = vy;
++    const int nb = n / QK2_0;
++    int ib = 0;
++    float sumf = 0;
++
++#if defined(__AVX2__)
++    const __m128i rep_lo = _mm_set_epi8(3,3,3,3, 2,2,2,2, 1,1,1,1, 0,0,0,0);
++    const __m128i rep_hi = _mm_set_epi8(7,7,7,7, 6,6,6,6, 5,5,5,5, 4,4,4,4);
++    const __m256i factors = _mm256_set_epi16(1,4,16,64, 1,4,16,64, 1,4,16,64, 1,4,16,64);
++    const __m256i m3 = _mm256_set1_epi16(3);
++    const __m256i mone = _mm256_set1_epi8(1);
++    const __m256i m1_16 = _mm256_set1_epi16(1);
++    __m256 acc = _mm256_setzero_ps();
++    for (; ib < nb; ++ib) {
++        const float dx = GGML_FP16_TO_FP32(x[ib].d);
++        for (int h = 0; h < 2; ++h) {
++            const __m128i bytes8 = _mm_loadl_epi64((const __m128i *)(x[ib].qs + 8*h));
++            const __m256i lo = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(_mm256_cvtepu8_epi16(_mm_shuffle_epi8(bytes8, rep_lo)), factors), 6), m3);
++            const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(_mm256_cvtepu8_epi16(_mm_shuffle_epi8(bytes8, rep_hi)), factors), 6), m3);
++            const __m256i q = _mm256_sub_epi8(_mm256_permute4x64_epi64(_mm256_packus_epi16(lo, hi), 0xd8), mone);
++            const __m256i qy = _mm256_loadu_si256((const __m256i *)y[2*ib + h].qs);
++            const __m256i p = _mm256_madd_epi16(m1_16, _mm256_maddubs_epi16(_mm256_sign_epi8(q, q), _mm256_sign_epi8(qy, q)));
++            acc = _mm256_fmadd_ps(_mm256_set1_ps(dx * GGML_FP16_TO_FP32(y[2*ib + h].d)), _mm256_cvtepi32_ps(p), acc);
++        }
++    }
++    sumf = hsum_float_8(acc);
++    ib = nb;
++#endif
++    for (; ib < nb; ++ib) {
++        const float dx = GGML_FP16_TO_FP32(x[ib].d);
++        for (int h = 0; h < 2; ++h) {
++            const block_q8_0 * restrict yb = &y[2*ib + h];
++            int sumi = 0;
++            for (int b = 0; b < 8; ++b) {
++                const uint8_t byte = x[ib].qs[8*h + b];
++                sumi += ((int)((byte >> 0) & 3) - 1) * yb->qs[4*b + 0];
++                sumi += ((int)((byte >> 2) & 3) - 1) * yb->qs[4*b + 1];
++                sumi += ((int)((byte >> 4) & 3) - 1) * yb->qs[4*b + 2];
++                sumi += ((int)((byte >> 6) & 3) - 1) * yb->qs[4*b + 3];
++            }
++            sumf += dx * GGML_FP16_TO_FP32(yb->d) * sumi;
++        }
++    }
++    *s = sumf;
++}
++
+ void ggml_vec_dot_iq4_xs_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+     assert(nrc == 1);
+     UNUSED(nrc);
+diff --git a/ggml-quants.h b/ggml-quants.h
+index 4d436a8f0..5631bc3b3 100644
+--- a/ggml-quants.h
++++ b/ggml-quants.h
+@@ -76,6 +76,21 @@ void dequantize_row_iq1_m  (const block_iq1_m   * GGML_RESTRICT x, float * GGML_
+ void dequantize_row_iq4_nl (const block_iq4_nl  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ void dequantize_row_iq4_xs (const block_iq4_xs  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ void dequantize_row_iq3_s  (const block_iq3_s   * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
++void dequantize_row_mxfp4  (const block_mxfp4   * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
++void dequantize_row_q2_0   (const block_q2_0    * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
++// kt IQ4_LUT3S / IQ4_LUT3X / IQ4_LUT2S: the 16-entry signed magnitude tables (nibble -> value)
++extern const int8_t kvalues_iq4lut3s[16];
++extern const int8_t kvalues_iq4lut3x[16];
++extern const int8_t kvalues_iq4lut2s[16];
++void dequantize_row_iq4_lut3s(const block_iq4_lut * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
++void dequantize_row_iq4_lut3x(const block_iq4_lut * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
++void dequantize_row_iq4_lut2s(const block_iq4_lut * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
++void ggml_vec_dot_iq4_lut3s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
++void ggml_vec_dot_iq4_lut3x_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
++void ggml_vec_dot_iq4_lut2s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
++// kt: repack k weights (k % 256 == 0) of an IQ2_S / IQ3_XXS / IQ3_S row into IQ4_LUT* blocks (exact)
++void kt_repack_to_iq4_lut(const void * GGML_RESTRICT src, enum ggml_type src_type, block_iq4_lut * GGML_RESTRICT dst, int64_t k);
++enum ggml_type kt_iq4_lut_type_for(enum ggml_type src_type);
+ 
+ // Dot product
+ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+@@ -97,6 +112,8 @@ void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const
+ void ggml_vec_dot_iq1_s_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_iq1_m_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_iq4_nl_q8_0 (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
++void ggml_vec_dot_mxfp4_q8_0  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
++void ggml_vec_dot_q2_0_q8_0   (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_iq4_xs_q8_K (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_iq3_s_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ 
+diff --git a/ggml.c b/ggml.c
+index d5d33c2ba..d3020f3c1 100644
+--- a/ggml.c
++++ b/ggml.c
+@@ -902,6 +902,61 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_bf16,
+         .vec_dot_type             = GGML_TYPE_BF16,
+         .nrows                    = 1,
++    },
++    [GGML_TYPE_MXFP4] = {
++        // OCP microscaling FP4 (E2M1 + ue8m0), weight-only checkpoint format.
++        .type_name                = "mxfp4",
++        .blck_size                = QK_MXFP4,
++        .type_size                = sizeof(block_mxfp4),
++        .is_quantized             = true,
++        .to_float                 = (ggml_to_float_t) dequantize_row_mxfp4,
++        .vec_dot                  = ggml_vec_dot_mxfp4_q8_0,
++        .vec_dot_type             = GGML_TYPE_Q8_0,
++        .nrows                    = 1,
++    },
++    [GGML_TYPE_IQ4_LUT3S] = {
++        // kt-internal decode repack of IQ3_S (sign + grid magnitude index nibbles)
++        .type_name                = "iq4_lut3s",
++        .blck_size                = QK_K,
++        .type_size                = sizeof(block_iq4_lut),
++        .is_quantized             = true,
++        .to_float                 = (ggml_to_float_t) dequantize_row_iq4_lut3s,
++        .vec_dot                  = ggml_vec_dot_iq4_lut3s_q8_K,
++        .vec_dot_type             = GGML_TYPE_Q8_K,
++        .nrows                    = 1,
++    },
++    [GGML_TYPE_IQ4_LUT3X] = {
++        // kt-internal decode repack of IQ3_XXS (sign + grid magnitude index nibbles)
++        .type_name                = "iq4_lut3x",
++        .blck_size                = QK_K,
++        .type_size                = sizeof(block_iq4_lut),
++        .is_quantized             = true,
++        .to_float                 = (ggml_to_float_t) dequantize_row_iq4_lut3x,
++        .vec_dot                  = ggml_vec_dot_iq4_lut3x_q8_K,
++        .vec_dot_type             = GGML_TYPE_Q8_K,
++        .nrows                    = 1,
++    },
++    [GGML_TYPE_IQ4_LUT2S] = {
++        // kt-internal decode repack of IQ2_S (sign + grid magnitude index nibbles)
++        .type_name                = "iq4_lut2s",
++        .blck_size                = QK_K,
++        .type_size                = sizeof(block_iq4_lut),
++        .is_quantized             = true,
++        .to_float                 = (ggml_to_float_t) dequantize_row_iq4_lut2s,
++        .vec_dot                  = ggml_vec_dot_iq4_lut2s_q8_K,
++        .vec_dot_type             = GGML_TYPE_Q8_K,
++        .nrows                    = 1,
++    },
++    [GGML_TYPE_Q2_0] = {
++        // upstream type 42: 2-bit {-1,0,1,2} with a fp16 scale per 64 weights
++        .type_name                = "q2_0",
++        .blck_size                = QK2_0,
++        .type_size                = sizeof(block_q2_0),
++        .is_quantized             = true,
++        .to_float                 = (ggml_to_float_t) dequantize_row_q2_0,
++        .vec_dot                  = ggml_vec_dot_q2_0_q8_0,
++        .vec_dot_type             = GGML_TYPE_Q8_0,
++        .nrows                    = 1,
+     }
+ };
+ 
+diff --git a/ggml.h b/ggml.h
+index 13502a362..cc7693a58 100644
+--- a/ggml.h
++++ b/ggml.h
+@@ -377,6 +377,11 @@ extern "C" {
+         GGML_TYPE_F64     = 28,
+         GGML_TYPE_IQ1_M   = 29,
+         GGML_TYPE_BF16    = 30,
++        GGML_TYPE_MXFP4   = 39, // OCP microscaling FP4 (E2M1 + ue8m0), id aligned with upstream
++        GGML_TYPE_Q2_0    = 42, // 2-bit {-1,0,1,2} x fp16 scale, 64-wide blocks, id aligned with upstream
++        GGML_TYPE_IQ4_LUT3S = 43, // kt-internal decode repack of IQ3_S  (nibble = sign<<3 | grid magnitude index), int8 scales per 16
++        GGML_TYPE_IQ4_LUT3X = 44, // kt-internal decode repack of IQ3_XXS
++        GGML_TYPE_IQ4_LUT2S = 45, // kt-internal decode repack of IQ2_S
+         GGML_TYPE_COUNT,
+     };
+ 
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index fb20cfabb..3c33158be 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -903,6 +903,7 @@ class GGMLQuantizationType(IntEnum):
+     F64     = 28
+     IQ1_M   = 29
+     BF16    = 30
++    MXFP4   = 39
+ 
+ 
+ # TODO: add GGMLFileType from ggml_ftype in ggml.h
+@@ -1017,6 +1018,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
+     GGMLQuantizationType.F64:     (1, 8),
+     GGMLQuantizationType.IQ1_M:   (256, QK_K // 8 + QK_K // 16  + QK_K // 32),
+     GGMLQuantizationType.BF16:    (1, 2),
++    GGMLQuantizationType.MXFP4:   (32, 1 + 16),
+ }
+ 
+ 
+diff --git a/gguf-py/gguf/gguf_reader.py b/gguf-py/gguf/gguf_reader.py
+index e48bc00c3..be7a994a4 100644
+--- a/gguf-py/gguf/gguf_reader.py
++++ b/gguf-py/gguf/gguf_reader.py
+@@ -35,6 +35,16 @@ logger = logging.getLogger(__name__)
+ READER_SUPPORTED_VERSIONS = [2, GGUF_VERSION]
+ 
+ 
++def _np_apply_byteorder(
++    arr: npt.NDArray[Any],
++    order: Literal["I"] | Literal["S"] | Literal["<"] | Literal[">"] | None,
++) -> npt.NDArray[Any]:
++    """NumPy 2+ compatible replacement for ndarray.newbyteorder (removed in NumPy 2.0)."""
++    if order is None or order == "I":
++        return arr
++    return arr.view(arr.dtype.newbyteorder(order))
++
++
+ class ReaderField(NamedTuple):
+     # Offset to start of this field.
+     offset: int
+@@ -96,7 +106,7 @@ class GGUFReader:
+             # If we get 0 here that means it's (probably) a GGUF file created for
+             # the opposite byte order of the machine this script is running on.
+             self.byte_order = 'S'
+-            temp_version = temp_version.newbyteorder(self.byte_order)
++            temp_version = _np_apply_byteorder(temp_version, self.byte_order)
+         version = temp_version[0]
+         if version not in READER_SUPPORTED_VERSIONS:
+             raise ValueError(f'Sorry, file appears to be version {version} which we cannot handle')
+@@ -135,10 +145,9 @@ class GGUFReader:
+         count = int(count)
+         itemsize = int(np.empty([], dtype = dtype).itemsize)
+         end_offs = offset + itemsize * count
+-        return (
+-            self.data[offset:end_offs]
+-            .view(dtype = dtype)[:count]
+-            .newbyteorder(override_order or self.byte_order)
++        return _np_apply_byteorder(
++            self.data[offset:end_offs].view(dtype=dtype)[:count],
++            override_order or self.byte_order,
+         )
+ 
+     def _push_field(self, field: ReaderField, skip_sum: bool = False) -> int:
