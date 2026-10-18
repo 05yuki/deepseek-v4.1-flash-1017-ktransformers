@@ -126,6 +126,9 @@ export KT_GPU_STREAM_DROP_CACHE="${KT_GPU_STREAM_DROP_CACHE:-$model}"
 export KT_LOAD_PREFETCH="${KT_LOAD_PREFETCH:-4}"
 export KT_FAST_PINNED="${KT_FAST_PINNED:-0}"
 export KT_SWIGLU_CLAMP="${KT_SWIGLU_CLAMP:-1}"
+# the CPU experts read a one-byte code per 32-value scale group instead of an fp32 scale
+# (15% fewer bytes a weight, bit-identical; 0: fp32 scales)
+export KT_MXFP4_SCALE_CODES="${KT_MXFP4_SCALE_CODES:-1}"
 export SGLANG_UNBALANCED_LOAD_TIMEOUT_S="${SGLANG_UNBALANCED_LOAD_TIMEOUT_S:-1800}"
 # the first launch of a new environment compiles its kernels inside the warmup request
 # (over 10 minutes here), past SGLang's 600 s default; later launches reuse the cache
@@ -248,7 +251,7 @@ command=(
 printf '%s\n' "DeepSeek-V4.1-Flash on SGLang + KTransformers: $model"
 printf '%s\n' "GPUs ${CUDA_VISIBLE_DEVICES} (sm $cap), TP $tp on NUMA nodes $numa_list; CPU experts: $cpu_threads threads in $threadpools pools; GPU experts $gpu_experts a layer"
 printf '%s\n' "context $context_length; attention output FP8 before wo_a: block ${SGLANG_DSV4_O_FP8_QDQ_BLOCK:-0}"
-printf '%s\n' "wo_a native FP8: $SGLANG_DSV4_WO_A_FP8_NATIVE; vision tower on demand: $SGLANG_DSV4_VISION_ON_DEMAND; MXFP4 MoE fp32: $SGLANG_MXFP4_MOE_FP32; Marlin MoE fp32 glue: $SGLANG_MARLIN_MOE_FP32_GLUE; hot lend spare floor: $KT_KV_HOT_SPARE_FLOOR_MB MiB"
+printf '%s\n' "wo_a native FP8: $SGLANG_DSV4_WO_A_FP8_NATIVE; vision tower on demand: $SGLANG_DSV4_VISION_ON_DEMAND; MXFP4 MoE fp32: $SGLANG_MXFP4_MOE_FP32; Marlin MoE fp32 glue: $SGLANG_MARLIN_MOE_FP32_GLUE; CPU scale codes: $KT_MXFP4_SCALE_CODES; hot lend spare floor: $KT_KV_HOT_SPARE_FLOOR_MB MiB"
 printf '%s\n' "Run directory: $run_dir"
 ln -sfn "$run_dir" "$log_root/$log_name/current"
 if [[ "$mode" == "--background" ]]; then

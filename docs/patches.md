@@ -151,8 +151,8 @@ switch marked "on" is on in `serve.sh`.
 - **MXFP4 experts on AVX2** (`operators/avx2/mxfp4-moe.hpp`, `moe_base.hpp`): the CPU expert
   kernels for this model. Activations are reordered once per expert to match the weight
   decode; the SwiGLU clamp is applied (`KT_SWIGLU_CLAMP`).
-- **Scale codes** (`KT_MXFP4_SCALE_CODES=1`): one byte per 32-value scale group instead of
-  an fp32 scale, 15% fewer bytes a weight, bit-identical results. Off in `serve.sh` for now.
+- **Scale codes** (`KT_MXFP4_SCALE_CODES`, on): one byte per 32-value scale group instead
+  of an fp32 scale, 15% fewer bytes a weight, bit-identical results.
 - **Shared expert memory** (`KT_EXPERT_SHM`, on): the experts live in shared memory on 2 MB
   pages, which the GPU ranks map to stream from (the streamed prefill).
 - **Placement on the CPU side**: each NUMA part loads the experts the placement assigns to
@@ -167,3 +167,22 @@ switch marked "on" is on in `serve.sh`.
 - Code for other models also comes with the tree (the llama.cpp-format GGUF experts and
   `kt-kernel-llama-cpp.patch`, EXL3 experts, Gemma 4 BF16 experts). This repository does
   not use it, but the build needs it.
+
+## Values tuned on the test machine
+
+These were measured on 2 × RTX 5070 Ti (SM120) with Zen 2 CPUs. Other machines run with
+them unchanged, which may not be their best:
+
+- the GPU MoE kernels' tiles (`GEMV_BN`, `GEMV_BK`, `GEMM_SMALL`, `GEMM_LARGE` in
+  `mxfp4_fp32_moe.py`) and the decode/tensor-core split (`GEMV_MAX_TOKENS`, 8 tokens);
+- `KT_GPU_STREAM_PREFILL` (512 tokens) and `KT_GPU_STREAM_GROUP` (4 experts a group);
+- the hot lend's `KT_KV_HOT_EXTRA` (16 a layer) and `KT_KV_HOT_SPARE_FLOOR_MB` (1024);
+- `SGLANG_MEM_FRACTION` (0.81) and the prefill chunk, which the first launch calibrates.
+
+## Tests
+
+- `tools/dsv4-o-fp8-qdq-test.py`: 1017's FP8 step against the checkpoint's own `act_quant`.
+- `tools/e4m3-emulation-test.py`: the fp32 e4m3 rounding for GPUs before sm89.
+- `tools/mxfp4-fp32-moe-test.py`: the GPU MoE kernels against an fp64 reference and Marlin,
+  and their outputs repeating bit for bit.
+- `tools/bench.py`: the README's decode and prefill numbers, against a running server.

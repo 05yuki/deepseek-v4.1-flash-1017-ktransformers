@@ -146,13 +146,21 @@ None of it needs a server change:
 ## Results
 
 2 × AMD EPYC 7452 (Zen 2, AVX2), 512 GB DDR4, 2 × RTX 5070 Ti 16 GB, the checkpoint on
-NVMe; built from this repository and run with the `serve.sh` defaults (1M-token
-context, one request at a time):
+NVMe; built from this repository and run with the `serve.sh` defaults (1M-token context,
+one request at a time), measured with `tools/bench.py`:
 
 | | |
 |---|---|
 | decode, Japanese prose | 35 tok/s |
-| prefill, 35,000-token prompt | 674 tok/s (991 tok/s for a second prompt) |
+| prefill, 35,000-token prompt | 636 tok/s |
+| prefill, 131,072-token prompt | 647 tok/s |
+| prefill, 524,288-token prompt | 611 tok/s |
+| prefill, 1,000,000-token prompt | 504 tok/s (33 minutes) |
+
+Longer prompts run in smaller chunks: the prompt's own KV and the attention's working
+memory grow with its length, leaving less GPU memory for a chunk, and every chunk streams
+the CPU experts to the GPU once. The prompts are random token ids, which spread over more
+experts than real text, so these figures are lower than with text.
 
 ## Fixes from dsv41-flash-dual-epyc
 

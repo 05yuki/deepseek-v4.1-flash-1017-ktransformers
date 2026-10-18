@@ -1,0 +1,50 @@
+name: patches apply
+
+# Do the three patches still apply to their pinned upstream commits? Fetches only those
+# commits (no GPU, no build), every push and pull request and once a week, so an upstream
+# commit that disappears or a patch that no longer fits shows up here first.
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: pinned commits
+        run: |
+          echo "SGLANG_COMMIT=$(sed -n 's/^SGLANG_COMMIT=\([0-9a-f]*\).*/\1/p' setup.sh)" >> "$GITHUB_ENV"
+          echo "SGLANG_TAG=$(sed -n 's/^SGLANG_TAG=\([^ ]*\).*/\1/p' setup.sh)" >> "$GITHUB_ENV"
+          echo "KT_COMMIT=$(sed -n 's/^KT_COMMIT=\([0-9a-f]*\).*/\1/p' setup.sh)" >> "$GITHUB_ENV"
+
+      - name: sglang
+        run: |
+          git init -q sglang && cd sglang
+          git fetch -q --depth 1 https://github.com/sgl-project/sglang.git "$SGLANG_COMMIT" \
+            || { echo "::warning::$SGLANG_COMMIT not fetchable from sgl-project/sglang, using the fork's tag"; \
+                 git fetch -q --depth 1 https://github.com/05yuki/sglang-upstream.git "refs/tags/$SGLANG_TAG"; }
+          git checkout -q FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SGLANG_COMMIT"
+          git apply --check --whitespace=nowarn ../patches/sglang-dsv41-tree.patch
+
+      - name: ktransformers and its llama.cpp
+        run: |
+          git init -q kt && cd kt
+          git fetch -q --depth 1 https://github.com/kvcache-ai/ktransformers.git "$KT_COMMIT"
+          git checkout -q FETCH_HEAD
+          git apply --check --whitespace=nowarn ../patches/kt-kernel-tree.patch
+          llama=$(git ls-tree HEAD third_party/llama.cpp | awk '{print $3}')
+          git init -q ../llama && cd ../llama
+          git fetch -q --depth 1 https://github.com/ggerganov/llama.cpp.git "$llama"
+          git checkout -q FETCH_HEAD
+          git apply --check --whitespace=nowarn ../patches/kt-kernel-llama-cpp.patch
+
+      - name: scripts
+        run: |
+          for f in setup.sh serve.sh lib/*.sh tools/*.sh; do bash -n "$f"; done
+          python3 -m py_compile tools/*.py lib/*.py engram-adapter/*.py patches/*.py

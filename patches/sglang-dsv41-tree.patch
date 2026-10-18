@@ -1015,7 +1015,7 @@ index a1f0e7f0..bcd700b7 100644
  
          self._weight_loader_impl(
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 36c15cf1..4866bfb2 100644
+index 36c15cf1..c56eee77 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -7,12 +7,14 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
@@ -1221,7 +1221,7 @@ index 36c15cf1..4866bfb2 100644
  
      def create_moe_runner(
          self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
-@@ -297,6 +431,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -297,6 +431,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          topk_output = dispatch_output.topk_output
          topk_weights, topk_ids, _ = topk_output
  
@@ -1230,13 +1230,10 @@ index 36c15cf1..4866bfb2 100644
 +        # counting under CUDA graph replay) and save it as
 +        # <prefix>-rank<r>.pt every 30 s. SGLang's expert distribution recorder
 +        # never sees the V4 router's ids (09-13); this does.
-+        if _routing_dump_prefix:
-+            _routing_count(x.device, self.kt_config.layer_idx, topk_ids, self.tp_rank)
-+
          # Submit forward task to CPU (non-blocking)
          self.wrapper.submit_forward(
              x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
-@@ -344,10 +486,55 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -344,10 +483,62 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
  
          x = dispatch_output.hidden_states
          topk_output = dispatch_output.topk_output
@@ -1251,6 +1248,13 @@ index 36c15cf1..4866bfb2 100644
 +            remapped = torch.where(ids >= 0, log2phy[ids.clamp(min=0)], ids).to(ids.dtype)
 +            topk_output = topk_output._replace(topk_ids=remapped)
 +            dispatch_output = dispatch_output._replace(topk_output=topk_output)
++        # KT_ROUTING_DUMP=<prefix>: a [layers, experts] histogram of the routed physical ids
++        # (a captured index_add_, so it keeps counting under CUDA graph replay), saved as
++        # <prefix>-rank<r>.pt every 30 s. Counted here, before the hot lend and the
++        # streamer split the routes (sglang-kt-routing-count-before-split.py); SGLang's
++        # expert distribution recorder never sees the V4 router's ids (09-13).
++        if _routing_dump_prefix and self.tp_rank == 0:
++            _routing_count(x.device, self.kt_config.layer_idx, topk_output.topk_ids, self.tp_rank)
 +
 +        # KT_GPU_STREAM_PREFILL=<tokens>: above that many tokens the CPU
 +        # experts are streamed to the GPU in groups instead of computed here
@@ -1294,7 +1298,7 @@ index 36c15cf1..4866bfb2 100644
  
          # Step 2: Prepare GPU computation by masking CPU expert IDs
          # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
-@@ -355,23 +542,69 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -355,23 +546,69 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
  
          # Create modified dispatch output for GPU computation
@@ -4861,10 +4865,10 @@ index 00000000..f65561df
 +    return _bounce["buf"][:nbytes]
 diff --git a/python/sglang/srt/layers/moe/kt_prefill_plan.py b/python/sglang/srt/layers/moe/kt_prefill_plan.py
 new file mode 100644
-index 00000000..2007364d
+index 00000000..3bec7ca6
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_prefill_plan.py
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,238 @@
 +"""The prefill chunk planned per request (KT_PREFILL_PLAN=1, with the prefill lend
 +and, for the room of the free KV pages, KT_PREFILL_KV_LEND=1).
 +
@@ -5061,11 +5065,13 @@ index 00000000..2007364d
 +    def swa_cost(c: int) -> int:
 +        if swa is None:
 +            return 0
-+        # one chunk holds its own rows; with more, the request may hold the SWA
-+        # of every chunk until it ends (V4.1's chunk cache: SWA usage 0.31 ->
-+        # 0.44 over three chunks, 0.76 GB mapped where two chunks' worth was
-+        # planned), so the whole remaining prompt
-+        need = c if rem <= c else rem
++        # one chunk holds its own rows; with more, the chunks held at once (swa[3]:
++        # two under the overlap scheduler, whose next chunk is allocated before the
++        # last one's slots are freed). Not the whole remaining prompt: a 512K prompt
++        # in 2,048-row chunks held 6% of a 77K-token pool throughout (2.25 chunks),
++        # 7,168-row chunks 19% (2.04), 18,432-row 46% (1.92) (10-18), while charging
++        # the remaining prompt planned 11.5 GB and kept a 512K prefill at 2,048 rows.
++        need = c if rem <= c else c * max(1, int(swa[3]))
 +        return 0 if need <= swa[0] else int((need - swa[0]) * swa[1] + swa[2])
 +
 +    def fits(c: int, n: int) -> bool:
@@ -6928,10 +6934,10 @@ index 950591ca..8115cb70 100644
      if do_pad:
 diff --git a/python/sglang/srt/layers/moe/mxfp4_fp32_moe.py b/python/sglang/srt/layers/moe/mxfp4_fp32_moe.py
 new file mode 100644
-index 00000000..c3c19e31
+index 00000000..02a118ed
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/mxfp4_fp32_moe.py
-@@ -0,0 +1,357 @@
+@@ -0,0 +1,385 @@
 +"""MXFP4 MoE on the GPU with one rounding, in the checkpoint's layout
 +(SGLANG_MXFP4_MOE_FP32=1, patches/sglang-mxfp4-fp32-moe.py installs this as
 +sglang/srt/layers/moe/mxfp4_fp32_moe.py).
@@ -6975,6 +6981,30 @@ index 00000000..c3c19e31
 +    mant = m & 1
 +    bits = tl.where(e == 0, mant * (126 << 7), ((e + 126) << 7) | (mant << 6)) | ((n & 8) << 12)
 +    return bits.to(tl.int16).to(tl.bfloat16, bitcast=True)
++
++
++@triton.jit
++def _e2m1_pair(lut_ptr, packed):
++    """A byte of two E2M1 codes to their two fp32 values through a 256-entry table of bf16
++    pairs (low nibble in the low half): one gather instead of the bit construction."""
++    pairs = tl.load(lut_ptr + packed)
++    lo = (pairs << 16).to(tl.float32, bitcast=True)
++    hi = (pairs & -65536).to(tl.float32, bitcast=True)
++    return lo, hi
++
++
++_LUTS = {}
++
++
++def _e2m1_pair_lut(device):
++    t = _LUTS.get(device)
++    if t is None:
++        v = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], dtype=torch.bfloat16)
++        bits = v.view(torch.int16).to(torch.int32) & 0xFFFF
++        b = torch.arange(256)
++        t = (bits[b & 15] | (bits[b >> 4] << 16)).to(torch.int32).to(device)
++        _LUTS[device] = t
++    return t
 +
 +
 +@triton.jit
@@ -7034,7 +7064,7 @@ index 00000000..c3c19e31
 +
 +@triton.jit
 +def _mxfp4_moe_gemv_kernel(
-+    a_ptr, b_ptr, bs_ptr, c_ptr, ids_ptr, w_ptr,
++    a_ptr, b_ptr, bs_ptr, c_ptr, ids_ptr, w_ptr, lut_ptr,
 +    N, K,
 +    stride_am, stride_be, stride_bn, stride_se, stride_sn, stride_cm,
 +    A_DIV: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
@@ -7061,7 +7091,8 @@ index 00000000..c3c19e31
 +            ks = (k0 // 32 + tl.arange(0, BK // 32))[None, :]
 +            packed = tl.load(b_base + kb, mask=n_ok[:, None] & (kb < K // 2), other=0)
 +            packed = packed.to(tl.int32) & 0xFF
-+            w = tl.interleave(_e2m1(packed & 15), _e2m1(packed >> 4))
++            lo, hi = _e2m1_pair(lut_ptr, packed)
++            w = tl.interleave(lo, hi)
 +            sc = tl.load(s_base + ks, mask=n_ok[:, None] & (ks < K // 32), other=127)
 +            sc = _e8m0(sc.to(tl.int32) & 0xFF)
 +            acc2 += tl.sum(tl.reshape(w * a[None, :], (BN, BK // 32, 32)), axis=2) * sc
@@ -7071,7 +7102,7 @@ index 00000000..c3c19e31
 +
 +@triton.jit
 +def _mxfp4_moe_gemv_gate_up_kernel(
-+    a_ptr, b_ptr, bs_ptr, h_ptr, ids_ptr, w_ptr,
++    a_ptr, b_ptr, bs_ptr, h_ptr, ids_ptr, w_ptr, lut_ptr,
 +    I, K, limit,
 +    stride_am, stride_be, stride_bn, stride_se, stride_sn, stride_hm,
 +    A_DIV: tl.constexpr, HAS_LIMIT: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
@@ -7108,8 +7139,10 @@ index 00000000..c3c19e31
 +            pu = tl.load(bu + kb, mask=mb, other=0).to(tl.int32) & 0xFF
 +            cg = _e8m0(tl.load(sg + ks, mask=msk, other=127).to(tl.int32) & 0xFF)
 +            cu = _e8m0(tl.load(su + ks, mask=msk, other=127).to(tl.int32) & 0xFF)
-+            pg_ = tl.reshape(tl.interleave(_e2m1(pg & 15), _e2m1(pg >> 4)) * a, (BN, BK // 32, 32))
-+            pu_ = tl.reshape(tl.interleave(_e2m1(pu & 15), _e2m1(pu >> 4)) * a, (BN, BK // 32, 32))
++            glo, ghi = _e2m1_pair(lut_ptr, pg)
++            ulo, uhi = _e2m1_pair(lut_ptr, pu)
++            pg_ = tl.reshape(tl.interleave(glo, ghi) * a, (BN, BK // 32, 32))
++            pu_ = tl.reshape(tl.interleave(ulo, uhi) * a, (BN, BK // 32, 32))
 +            acc_g += tl.sum(pg_, axis=2) * cg
 +            acc_u += tl.sum(pu_, axis=2) * cu
 +        g = tl.sum(acc_g, axis=1)
@@ -7226,12 +7259,13 @@ index 00000000..c3c19e31
 +        ids = topk_ids.reshape(-1).contiguous()
 +        wts = topk_weights.reshape(-1).contiguous()
 +        bn, bk = GEMV_BN, GEMV_BK
++        lut = _e2m1_pair_lut(dev)
 +        _mxfp4_moe_gemv_gate_up_kernel[(num_valid, triton.cdiv(I, bn))](
-+            hidden_states, w13, s13, h, ids, wts, I, H, lim,
++            hidden_states, w13, s13, h, ids, wts, lut, I, H, lim,
 +            hidden_states.stride(0), w13.stride(0), w13.stride(1), s13.stride(0), s13.stride(1), h.stride(0),
 +            A_DIV=topk, HAS_LIMIT=lim > 0, BN=bn, BK=bk, num_warps=GEMV_WARPS)
 +        _mxfp4_moe_gemv_kernel[(num_valid, triton.cdiv(H, bn))](
-+            h, w2, s2, y, ids, wts, H, I,
++            h, w2, s2, y, ids, wts, lut, H, I,
 +            h.stride(0), w2.stride(0), w2.stride(1), s2.stride(0), s2.stride(1), y.stride(0),
 +            A_DIV=1, BN=bn, BK=bk, num_warps=GEMV_WARPS)
 +    else:
