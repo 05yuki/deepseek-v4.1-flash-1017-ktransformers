@@ -88,8 +88,9 @@ variable named next to it. Among them:
 - `wo_a` kept in the checkpoint's FP8 instead of a bf16 copy (`SGLANG_DSV4_WO_A_FP8_NATIVE`)
 - the vision tower in host memory, on the GPU only while images are encoded
   (`SGLANG_DSV4_VISION_ON_DEMAND`)
-- the resident experts through Marlin, with the steps around its GEMMs in fp32
-  (`SGLANG_MARLIN_MOE_FP32_GLUE`)
+- the GPU experts (resident and hot) in the checkpoint's MXFP4 layout through Triton
+  kernels that round once, at the weighted sum (`SGLANG_MXFP4_MOE_FP32`; `0` runs them
+  through Marlin)
 - a prefill chunk calibrated once, on the first launch of a setup (the server starts
   one extra time for this)
 - FlashInfer autotune off, so outputs reproduce across launches
@@ -145,7 +146,7 @@ context, one request at a time):
 | | |
 |---|---|
 | decode, Japanese prose | 35 tok/s |
-| prefill, 35,000-token prompt | 649 tok/s (937 tok/s for a second prompt) |
+| prefill, 35,000-token prompt | 674 tok/s (991 tok/s for a second prompt) |
 
 ## Fixes from dsv41-flash-dual-epyc
 
@@ -166,9 +167,9 @@ SM120 attention no longer reads an uninitialized padding page (#3), and
   also have.
 - One GPU, or more than two: `serve.sh` sets tensor parallelism from the GPUs it sees;
   not tested. One GPU needs about 24 GB at a 1M context.
-- Other NVIDIA GPUs: the MXFP4 Marlin path stops at load on anything but SM90 or SM120
-  (RTX 30/40, A100), and the DeepSeek-V4 attention in this SGLang branch is written for
-  SM90 and newer.
+- Other NVIDIA GPUs: the DeepSeek-V4 attention in this SGLang branch is written for SM90
+  and newer, so RTX 30/40 and A100 are not expected to run. With
+  `SGLANG_MXFP4_MOE_FP32=0`, the MXFP4 Marlin path also needs SM90 or SM120.
 - AMD GPUs: not supported (kv-vmm and kt-kernel use CUDA).
 
 ## License

@@ -87,6 +87,9 @@ export SGLANG_DSV4_VISION_ON_DEMAND="${SGLANG_DSV4_VISION_ON_DEMAND:-1}"
 # the Marlin MoE steps around its two GEMMs (SwiGLU, routing weights, top-k sum) in fp32
 # with one rounding each (0: the bf16 steps)
 export SGLANG_MARLIN_MOE_FP32_GLUE="${SGLANG_MARLIN_MOE_FP32_GLUE:-1}"
+# the GPU experts (resident and hot) without Marlin: the checkpoint's MXFP4 layout through
+# Triton kernels that round once, at the weighted top-k sum (0: Marlin, with the glue above)
+export SGLANG_MXFP4_MOE_FP32="${SGLANG_MXFP4_MOE_FP32:-1}"
 
 # hot experts: the resident ones, and with the hot lend 16 more a layer in the KV
 # pool's free pages outside prefill (KT_KV_HOT_LEND=0 turns it off)
@@ -239,7 +242,7 @@ command=(
 printf '%s\n' "DeepSeek-V4.1-Flash on SGLang + KTransformers: $model"
 printf '%s\n' "GPUs ${CUDA_VISIBLE_DEVICES} (sm $cap), TP $tp on NUMA nodes $numa_list; CPU experts: $cpu_threads threads in $threadpools pools; GPU experts $gpu_experts a layer"
 printf '%s\n' "context $context_length; attention output FP8 before wo_a: block ${SGLANG_DSV4_O_FP8_QDQ_BLOCK:-0}"
-printf '%s\n' "wo_a native FP8: $SGLANG_DSV4_WO_A_FP8_NATIVE; vision tower on demand: $SGLANG_DSV4_VISION_ON_DEMAND; Marlin MoE fp32 glue: $SGLANG_MARLIN_MOE_FP32_GLUE; hot lend spare floor: $KT_KV_HOT_SPARE_FLOOR_MB MiB"
+printf '%s\n' "wo_a native FP8: $SGLANG_DSV4_WO_A_FP8_NATIVE; vision tower on demand: $SGLANG_DSV4_VISION_ON_DEMAND; MXFP4 MoE fp32: $SGLANG_MXFP4_MOE_FP32; Marlin MoE fp32 glue: $SGLANG_MARLIN_MOE_FP32_GLUE; hot lend spare floor: $KT_KV_HOT_SPARE_FLOOR_MB MiB"
 printf '%s\n' "Run directory: $run_dir"
 ln -sfn "$run_dir" "$log_root/$log_name/current"
 if [[ "$mode" == "--background" ]]; then
