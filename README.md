@@ -22,30 +22,20 @@ serves the earlier DeepSeek-V4.1-Flash release: point `MODEL` at it.
 
 ## What it needs
 
-- **RAM: a 512 GB class machine.** The server used 418 GiB, measured while running
-  1017:
-  - 313 GiB holds the MXFP4 CPU experts, on 2 MB pages.
-  - About 40 GiB is the rest of the shared memory: arena pages that ended up on 4 KB,
-    the prefill lend's mirror and the all-reduce buffers.
-  - Add the 8 GiB engram cache and the OS. 384 GB does not fit. 448 GB leaves no room
-    for the page cache the load passes through.
+- **RAM: a 512 GB class machine.** The server uses about 420 GiB, most of it the MXFP4
+  CPU experts on 2 MB pages. 384 GB does not fit.
 
   The launcher makes one expert pool per NUMA node and uses every physical core.
   kt-kernel is built for the CPU it is built on (`CPUINFER_CPU_INSTRUCT=NATIVE`). Its
   MXFP4 kernels need AVX2.
 - **VRAM: two 16 GB cards, nearly full, with the defaults.** Per card (tensor
-  parallel 2):
-  - 9.9 GB of weights: half of attention and the other dense layers, plus 5 resident
-    experts a layer.
-  - 1.9 GB for the 1M-token KV pool.
-  - 0.3 GB of CUDA graphs.
-  - 2.7 GB left for prefill work: the streamed experts' buffers and a 0.5 GB CUTLASS
-    workspace.
+  parallel 2): 8.3 GB of weights (half of attention and the other dense layers, plus 5
+  resident experts a layer), 1.9 GB for the 1M-token KV pool, and the rest for prefill
+  work and extra hot experts in decode.
 
-  One GPU holds all of the dense part and the whole KV pool itself. By estimate, that
-  needs about 24 GB at a 1M context. A single 16 GB card might fit with
-  `KT_GPU_EXPERTS=0` and `SGLANG_CONTEXT_LENGTH` around 262144. Neither is measured.
-  `CUDA_VISIBLE_DEVICES` picks the GPUs, one tensor-parallel rank each.
+  One GPU holds all of the dense part and the whole KV pool itself, about 24 GB at a 1M
+  context by estimate. `CUDA_VISIBLE_DEVICES` picks the GPUs, one tensor-parallel rank
+  each.
 - **Disk: about 500 GB, NVMe.**
   - The checkpoint is 476 GiB (510 GB).
   - `.venv` is 8.6 GB and the upstream clones about 1 GB.
@@ -92,9 +82,14 @@ defaults are listed in the script. Each one can be overridden by the environment
 variable named next to it. Among them:
 
 - the prefill experts streamed to the GPU, in bf16
-- the resident experts through Marlin
-- a "hot lend": 16 more hot experts a layer kept in the KV pool's free pages outside
-  prefill, without taking any of the pool
+- a "hot lend": more hot experts a layer kept on the GPU in decode, in the KV pool's free
+  pages and the driver's idle memory, without taking any of the pool
+  (`KT_KV_HOT_LEND`, `KT_KV_HOT_SPARE_FLOOR_MB`)
+- `wo_a` kept in the checkpoint's FP8 instead of a bf16 copy (`SGLANG_DSV4_WO_A_FP8_NATIVE`)
+- the vision tower in host memory, on the GPU only while images are encoded
+  (`SGLANG_DSV4_VISION_ON_DEMAND`)
+- the resident experts through Marlin, with the steps around its GEMMs in fp32
+  (`SGLANG_MARLIN_MOE_FP32_GLUE`)
 - a prefill chunk calibrated once, on the first launch of a setup (the server starts
   one extra time for this)
 - FlashInfer autotune off, so outputs reproduce across launches
@@ -116,17 +111,12 @@ before the bf16 `wo_a` projection:
 act_quant(o, fp8_block_size, scale_fmt, scale_dtype, True)  # blocks of 32, power-of-two scales
 ```
 
-The earlier release did not have this step. The weights are new (all 48 shards
-changed) and were made with it. The step moves `o` by 1.8-2.6% (relative L2) in
-every layer.
+The earlier release did not have this step; 1017's weights were made with it.
 
-- `patches/dsv4_o_fp8_qdq.py`: an in-place Triton kernel. It is bit-exact against the
-  checkpoint's own tilelang `act_quant`: 0 differing bf16 values at 1, 3, 37 and 4,096
-  tokens (`tools/dsv4-o-fp8-qdq-test.py`).
-  - On sm89 and newer, the e4m3 rounding uses the hardware conversion.
-  - On Ampere and older, Triton has no e4m3 type, so the kernel rounds in fp32
-    arithmetic. This emulation matches torch's `float8_e4m3fn` cast bit for bit,
-    signed zeros included, on 118,343,666 values (`tools/e4m3-emulation-test.py`).
+- `patches/dsv4_o_fp8_qdq.py`: an in-place Triton kernel, bit-exact against the
+  checkpoint's own tilelang `act_quant` (`tools/dsv4-o-fp8-qdq-test.py`). GPUs older
+  than sm89 get an fp32 emulation of the e4m3 rounding, also bit-exact
+  (`tools/e4m3-emulation-test.py`).
 - The tree patch includes it, behind `SGLANG_DSV4_O_FP8_QDQ_BLOCK`.
   `tools/o-fp8-qdq-block.sh` (sourced by `serve.sh`) reads the block size from the
   checkpoint's own `inference/model.py`. The step therefore turns on for 1017 (block
@@ -146,82 +136,22 @@ None of it needs a server change:
   defaults for a request that sets neither, since the checkpoint has no
   `generation_config.json`.
 
-## Memory and accuracy defaults
-
-`serve.sh` turns on four switches. Each one has an environment variable to turn it off.
-
-| switch | what it does | off |
-|---|---|---|
-| `SGLANG_DSV4_WO_A_FP8_NATIVE=1` | `wo_a` stays in the checkpoint's FP8 (32 × 32 E8M0 blocks) instead of a bf16 copy. Decode reads the FP8 directly, prefill dequantizes into a shared scratch. The lend's spans keep the FP8 size, so the KV pool is unchanged. | `0` |
-| `SGLANG_DSV4_VISION_ON_DEMAND=1` | The vision tower (925.7 MiB a GPU) waits in pinned host memory and is on the GPU only while a batch's images are encoded. The prefill plan gives a request with images that much less room. | `0` |
-| `KT_KV_HOT_SPARE_FLOOR_MB=1024` | In decode, the hot lend's slots also take the driver's idle memory above a 1 GiB floor, not only the KV pool's free pages. | `-1` |
-| `SGLANG_MARLIN_MOE_FP32_GLUE=1` | The Marlin MoE steps around its two GEMMs (SwiGLU, routing weights, top-k sum) run in fp32 with one rounding each. As written, they round to bf16 seven times, and a GPU expert lands 0.45% from fp32 (the CPU experts: 0.37%). | `0` |
-
-Measured on the development tree, three launches each (decode median, 35,000-token
-prompt, mean NLL over 6,120 tokens):
-
-| | decode tok/s | prefill tok/s, first / second | NLL | hot slots |
-|---|---|---|---|---|
-| FP8 `wo_a` only | 31.73 | 577 / 786 | 3.1508 | 129 |
-| + driver's idle memory | 34.43 | 577 / 889 | 3.1522 | 394 |
-| + vision on demand | 34.89 | 636 / 908 | 3.1606 | 501 |
-| + fp32 Marlin glue (the defaults) | 34.92 | 636 / 913 | 3.1478 | 501 |
-
-The extra hot slots move routes from the CPU to the GPU. With Marlin's bf16 steps, that
-raised the NLL; with the fp32 glue, the defaults sit lower than any of the earlier nine
-launches.
-
-Built from this repository alone with these defaults (a fresh directory, `setup.sh`,
-`serve.sh`, one launch): decode 35.04 tok/s, prefill 649 / 937 tok/s, NLL 3.1500. That
-is +0.0029 against the development tree's first launch with the same defaults (paired, SE
-0.0120, z +0.24).
-
 ## Results
 
-One machine, as an example: 2 × AMD EPYC 7452 (Zen 2, AVX2), 512 GB DDR4, 2 × RTX
-5070 Ti 16 GB, the checkpoint on NVMe. It ran the `serve.sh` defaults: 5 resident
-experts a layer, a 1M-token context, one request at a time. Each column is one
-launch.
+2 × AMD EPYC 7452 (Zen 2, AVX2), 512 GB DDR4, 2 × RTX 5070 Ti 16 GB, the checkpoint on
+NVMe; built from this repository and run with the `serve.sh` defaults (1M-token
+context, one request at a time):
 
-The last column was built from this repository alone: a new directory, a new venv,
-`setup.sh` cloning both upstreams from GitHub, then `serve.sh`. The other columns ran
-on the development tree these patches were taken from.
-
-| | earlier release | 1017 | 1017 without the FP8 step | 1017, built from this repo |
-|---|---|---|---|---|
-| decode, Japanese prose, median tok/s | 30.01 | 30.62 | 30.76 | 31.26 |
-| prefill, 35,000-token prompt, tok/s: first / second prompt | 549 / 786 | 522 / 685 ¹ | 580 / 788 | 598 / 738 ² |
-| mean NLL, 6,120 tokens of Japanese prose (24 × 256) | 3.0558 | 3.1369 | 3.1605 | 3.1557 |
-
-¹ This launch came straight after copying the checkpoint onto the NVMe, with the page
-cache full. Not repeated yet.
-
-² On its first launch the chunk calibration ran out of time while kernels compiled
-(fixed since: `SGLANG_WARMUP_TIMEOUT`), so the chunk stayed at its fallback.
-
-**Built from this repo vs the development tree** (same weights, same step): paired
-NLL +0.0188 (SE 0.0111, z +1.69). That is inside the launch-to-launch spread below.
-
-**Paired NLL, 1017 with the step minus without it:** −0.0237 (SE 0.0137, z −1.73,
-6,120 tokens). That is lower, but within what two launches of one configuration differ
-by on this machine (0.020-0.036, z up to −2.2). One launch each cannot tell the two
-apart. The reason for the step is that it is the model's own arithmetic, bit-exact
-against the reference code, and not this measurement.
-
-The earlier release's NLL comes from different weights, so it is not a quality
-comparison between the releases.
+| | |
+|---|---|
+| decode, Japanese prose | 35 tok/s |
+| prefill, 35,000-token prompt | 649 tok/s (937 tok/s for a second prompt) |
 
 ## Fixes from dsv41-flash-dual-epyc
 
-Two fixes by f-wunderlich for the earlier release's repo are in the tree patch here too:
-
-- **SM120 sparse MLA padding page** (dsv41-flash-dual-epyc#3). SGLang reserves
-  physical KV page 0 for padding, and FlashInfer maps index -1 to entry 0 before
-  it masks the score. The page-split scratch is persistent `torch.empty` storage,
-  so page 0 could hold NaN, and a masked NaN still reaches the attention output
-  through 0 × NaN. The page-split kernel now zeroes that page on every conversion.
-- **Zero resident experts with Marlin** (#2). `--kt-num-gpu-experts 0` no longer
-  asks Marlin to repack empty resident weights at load.
+Two fixes by f-wunderlich, from the earlier release's repo, are in the tree patch:
+SM120 attention no longer reads an uninitialized padding page (#3), and
+`--kt-num-gpu-experts 0` starts with Marlin (#2).
 
 ## Not done
 
