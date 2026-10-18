@@ -78,11 +78,23 @@ radix_args=(--disable-radix-cache)
 # DeepSeek-V4.1-Flash-1017 rounds the attention output to FP8 before wo_a; the block
 # comes from the checkpoint's own inference code (off for the earlier release)
 source "$here/tools/o-fp8-qdq-block.sh"
+# wo_a stays in the checkpoint's FP8 (32x32 E8M0 blocks) instead of a bf16 copy (0: bf16)
+export SGLANG_DSV4_WO_A_FP8_NATIVE="${SGLANG_DSV4_WO_A_FP8_NATIVE:-1}"
+# the vision tower waits in pinned host memory and is on the GPU only while a batch's
+# images are encoded; the prefill plan gives a request with images that much less room
+# (0: resident)
+export SGLANG_DSV4_VISION_ON_DEMAND="${SGLANG_DSV4_VISION_ON_DEMAND:-1}"
+# the Marlin MoE steps around its two GEMMs (SwiGLU, routing weights, top-k sum) in fp32
+# with one rounding each (0: the bf16 steps)
+export SGLANG_MARLIN_MOE_FP32_GLUE="${SGLANG_MARLIN_MOE_FP32_GLUE:-1}"
 
 # hot experts: the resident ones, and with the hot lend 16 more a layer in the KV
 # pool's free pages outside prefill (KT_KV_HOT_LEND=0 turns it off)
 source "$here/lib/kt-kv-hot-default.sh"
 kt_kv_hot_default "$here/placements/dsv41-expert-placement-hot64.json" 5 "$gpu_experts" 16 "$source_dir" swa
+# in decode the hot lend's slots also take the driver's idle memory above a 1 GiB floor
+# (-1: only the KV pool's free pages)
+export KT_KV_HOT_SPARE_FLOOR_MB="${KT_KV_HOT_SPARE_FLOOR_MB:-1024}"
 placement="${KT_EXPERT_PLACEMENT:-${KT_KV_HOT_PLACEMENT:-$here/placements/dsv41-expert-placement-${gpu_experts}.json}}"
 if [[ "$placement" != "none" && -f "$placement" ]]; then
   extra_args+=(--init-expert-location "$placement")
@@ -227,6 +239,7 @@ command=(
 printf '%s\n' "DeepSeek-V4.1-Flash on SGLang + KTransformers: $model"
 printf '%s\n' "GPUs ${CUDA_VISIBLE_DEVICES} (sm $cap), TP $tp on NUMA nodes $numa_list; CPU experts: $cpu_threads threads in $threadpools pools; GPU experts $gpu_experts a layer"
 printf '%s\n' "context $context_length; attention output FP8 before wo_a: block ${SGLANG_DSV4_O_FP8_QDQ_BLOCK:-0}"
+printf '%s\n' "wo_a native FP8: $SGLANG_DSV4_WO_A_FP8_NATIVE; vision tower on demand: $SGLANG_DSV4_VISION_ON_DEMAND; Marlin MoE fp32 glue: $SGLANG_MARLIN_MOE_FP32_GLUE; hot lend spare floor: $KT_KV_HOT_SPARE_FLOOR_MB MiB"
 printf '%s\n' "Run directory: $run_dir"
 ln -sfn "$run_dir" "$log_root/$log_name/current"
 if [[ "$mode" == "--background" ]]; then

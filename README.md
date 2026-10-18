@@ -146,6 +146,36 @@ None of it needs a server change:
   defaults for a request that sets neither, since the checkpoint has no
   `generation_config.json`.
 
+## Memory and accuracy defaults
+
+`serve.sh` turns on four switches. Each one has an environment variable to turn it off.
+
+| switch | what it does | off |
+|---|---|---|
+| `SGLANG_DSV4_WO_A_FP8_NATIVE=1` | `wo_a` stays in the checkpoint's FP8 (32 × 32 E8M0 blocks) instead of a bf16 copy. Decode reads the FP8 directly, prefill dequantizes into a shared scratch. The lend's spans keep the FP8 size, so the KV pool is unchanged. | `0` |
+| `SGLANG_DSV4_VISION_ON_DEMAND=1` | The vision tower (925.7 MiB a GPU) waits in pinned host memory and is on the GPU only while a batch's images are encoded. The prefill plan gives a request with images that much less room. | `0` |
+| `KT_KV_HOT_SPARE_FLOOR_MB=1024` | In decode, the hot lend's slots also take the driver's idle memory above a 1 GiB floor, not only the KV pool's free pages. | `-1` |
+| `SGLANG_MARLIN_MOE_FP32_GLUE=1` | The Marlin MoE steps around its two GEMMs (SwiGLU, routing weights, top-k sum) run in fp32 with one rounding each. As written, they round to bf16 seven times, and a GPU expert lands 0.45% from fp32 (the CPU experts: 0.37%). | `0` |
+
+Measured on the development tree, three launches each (decode median, 35,000-token
+prompt, mean NLL over 6,120 tokens):
+
+| | decode tok/s | prefill tok/s, first / second | NLL | hot slots |
+|---|---|---|---|---|
+| FP8 `wo_a` only | 31.73 | 577 / 786 | 3.1508 | 129 |
+| + driver's idle memory | 34.43 | 577 / 889 | 3.1522 | 394 |
+| + vision on demand | 34.89 | 636 / 908 | 3.1606 | 501 |
+| + fp32 Marlin glue (the defaults) | 34.92 | 636 / 913 | 3.1478 | 501 |
+
+The extra hot slots move routes from the CPU to the GPU. With Marlin's bf16 steps, that
+raised the NLL; with the fp32 glue, the defaults sit lower than any of the earlier nine
+launches.
+
+Built from this repository alone with these defaults (a fresh directory, `setup.sh`,
+`serve.sh`, one launch): decode 35.04 tok/s, prefill 649 / 937 tok/s, NLL 3.1500. That
+is +0.0029 against the development tree's first launch with the same defaults (paired, SE
+0.0120, z +0.24).
+
 ## Results
 
 One machine, as an example: 2 × AMD EPYC 7452 (Zen 2, AVX2), 512 GB DDR4, 2 × RTX

@@ -898,6 +898,104 @@ index 7dba72ae..aec621a3 100644
 +    if not expand:
 +        return keep  # [..., blocks]: the decision per block, not yet per position
      return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py b/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
+index 7f76b261..66b99985 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
+@@ -103,6 +103,59 @@ def get_scalar_type(
+         return scalar_types.uint4b8 if num_bits == 4 else scalar_types.uint8b128
+ 
+ 
++# sglang-marlin-moe-fp32-glue.py
++_FP32_GLUE = __import__("os").environ.get("SGLANG_MARLIN_MOE_FP32_GLUE", "0") == "1"
++
++
++@triton.jit
++def _swiglu_fp32_kernel(in_ptr, out_ptr, d, limit, HAS_LIMIT: tl.constexpr, BLOCK: tl.constexpr):
++    row = tl.program_id(0).to(tl.int64)
++    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    m = cols < d
++    g = tl.load(in_ptr + row * 2 * d + cols, mask=m, other=0.0).to(tl.float32)
++    u = tl.load(in_ptr + row * 2 * d + d + cols, mask=m, other=0.0).to(tl.float32)
++    if HAS_LIMIT:
++        g = tl.minimum(g, limit)
++        u = tl.minimum(tl.maximum(u, -limit), limit)
++    h = g / (1.0 + tl.exp(-g)) * u
++    tl.store(out_ptr + row * d + cols, h.to(out_ptr.dtype.element_ty), mask=m)
++
++
++def _swiglu_fp32(output: torch.Tensor, input: torch.Tensor, limit) -> None:
++    """silu(gate) * up of [rows, 2d] bf16 (gate first) in fp32, one rounding into output."""
++    rows, d = input.shape[0], input.shape[1] // 2
++    if rows == 0:
++        return
++    assert input.is_contiguous() and output.is_contiguous()
++    lim = float(limit) if limit else 0.0
++    BLOCK = 1024
++    _swiglu_fp32_kernel[(rows, triton.cdiv(d, BLOCK))](input, output, d, lim, HAS_LIMIT=lim > 0, BLOCK=BLOCK)
++
++
++@triton.jit
++def _topk_wsum_fp32_kernel(y_ptr, w_ptr, out_ptr, K, scale, TOPK: tl.constexpr, BLOCK: tl.constexpr):
++    row = tl.program_id(0).to(tl.int64)
++    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    m = cols < K
++    acc = tl.zeros([BLOCK], dtype=tl.float32)
++    for t in tl.static_range(TOPK):
++        wt = tl.load(w_ptr + row * TOPK + t).to(tl.float32)
++        y = tl.load(y_ptr + (row * TOPK + t) * K + cols, mask=m, other=0.0).to(tl.float32)
++        acc += wt * y
++    tl.store(out_ptr + row * K + cols, (acc * scale).to(out_ptr.dtype.element_ty), mask=m)
++
++
++def _topk_wsum_fp32(y: torch.Tensor, weights: torch.Tensor, output: torch.Tensor, scale: float) -> None:
++    """output[m] = scale * sum_t weights[m, t] * y[m, t] in fp32, one rounding."""
++    M, topk, K = y.shape
++    if M == 0:
++        return
++    weights = weights.contiguous()
++    assert y.is_contiguous() and output.is_contiguous() and weights.shape == (M, topk)
++    BLOCK = 1024
++    _topk_wsum_fp32_kernel[(M, triton.cdiv(K, BLOCK))](y, weights, output, K, float(scale), TOPK=topk, BLOCK=BLOCK)
++
++
+ def swiglu_limit_func(
+     output: torch.Tensor,
+     input: torch.Tensor,  # first half is gate, second half is up
+@@ -340,6 +393,9 @@ def fused_marlin_moe(
+             gemm1_alpha,
+             clamp_limit,
+         )
++    elif activation == "silu" and is_gated and _FP32_GLUE:
++        # sglang-marlin-moe-fp32-glue.py: fp32 SwiGLU, one rounding
++        _swiglu_fp32(intermediate_cache2, intermediate_cache1.view(-1, gemm1_n), clamp_limit)
+     elif activation == "silu" and is_gated and clamp_limit is not None:
+         swiglu_limit_func(
+             intermediate_cache2,
+@@ -382,7 +438,8 @@ def fused_marlin_moe(
+         topk_weights,
+         moe_block_size=block_size_m,
+         top_k=1,
+-        mul_topk_weights=True,
++        # sglang-marlin-moe-fp32-glue.py: the weights go on in fp32 in the sum below
++        mul_topk_weights=not _FP32_GLUE,
+         is_ep=expert_map is not None,
+         b_q_type=scalar_type2,
+         size_m=M * topk,
+@@ -398,6 +455,13 @@ def fused_marlin_moe(
+     if output is None:
+         output = hidden_states if inplace else torch.empty_like(hidden_states)
+ 
++    if _FP32_GLUE:
++        # sglang-marlin-moe-fp32-glue.py: the routes' outputs times their weights, summed
++        # in fp32; the MXFP4 path's weights already carry routed scaling
++        scale = 1.0 if is_mxfp4_marlin or routed_scaling_factor is None else routed_scaling_factor
++        _topk_wsum_fp32(intermediate_cache3, topk_weights, output, scale)
++        return output
++
+     if is_mxfp4_marlin:
+         # Top-k weights (incl. routed scaling) are already applied above via
+         # mul_topk_weights, so this is a plain sum over the topk dim. The JIT
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 index a1f0e7f0..bcd700b7 100644
 --- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
@@ -1273,10 +1371,10 @@ index 36c15cf1..4866bfb2 100644
  
 diff --git a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
 new file mode 100644
-index 00000000..6dc5552b
+index 00000000..f98d0867
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
-@@ -0,0 +1,484 @@
+@@ -0,0 +1,546 @@
 +"""More hot experts in the KV pool's free pages, outside prefill, for any GPU MoE
 +method of the KT wrapper (KT_KV_HOT_LEND=1, KT_KV_HOT_EXTRA=<X>; with
 +KT_KV_VMM=1).
@@ -1327,6 +1425,9 @@ index 00000000..6dc5552b
 +MIN_MB = int(os.environ.get("KT_KV_HOT_MIN_MB", "256"))  # smallest lend worth a sync and a copy
 +RETRY = int(os.environ.get("KT_KV_HOT_RETRY", "256"))  # forwards between tries when nothing was lent
 +MARGIN_MB = int(os.environ.get("KT_KV_HOT_MARGIN_MB", "64"))  # of the unmapped bytes left unused
++# KT_KV_HOT_SPARE_FLOOR_MB=<n> (sglang-kt-kv-hot-spare.py): the slots also take what the
++# driver has free in decode beyond n MiB (the prefill's room, idle between windows)
++SPARE_FLOOR_MB = int(os.environ.get("KT_KV_HOT_SPARE_FLOOR_MB", "-1") or -1)
 +# KT_KV_HOT_CHECK=<n>: every n-th eager MoE call, the layer's output is compared
 +# with the same call computed without the lend (the resident experts again, the
 +# CPU with every route), summed over the TP ranks (check)
@@ -1334,6 +1435,9 @@ index 00000000..6dc5552b
 +_CHECK_DUMP = os.environ.get("KT_KV_HOT_CHECK_DUMP", "")  # a directory: see check
 +_CHECK_DUMP_FIRST = int(os.environ.get("KT_KV_HOT_CHECK_DUMP_FIRST", "2"))  # checks dumped whatever they say
 +_MASK_ZERO = os.environ.get("KT_GPU_MASK_ZERO", "0") == "1"
++_SLOT_REL = float(os.environ.get("KT_KV_HOT_CHECK_SLOT_REL", "0.05") or 0.05)
++_DUMP_REL = float(os.environ.get("KT_KV_HOT_CHECK_DUMP_REL", "0.2") or 0.2)  # a call dumped past this
++_CHECK_REPEAT = os.environ.get("KT_KV_HOT_CHECK_REPEAT", "0") == "1"
 +
 +LAYERS: List["_Layer"] = []
 +STATE = {"k": None, "want": True, "since": 0, "lent_slots": 0, "lends": 0, "releases": 0, "hooked": False,
@@ -1464,6 +1568,15 @@ index 00000000..6dc5552b
 +    if cfg is not None and hasattr(method, "create_moe_runner"):
 +        cfg.num_local_experts = x
 +        method.create_moe_runner(shadow, cfg)
++    # the method's global-experts parameters (ModelOpt NVFP4's input scales) load no row
++    # into the shadow and kept their 1.0 fill, which the method's max took: the layer's
++    # loaded rows instead (patches/sglang-kt-global-expert-params.py)
++    try:
++        from sglang.srt.layers.moe.kt_ep_wrapper import kt_fill_global_expert_params
++    except ImportError:  # a tree without that patch
++        kt_fill_global_expert_params = None
++    if kt_fill_global_expert_params is not None:
++        kt_fill_global_expert_params(shadow, src=layer)
 +    with torch.cuda.device(dev):
 +        if hasattr(method, "process_weights_after_loading"):
 +            method.process_weights_after_loading(shadow)
@@ -1572,15 +1685,31 @@ index 00000000..6dc5552b
 +        rw = torch.where(cpu_id, torch.zeros_like(w), w)
 +    else:
 +        rid, rw = torch.where(cpu_id, torch.full_like(ids, -1), ids), w
++    # every call finished and copied out before the next one starts: the CPU's result
++    # comes through a host buffer the next submit writes again (10-18: rows that came
++    # back wrong on whichever side was read second)
++    torch.cuda.synchronize(x.device)
 +    res = wrapper.gpu_method.apply(layer, dispatch_output._replace(
-+        topk_output=topk._replace(topk_ids=rid, topk_weights=rw))).hidden_states.float()
-+    slots = L.method.apply(L.shadow, hot[1]).hidden_states.float()
++        topk_output=topk._replace(topk_ids=rid, topk_weights=rw))).hidden_states.float().clone()
++    slots = L.method.apply(L.shadow, hot[1]).hidden_states.float().clone()
++    torch.cuda.synchronize(x.device)
 +    cpu_full = cpu_rest = torch.zeros_like(res)
 +    if wrapper.tp_rank == 0 and wrapper.wrapper is not None:
 +        wrapper.submit(layer, dispatch_output._replace(topk_output=topk._replace(topk_ids=ids, topk_weights=w)))
-+        cpu_full = wrapper.sync(x).float()
++        cpu_full = wrapper.sync(x).float().clone()
++        torch.cuda.synchronize(x.device)
 +        wrapper.submit(layer, hot[0])
-+        cpu_rest = wrapper.sync(x).float()
++        cpu_rest = wrapper.sync(x).float().clone()
++        torch.cuda.synchronize(x.device)
++        if _CHECK_REPEAT:
++            # KT_KV_HOT_CHECK_REPEAT=1: both CPU calls once more, in the same order, so a
++            # dump shows whether a call's result depends on what ran before it
++            wrapper.submit(layer, dispatch_output._replace(topk_output=topk._replace(topk_ids=ids, topk_weights=w)))
++            STATE["cpu_full2"] = wrapper.sync(x).float().clone()
++            torch.cuda.synchronize(x.device)
++            wrapper.submit(layer, hot[0])
++            STATE["cpu_rest2"] = wrapper.sync(x).float().clone()
++            torch.cuda.synchronize(x.device)
 +    ar = tensor_model_parallel_all_reduce
 +    slots, lent_cpu = ar(slots.contiguous()), ar((cpu_full - cpu_rest).contiguous())
 +    ref = ar((res + cpu_full).contiguous())
@@ -1599,17 +1728,33 @@ index 00000000..6dc5552b
 +    floor = float(2.0 ** -8 * full_rows.norm() / lent_cpu.norm().clamp(min=1e-30))
 +    STATE["checks"] += 1
 +    if _CHECK_DUMP and wrapper.tp_rank == 0 and n_lent and (
-+            STATE["checks"] <= _CHECK_DUMP_FIRST or (rel_slots > 0.2 and STATE.get("dumps", 0) < 6)):
++            STATE["checks"] <= _CHECK_DUMP_FIRST or (rel_slots > _DUMP_REL and STATE.get("dumps", 0) < 6)):
 +        # KT_KV_HOT_CHECK_DUMP=<dir>: the call's inputs and both sides of the lent
 +        # routes, for a reference computed from the checkpoint offline
 +        STATE["dumps"] = STATE.get("dumps", 0) + (STATE["checks"] > _CHECK_DUMP_FIRST)
 +        os.makedirs(_CHECK_DUMP, exist_ok=True)
 +        # res: the resident experts' routes on the GPU method, the same method as the
 +        # slots (a reference can tell a property of the method from one of the lend)
++        # cpu_full / cpu_rest: the CPU's two calls (every route; the lent ones out), so a
++        # reference can tell a wrong CPU row from a wrong slot
 +        torch.save({"layer": L.idx, "n": L.n, "x": x.cpu(), "ids": ids.cpu(), "w": w.cpu(), "lent": lent.cpu(),
 +                    "slots": slots.cpu(), "cpu": lent_cpu.cpu(), "res": (ref - cpu_all).cpu(),
++                    "cpu_full": cpu_all.cpu(), "cpu_rest": ar(cpu_rest.contiguous()).cpu(),
++                    "cpu_full_raw": cpu_full.cpu(), "cpu_rest_raw": cpu_rest.cpu(),
++                    "cpu_full2": STATE.pop("cpu_full2", torch.zeros(0)).cpu(),
++                    "cpu_rest2": STATE.pop("cpu_rest2", torch.zeros(0)).cpu(),
++                    "cpu_ids": hot[0].topk_output.topk_ids.cpu(), "cpu_w": hot[0].topk_output.topk_weights.cpu(),
 +                    "rel_slots": rel_slots, "share": share},
 +                   os.path.join(_CHECK_DUMP, f"check{STATE['checks']}-layer{L.idx}.pt"))
++    if n_lent and rel_slots > _SLOT_REL and STATE.get("slotdiag", 0) < 4:
++        # KT_KV_HOT_CHECK_SLOT_REL: past this, which slot holds what its bank does not
++        # (a slot read through an unmapped or stale chunk differs from its bank)
++        STATE["slotdiag"] = STATE.get("slotdiag", 0) + 1
++        k = int(_k_dev(x.device)[L.idx])
++        bad = [f"{nm}[{j}]" for _, nm in L.names for j in range(k)
++               if not torch.equal(L.slots[nm][j].cpu(), L.banks[nm][j].cpu())]
++        _log(f"slot diag rank {wrapper.tp_rank} layer {L.idx} (k {k}, slots vs CPU {rel_slots:.3e}): "
++             f"{len(bad)} of {k * len(L.names)} slot tensors differ from their bank: {bad[:16]}")
 +    if n_lent and rel_slots > 0.5 and STATE.get("diag", 0) < 3:
 +        # the slots gave (almost) nothing for routes they hold: what do they hold?
 +        STATE["diag"] = STATE.get("diag", 0) + 1
@@ -1618,8 +1763,10 @@ index 00000000..6dc5552b
 +            cur = (L.shadow._parameters.get(nm) if kind == "param" else L.shadow._buffers.get(nm)
 +                   if kind == "buffer" else L.shadow.__dict__.get(nm))
 +            same = cur is not None and cur.data_ptr() == L.slots[nm].data_ptr()
-+            sv = float(L.slots[nm][:k].view(torch.uint8).float().abs().sum()) if k else 0.0
-+            bv = float(L.banks[nm][:k].view(torch.uint8).float().abs().sum()) if k else 0.0
++            # on the host: in decode the driver's memory may be the lend's (a 226 MiB
++            # float copy here ran 1017 out of memory, 10-17)
++            sv = float(L.slots[nm][:k].cpu().view(torch.uint8).float().abs().sum()) if k else 0.0
++            bv = float(L.banks[nm][:k].cpu().view(torch.uint8).float().abs().sum()) if k else 0.0
 +            _log(f"diag rank {wrapper.tp_rank} layer {L.idx} {kind} {nm}: shadow reads the slot {same}, "
 +                 f"getattr is the slot {getattr(L.shadow, nm).data_ptr() == L.slots[nm].data_ptr()}, "
 +                 f"slot bytes sum {sv:.4g}, bank {bv:.4g}")
@@ -1711,7 +1858,15 @@ index 00000000..6dc5552b
 +    if got <= 0:
 +        return
 +    dev = LAYERS[0].slots[LAYERS[0].names[0][1]].device
-+    ks = _plan(got - (MARGIN_MB << 20))
++    budget = got - (MARGIN_MB << 20)
++    spare = 0
++    if SPARE_FLOOR_MB >= 0:
++        # what the driver has free now counts the KV chunks just unmapped
++        torch.cuda.empty_cache()
++        free = torch.cuda.mem_get_info(dev)[0] - (SPARE_FLOOR_MB << 20)
++        if free > budget:
++            spare, budget = free - budget, free
++    ks = _plan(budget)
 +    for i, (L, k) in enumerate(zip(LAYERS, ks)):
 +        if k and any(kt_kv_vmm.restore(L.slots[nm], 0, _span(L, nm, k)) < 0 for _, nm in L.names):
 +            # no memory after all: this layer and the rest get nothing
@@ -1731,9 +1886,13 @@ index 00000000..6dc5552b
 +    kd.copy_(torch.tensor(ks, dtype=torch.int64), non_blocking=True)
 +    torch.cuda.synchronize(dev)
 +    STATE["lent_slots"] = sum(ks)
++    # what the slots hold beyond the KV pages: back at the window's start, so the
++    # prefill plan counts it as free (sglang-kt-kv-hot-spare-plan.py)
++    STATE["spare_held"] = max(0, sum(_cost(L, k) for L, k in zip(LAYERS, ks)) - got)
 +    STATE["lends"] += 1
 +    if STATE["lends"] in (1, 2, 10, 100, 1000) or CHECK:
-+        _log(f"lend {STATE['lends']}: {got / 2**30:.2f} GiB of free pages unmapped, {sum(ks)} slots "
++        _log(f"lend {STATE['lends']}: {got / 2**30:.2f} GiB of free pages unmapped"
++             + (f" + {spare / 2**30:.2f} GiB the driver had free" if spare else "") + f", {sum(ks)} slots "
 +             f"({min(ks)}-{max(ks)} a layer of {LAYERS[0].x}) in {(time.perf_counter() - t0) * 1e3:.1f} ms"
 +             + (f"; the shadows keep {STATE.get('left', 0) / 2**20:.0f} MiB outside their slots"
 +                if STATE["lends"] == 1 else ""))
@@ -1761,6 +1920,7 @@ index 00000000..6dc5552b
 +        _log(f"release {STATE['releases']} ({why}): {STATE['lent_slots']} slots out in "
 +             f"{(time.perf_counter() - t0) * 1e3:.1f} ms")
 +    STATE["lent_slots"] = 0
++    STATE["spare_held"] = 0
 diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 new file mode 100644
 index 00000000..9846efd0
@@ -4697,10 +4857,10 @@ index 00000000..f65561df
 +    return _bounce["buf"][:nbytes]
 diff --git a/python/sglang/srt/layers/moe/kt_prefill_plan.py b/python/sglang/srt/layers/moe/kt_prefill_plan.py
 new file mode 100644
-index 00000000..ef7bc256
+index 00000000..2007364d
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_prefill_plan.py
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,236 @@
 +"""The prefill chunk planned per request (KT_PREFILL_PLAN=1, with the prefill lend
 +and, for the room of the free KV pages, KT_PREFILL_KV_LEND=1).
 +
@@ -4744,6 +4904,24 @@ index 00000000..ef7bc256
 +# of a launch without KT_PREFILL_PLAN_DELTA_MB); unset, the launch chunk
 +SAFE = int(os.environ.get("KT_PREFILL_PLAN_SAFE", "0") or 0)
 +STATS = {"plans": 0, "last": None}
++# what a request's own forward puts back on the GPU before its rows run, by name (bytes):
++# a model that keeps its vision tower on the host between images registers it
++# (sglang-dsv4-vision-on-demand.py), and a request with images is planned with that
++# much less room
++ON_DEMAND = {}
++
++
++def on_demand(name: str, nbytes: int) -> None:
++    ON_DEMAND[name] = int(nbytes)
++
++
++def _on_demand_for(req) -> int:
++    if not ON_DEMAND:
++        return 0
++    mm = getattr(req, "multimodal_inputs", None)
++    if mm is None or not getattr(mm, "mm_items", None):
++        return 0
++    return sum(ON_DEMAND.values())
 +
 +
 +# room kept free in a planned window (MiB); unset: the lend's own margin. The
@@ -4813,6 +4991,12 @@ index 00000000..ef7bc256
 +        # before this launch's first window: the step an earlier launch measured
 +        delta = DELTA
 +    mine = torch.cuda.mem_get_info()[0] + delta if delta is not None else -1
++    if mine >= 0:
++        # the hot lend's share of the driver's free memory comes back at the window's
++        # start (sglang-kt-kv-hot-spare-plan.py)
++        from sglang.srt.layers.moe import kt_kv_hot_lend
++
++        mine += int(kt_kv_hot_lend.STATE.get("spare_held", 0) or 0)
 +    t = torch.tensor([mine], dtype=torch.int64)
 +    group = getattr(scheduler, "tp_cpu_group", None)
 +    if group is not None and torch.distributed.is_initialized():
@@ -4861,7 +5045,8 @@ index 00000000..ef7bc256
 +    if free <= 0:
 +        return min(chunk, SAFE) if SAFE > 0 else chunk
 +    loan = kt_kv_prefill_lend.loan_estimate(scheduler, rem)
-+    room = free + loan - _margin()
++    back = _on_demand_for(req)
++    room = free + loan - _margin() - back
 +    # the sliding-window pool's lent pages a request's chunks map back
 +    # (KT_PREFILL_SWA_LEND): nothing up to the mapped free ones, then a token's SWA
 +    # bytes a row, for every row the request may hold at once
@@ -4900,15 +5085,17 @@ index 00000000..ef7bc256
 +    # the loan when the estimate needs it, and always past the lend's own chunk:
 +    # there the estimate is extrapolated, and lending costs a few tens of ms
 +    NEED[req.rid] = (FIXED + (CARRY if n > 1 else 0) + ROW * c + SEQ * (done + rem) + swa_cost(c)
-+                     + _margin() > free) or (SAFE > 0 and c > SAFE)
++                     + _margin() + back > free) or (SAFE > 0 and c > SAFE)
 +    STATS["plans"] += 1
-+    plan = (rem, n, c)
++    plan = (rem, n, c, back)
 +    if plan != STATS["last"]:
 +        STATS["last"] = plan
 +        print(f"[kt-prefill-plan] {rem} tokens to prefill after {done} cached: {n} chunk(s) of {c} "
 +              f"(free {free >> 20} MiB + loan {loan >> 20} MiB, fixed {FIXED >> 20} MiB, "
 +              f"{ROW / 1024:.0f} KiB a row, {SEQ:.0f} B a sequence token, carry {CARRY >> 20} MiB, "
-+              f"SWA mapped back {swa_cost(c) >> 20} MiB, cap {chunk})", flush=True)
++              f"SWA mapped back {swa_cost(c) >> 20} MiB"
++              + (f", {back >> 20} MiB back on the GPU for the images ({', '.join(ON_DEMAND)})" if back else "")
++              + f", cap {chunk})", flush=True)
 +    return c
 diff --git a/python/sglang/srt/layers/moe/kt_stream_prefill.py b/python/sglang/srt/layers/moe/kt_stream_prefill.py
 new file mode 100644
@@ -7389,38 +7576,41 @@ index 00000000..3a062ae8
 +    return (v.to(torch.float8_e4m3fn).float() * s).to(x.dtype).reshape(shape)
 diff --git a/python/sglang/srt/models/deepseek_common/wo_a_fp8_gemv.py b/python/sglang/srt/models/deepseek_common/wo_a_fp8_gemv.py
 new file mode 100644
-index 00000000..8e0a4cbd
+index 00000000..8ff875fa
 --- /dev/null
 +++ b/python/sglang/srt/models/deepseek_common/wo_a_fp8_gemv.py
-@@ -0,0 +1,49 @@
-+"""Single-token V4 wo_a from FP8 weights (patches/sglang-dsv4-wo-a-fp8-gemv.py)."""
+@@ -0,0 +1,73 @@
++"""V4 wo_a from FP8 weights (patches/sglang-dsv4-wo-a-fp8-gemv.py,
++patches/sglang-dsv4-wo-a-fp8-block.py)."""
 +
 +import torch
 +import triton
 +import triton.language as tl
 +
 +
-+def fp8_blocks_from_bf16(w: torch.Tensor):
-+    """[G, R, D] bf16 -> ([G, R, D] e4m3, [G, R/128, D/128] fp32) by the
-+    converter's rule (scale 2^ceil(log2(amax / 448)) per 128x128 block), or
-+    None unless it reproduces w exactly."""
++def fp8_blocks_from_bf16(w: torch.Tensor, blocks=(128, 32)):
++    """[G, R, D] bf16 -> ([G, R, D] e4m3, [G, R/b, D/b] fp32) by the converter's rule
++    (scale 2^ceil(log2(amax / 448)) per b x b block), at the first block size b that
++    reproduces w exactly; None if none does."""
 +    G, R, D = w.shape
-+    if R % 128 or D % 128:
-+        return None
-+    blocks = w.float().view(G, R // 128, 128, D // 128, 128)
-+    amax = blocks.abs().amax(dim=(2, 4))
-+    exp = torch.ceil(torch.log2(torch.where(amax > 0, amax / 448.0, torch.ones_like(amax))))
-+    exp = torch.where(amax > 0, exp, torch.full_like(exp, -127.0))
-+    scale = torch.exp2(exp)
-+    q = (blocks / scale[:, :, None, :, None]).to(torch.float8_e4m3fn)
-+    back = (q.float() * scale[:, :, None, :, None]).view(G, R, D).to(torch.bfloat16)
-+    if not torch.equal(back, w):
-+        return None
-+    return q.view(G, R, D).contiguous(), scale.contiguous()
++    for b in blocks:
++        if R % b or D % b:
++            continue
++        tiles = w.float().view(G, R // b, b, D // b, b)
++        amax = tiles.abs().amax(dim=(2, 4))
++        exp = torch.ceil(torch.log2(torch.where(amax > 0, amax / 448.0, torch.ones_like(amax))))
++        exp = torch.where(amax > 0, exp, torch.full_like(exp, -127.0))
++        scale = torch.exp2(exp)
++        q = (tiles / scale[:, :, None, :, None]).to(torch.float8_e4m3fn)
++        back = (q.float() * scale[:, :, None, :, None]).view(G, R, D).to(torch.bfloat16)
++        del tiles
++        if torch.equal(back, w):
++            return q.view(G, R, D).contiguous(), scale.contiguous()
++    return None
 +
 +
 +@triton.jit
-+def _wo_a_fp8_gemv_kernel(x_ptr, w_ptr, s_ptr, o_ptr, R, D,
++def _wo_a_fp8_gemv_kernel(x_ptr, w_ptr, s_ptr, o_ptr, R, D, SB: tl.constexpr,
 +                          BLOCK_R: tl.constexpr, BLOCK_D: tl.constexpr):
 +    g = tl.program_id(0)
 +    rb = tl.program_id(1)
@@ -7430,17 +7620,38 @@ index 00000000..8e0a4cbd
 +        cols = d0 + tl.arange(0, BLOCK_D)
 +        x = tl.load(x_ptr + g * D + cols).to(tl.float32)
 +        w = tl.load(w_ptr + (g * R + rows[:, None]) * D + cols[None, :]).to(tl.float32)
-+        s = tl.load(s_ptr + (g * (R // 128) + rows[:, None] // 128) * (D // 128) + cols[None, :] // 128)
++        s = tl.load(s_ptr + (g * (R // SB) + rows[:, None] // SB) * (D // SB) + cols[None, :] // SB)
 +        acc += w * s * x[None, :]
 +    tl.store(o_ptr + g * R + rows, tl.sum(acc, axis=1).to(o_ptr.dtype.element_ty))
 +
 +
 +def wo_a_fp8_gemv(o: torch.Tensor, q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-+    """o [1, G, D] bf16, q [G, R, D] e4m3, s [G, R/128, D/128] -> [1, G, R] bf16."""
++    """o [1, G, D] bf16, q [G, R, D] e4m3, s [G, R/b, D/b] -> [1, G, R] bf16."""
 +    G, R, D = q.shape
 +    x = o.reshape(G, D).contiguous()
 +    out = torch.empty((1, G, R), device=o.device, dtype=o.dtype)
-+    _wo_a_fp8_gemv_kernel[(G, R // 16)](x, q, s, out, R, D, BLOCK_R=16, BLOCK_D=256, num_warps=4)
++    _wo_a_fp8_gemv_kernel[(G, R // 16)](x, q, s, out, R, D, SB=R // s.shape[1],
++                                        BLOCK_R=16, BLOCK_D=256, num_warps=4)
++    return out
++
++
++@triton.jit
++def _wo_a_fp8_dequant_kernel(w_ptr, s_ptr, o_ptr, R, D, SB: tl.constexpr,
++                             BLOCK_R: tl.constexpr, BLOCK_D: tl.constexpr):
++    g = tl.program_id(0)
++    rows = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)
++    cols = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
++    offs = (g * R + rows[:, None]).to(tl.int64) * D + cols[None, :]
++    w = tl.load(w_ptr + offs).to(tl.float32)
++    s = tl.load(s_ptr + (g * (R // SB) + rows[:, None] // SB) * (D // SB) + cols[None, :] // SB)
++    tl.store(o_ptr + offs, (w * s).to(o_ptr.dtype.element_ty))
++
++
++def wo_a_fp8_dequant(q: torch.Tensor, s: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
++    """q [G, R, D] e4m3, s [G, R/b, D/b] -> out [G, R, D] bf16 (exact: s is a power of two)."""
++    G, R, D = q.shape
++    _wo_a_fp8_dequant_kernel[(G, R // 32, D // 128)](q, s, out, R, D, SB=R // s.shape[1],
++                                                     BLOCK_R=32, BLOCK_D=128, num_warps=4)
 +    return out
 diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
 index 8f3cf1da..dd9cea0c 100644
@@ -7525,10 +7736,18 @@ index 8f3cf1da..dd9cea0c 100644
              pre_quant_input = None
              shared_output = None
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 228af858..a0516f5c 100644
+index 228af858..a6a0ea64 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -19,6 +19,7 @@ from typing import (
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import concurrent.futures
++import contextlib
+ import functools
+ import logging
+ import time
+@@ -19,6 +20,7 @@ from typing import (
      Union,
  )
  
@@ -7536,7 +7755,7 @@ index 228af858..a0516f5c 100644
  import torch
  import torch.nn as nn
  import torch.nn.functional as F
-@@ -48,6 +49,45 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+@@ -48,6 +50,45 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
  from sglang.srt.environ import envs
  from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
  from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -7582,7 +7801,7 @@ index 228af858..a0516f5c 100644
  from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
  from sglang.srt.layers.attention.dsa.utils import (
      can_dsa_cp_split,
-@@ -182,6 +222,7 @@ from sglang.srt.models.deepseek_v2 import (
+@@ -182,6 +223,7 @@ from sglang.srt.models.deepseek_v2 import (
  )
  from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
  from sglang.srt.multimodal.deepseek_v41_image_processing import (
@@ -7590,12 +7809,13 @@ index 228af858..a0516f5c 100644
      image_token_types,
      materialize_image_gpu,
  )
-@@ -453,6 +494,51 @@ if _is_hip:
+@@ -453,6 +495,179 @@ if _is_hip:
              _wo_a_fp8_mxscale_fused_invrope = apply_wo_a_fp8_mxscale_fused_invrope
  
  
 +from sglang.srt.models.deepseek_common.wo_a_fp8_gemv import (  # noqa: E402
 +    fp8_blocks_from_bf16,
++    wo_a_fp8_dequant,
 +    wo_a_fp8_gemv,
 +)
 +
@@ -7626,6 +7846,30 @@ index 228af858..a0516f5c 100644
 +        built,
 +        skipped,
 +    )
++    # SGLANG_DSV4_WO_A_FP8_ONLY=1 (sglang-dsv4-wo-a-fp8-block.py): the attention layers
++    # drop the bf16 wo_a; other forwards dequantize into one shared scratch
++    if os.environ.get("SGLANG_DSV4_WO_A_FP8_ONLY") != "1" or not built:
++        return
++    scratch = {}
++    freed = 0
++    for module in model.modules():
++        copy = getattr(module, "_wo_a_fp8_copy", None)
++        if copy is None or type(module).__name__ != "MQALayer":
++            continue
++        weight = module.wo_a.weight
++        key = (weight.device, tuple(copy[0].shape))
++        if key not in scratch:
++            scratch[key] = torch.empty(copy[0].shape, dtype=torch.bfloat16, device=weight.device)
++        module._wo_a_fp8_scratch = scratch[key]
++        freed += weight.numel() * weight.element_size()
++        weight.data = torch.empty(0, dtype=weight.dtype, device=weight.device)
++        module._wo_a_fp8_only = True
++    torch.cuda.empty_cache()
++    logger.info(
++        "wo_a FP8 only: %.1f MB of bf16 freed, %.1f MB of scratch",
++        freed / 2**20,
++        sum(t.numel() * t.element_size() for t in scratch.values()) / 2**20,
++    )
 +
 +
 +def _o_fp8_qdq_block() -> int:
@@ -7639,10 +7883,159 @@ index 228af858..a0516f5c 100644
 +_O_FP8_QDQ_BLOCK = _o_fp8_qdq_block()
 +
 +
++# sglang-dsv4-vision-on-demand.py
++_VISION_ON_DEMAND = __import__("os").environ.get("SGLANG_DSV4_VISION_ON_DEMAND", "0") == "1"
++
++
++def _vision_offload(model) -> None:
++    """After loading: the vision tower's parameters to pinned host memory, their GPU
++    storage freed (SGLANG_DSV4_VISION_ON_DEMAND=1)."""
++    if not _VISION_ON_DEMAND or getattr(model, "vision", None) is None:
++        return
++    store, nbytes = [], 0
++    for mod in (model.vision, getattr(model, "aligner", None)):
++        if mod is None:
++            continue
++        for p in mod.parameters():
++            if not p.is_cuda or p.numel() == 0:
++                continue
++            host = torch.empty(p.shape, dtype=p.dtype, pin_memory=True)
++            host.copy_(p.data)
++            store.append((p, host))
++            nbytes += p.numel() * p.element_size()
++            p.data = torch.empty(0, dtype=p.dtype, device=p.device)
++    torch.cuda.synchronize()
++    torch.cuda.empty_cache()
++    model._vision_store = store
++    model._vision_resident = False
++    logger.info("vision tower on demand: %.1f MiB of %d parameters moved to pinned host memory",
++                nbytes / 2**20, len(store))
++    try:
++        # the prefill plan gives a request with images that much less room
++        from sglang.srt.layers.moe import kt_prefill_plan
++
++        kt_prefill_plan.on_demand("vision tower", nbytes)
++    except Exception:
++        pass
++
++
++@contextlib.contextmanager
++def _vision_on_gpu(model):
++    """Around an image batch: the tower's parameters back on the GPU, freed after."""
++    store = getattr(model, "_vision_store", None)
++    if not store or getattr(model, "_vision_resident", False):
++        yield
++        return
++    try:
++        from sglang.srt.layers.moe import kt_kv_prefill_lend
++
++        kt_kv_prefill_lend.hot_release("vision tower")
++    except Exception:
++        pass
++    dev = store[0][0].device
++    for p, host in store:
++        p.data = torch.empty(host.shape, dtype=host.dtype, device=dev)
++        p.data.copy_(host, non_blocking=True)
++    model._vision_resident = True
++    try:
++        yield
++    finally:
++        # frees are stream-ordered: the encoding's kernels finish before reuse
++        for p, host in store:
++            p.data = torch.empty(0, dtype=host.dtype, device=dev)
++        model._vision_resident = False
++# sglang-dsv4-wo-a-fp8-native.py
++_WO_A_FP8_NATIVE = __import__("os").environ.get("SGLANG_DSV4_WO_A_FP8_NATIVE", "0") == "1"
++
++
++class _WoANativeKeep:
++    """wo_a's quant method under SGLANG_DSV4_WO_A_FP8_NATIVE: nothing after loading."""
++
++    def process_weights_after_loading(self, layer) -> None:
++        return None
++
++
++def _setup_wo_a_native(model) -> None:
++    """After loading: each native-FP8 wo_a's scales as fp32 [G, R/b, D/b] (powers of
++    two, exact), and one bf16 scratch per device for the forwards that dequantize."""
++    scratch, n = {}, 0
++    for module in model.modules():
++        if not getattr(module, "_wo_a_native_fp8", False):
++            continue
++        w, sc = module.wo_a.weight, module.wo_a.weight_scale_inv
++        G, R = module.n_local_groups, module.o_lora_rank
++        D = w.shape[-1]
++        if w.dtype != torch.float8_e4m3fn or w.shape[0] != G * R or sc.dim() != 2:
++            raise RuntimeError(f"SGLANG_DSV4_WO_A_FP8_NATIVE: wo_a {tuple(w.shape)} {w.dtype}, "
++                               f"scales {tuple(sc.shape)} {sc.dtype}: not the checkpoint's FP8 blocks")
++        b, bk = (G * R) // sc.shape[0], D // sc.shape[1]
++        if b != bk or R % b or b * sc.shape[0] != G * R:
++            raise RuntimeError(f"SGLANG_DSV4_WO_A_FP8_NATIVE: {b} x {bk} blocks over [{G * R}, {D}]")
++        if sc.dtype in (torch.uint8, torch.float8_e8m0fnu):  # E8M0 exponents
++            scf = torch.exp2(sc.view(torch.uint8).float() - 127)
++        else:
++            scf = sc.float()
++        module._wo_a_native_s = scf.reshape(G, R // b, D // b).contiguous()
++        key = (w.device, G, R, D)
++        if key not in scratch:
++            scratch[key] = torch.empty((G, R, D), dtype=torch.bfloat16, device=w.device)
++        module._wo_a_fp8_scratch = scratch[key]
++        n += 1
++    if n:
++        logger.info("wo_a in the checkpoint's FP8: %d layers, %.1f MB of scratch", n,
++                    sum(t.numel() * 2 for t in scratch.values()) / 2**20)
++
++
  def _apply_wo_a_bf16_matmul(
      o: torch.Tensor, wo_a: torch.Tensor, is_decode: bool
  ) -> torch.Tensor:
-@@ -2061,8 +2147,19 @@ class MQALayer(MqaAttentionBase):
+@@ -795,6 +1010,17 @@ class MqaAttentionBase(nn.Module):
+         else:
+             wo_a_quant_config = None
+ 
++        # sglang-dsv4-wo-a-fp8-native.py: the checkpoint's FP8 wo_a kept as it is
++        self._wo_a_native_fp8 = (
++            _WO_A_FP8_NATIVE
++            and not fp8
++            and wo_a_fp8 is None
++            and wo_a_keeps_quant_config is None
++            and isinstance(quant_config, Fp8Config)
++            and quant_config.weight_block_size is not None
++        )
++        if self._wo_a_native_fp8:
++            wo_a_quant_config = quant_config
+         self.fuse_wqa_wkv = fuse
+         self.wo_a_fp8 = fp8
+ 
+@@ -842,8 +1068,13 @@ class MqaAttentionBase(nn.Module):
+             prefix=add_prefix("wo_a", prefix),
+             tp_rank=self.attn_tp_rank,
+             tp_size=self.attn_tp_size,
+-            **({} if fp8 else {"params_dtype": torch.bfloat16}),
++            **({} if fp8 or self._wo_a_native_fp8 else {"params_dtype": torch.bfloat16}),
+         )
++        if self._wo_a_native_fp8:
++            # applied by forward() below, never through the linear method: keep the
++            # weight and its scales as loaded (no requantization, no relayout)
++            self.wo_a.skip_aiter_bpreshuffle = True
++            self.wo_a.quant_method = _WoANativeKeep()
+         if fp8:
+             from sglang.srt.layers import deep_gemm_wrapper
+ 
+@@ -1870,7 +2101,11 @@ class MQALayer(MqaAttentionBase):
+                     or tuple(q_padded.shape) != want
+                     or q_padded.dtype != x.dtype
+                 ):
+-                    q_padded = x.new_zeros(*want)
++                    # sglang-dsv4-qpad-scratch.py: a prefill window's goes with the scratch
++                    from sglang.srt.layers.moe import kt_lend
++
++                    with kt_lend.scratch_region():
++                        q_padded = x.new_zeros(*want)
+                     if meta is not None:
+                         try:
+                             meta.q_pad_buffer = q_padded
+@@ -2061,8 +2296,36 @@ class MQALayer(MqaAttentionBase):
                  )
                  o = output
              else:
@@ -7659,11 +8052,28 @@ index 228af858..a0516f5c 100644
 +                    and forward_batch.forward_mode.is_decode()
 +                ):
 +                    o = wo_a_fp8_gemv(o, *wo_a_fp8_copy)
++                elif getattr(self, "_wo_a_fp8_only", False):
++                    # sglang-dsv4-wo-a-fp8-block.py: the bf16 wo_a is gone
++                    wo_a = wo_a_fp8_dequant(*wo_a_fp8_copy, self._wo_a_fp8_scratch)
++                    o = _apply_wo_a_bf16_matmul(
++                        o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
++                    )
++                elif getattr(self, "_wo_a_native_s", None) is not None:
++                    # sglang-dsv4-wo-a-fp8-native.py (the weight is viewed here, every
++                    # call: the prefill lend points it elsewhere while it streams)
++                    q = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
++                    if o.shape[0] == 1 and forward_batch.forward_mode.is_decode():
++                        o = wo_a_fp8_gemv(o, q, self._wo_a_native_s)
++                    else:
++                        wo_a = wo_a_fp8_dequant(q, self._wo_a_native_s, self._wo_a_fp8_scratch)
++                        o = _apply_wo_a_bf16_matmul(
++                            o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
++                        )
 +                elif wo_a_weight is not None:
                      wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
                      o = _apply_wo_a_bf16_matmul(
                          o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
-@@ -4052,7 +4149,11 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4052,7 +4315,19 @@ class DeepseekV4ForCausalLM(nn.Module):
          self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
          self.determine_num_fused_shared_experts()
          self.vision = None
@@ -7672,11 +8082,19 @@ index 228af858..a0516f5c 100644
 +        # V4 model types the checkpoint calls itself: V4-Flash-Vision-Exp says
 +        # "deepseek_v4" and carries the same ViT. Checkpoints without the field
 +        # keep the text-only path.
-+        if getattr(config, "vision_n_layers", 0) > 0:
++        # sglang-dsv4-language-model-only.py: --language-model-only builds no tower
++        self._lm_only = bool(getattr(config, "language_model_only", False))
++        if not self._lm_only:
++            from sglang.srt.runtime_context import get_disagg
++
++            self._lm_only = bool(getattr(get_disagg(), "language_model_only", False))
++        if getattr(config, "vision_n_layers", 0) > 0 and self._lm_only:
++            logger.info("--language-model-only: the vision tower and aligner are not built")
++        elif getattr(config, "vision_n_layers", 0) > 0:
              if (
                  get_parallel().attn_cp_size != 1
                  or get_pp_group().world_size != 1
-@@ -4068,6 +4169,9 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4068,6 +4343,9 @@ class DeepseekV4ForCausalLM(nn.Module):
              self.image_start = nn.Parameter(torch.empty(config.hidden_size))
              self.image_end = nn.Parameter(torch.empty(config.hidden_size))
              self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
@@ -7686,7 +8104,7 @@ index 228af858..a0516f5c 100644
          self.model = DeepseekV4Model(
              config, quant_config, prefix=add_prefix("model", prefix)
          )
-@@ -4140,7 +4244,14 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4140,7 +4418,14 @@ class DeepseekV4ForCausalLM(nn.Module):
              )
              features = self.aligner(self.vision(patches, h, w), h, w)
              r = self.config.vision_downsample_ratio
@@ -7702,7 +8120,7 @@ index 228af858..a0516f5c 100644
              span = torch.empty(
                  (len(types), self.config.hidden_size), device=device, dtype=dtype
              )
-@@ -4148,6 +4259,8 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4148,23 +4433,27 @@ class DeepseekV4ForCausalLM(nn.Module):
              span[types == 1] = features.to(dtype)
              span[types == 2] = self.image_newline
              span[types == 3] = self.image_end
@@ -7711,16 +8129,48 @@ index 228af858..a0516f5c 100644
              spans.append(span)
          return spans
  
-@@ -4360,6 +4473,8 @@ class DeepseekV4ForCausalLM(nn.Module):
+     def _prepare_mm_embeddings(self, input_ids, forward_batch):
+ 
+         # Keep scheduler hash IDs intact: the shared embedder clamps its input in place.
+-        input_embeds, _ = embed_mm_inputs(
+-            mm_inputs_list=[
+-                item if item is not None else MultimodalInputs(mm_items=[])
+-                for item in forward_batch.mm_inputs
+-            ],
+-            extend_prefix_lens=forward_batch.extend_prefix_lens_cpu,
+-            extend_seq_lens=forward_batch.extend_seq_lens_cpu,
+-            input_ids=input_ids.clone(),
+-            input_embedding=self.get_input_embeddings(),
+-            multimodal_model=self,
+-        )
++        # The tower is on the GPU for this batch only (sglang-dsv4-vision-on-demand.py).
++        with _vision_on_gpu(self):
++            input_embeds, _ = embed_mm_inputs(
++                mm_inputs_list=[
++                    item if item is not None else MultimodalInputs(mm_items=[])
++                    for item in forward_batch.mm_inputs
++                ],
++                extend_prefix_lens=forward_batch.extend_prefix_lens_cpu,
++                extend_seq_lens=forward_batch.extend_seq_lens_cpu,
++                input_ids=input_ids.clone(),
++                input_embedding=self.get_input_embeddings(),
++                multimodal_model=self,
++            )
+         forward_batch.mm_input_embeds = input_embeds
+         return input_embeds
+ 
+@@ -4360,6 +4649,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                  attn.wo_a.weight_scale_inv.format_ue8m0 = False
  
      def post_load_weights(self, is_nextn=False, weight_names=None):
 +        if not is_nextn:
++            _vision_offload(self)
 +            _build_wo_a_fp8_copies(self)
++            _setup_wo_a_native(self)
          if self.wo_a_fp8:
              self._setup_fp8_wo_a_scales(is_nextn)
  
-@@ -4554,6 +4669,8 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4554,6 +4847,8 @@ class DeepseekV4ForCausalLM(nn.Module):
  
          cache_compressor_weight = {}
          COMPRESSOR_PART = ".compressor.w"
@@ -7729,7 +8179,17 @@ index 228af858..a0516f5c 100644
  
          fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
          cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
-@@ -4608,6 +4725,11 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4603,11 +4898,21 @@ class DeepseekV4ForCausalLM(nn.Module):
+                 try:
+                     use_async_loading = should_async_load(loaded_weight)
+ 
++                    if getattr(self, "_lm_only", False) and name.startswith(
++                        ("vision.", "aligner.", "image_")
++                    ):
++                        # sglang-dsv4-language-model-only.py: no tower to load into
++                        continue
+                     name = self.remap_weight_name_to_dpsk_hf_format(
+                         name,
                          is_nextn=is_nextn,
                          num_hidden_layers=self.config.num_hidden_layers,
                      )
@@ -7741,6 +8201,16 @@ index 228af858..a0516f5c 100644
  
                      # V4.1 checkpoint tensors with no module in the text model yet;
                      # the per-group count is logged after loading.
+@@ -5043,6 +5348,9 @@ def _prepare_deepseek_v4_weights(
+     if quant_config is not None and quant_config.get_name() == "expert_pack":
+         logger.info("Keep Expert Pack GGUF weights on the streaming load path")
+         return weights
++    if _WO_A_FP8_NATIVE and isinstance(quant_config, Fp8Config):
++        # sglang-dsv4-wo-a-fp8-native.py: wo_a loads as the checkpoint has it
++        return weights
+     return _dequant_fp8_wo_a_streaming(weights)
+ 
+ 
 diff --git a/python/sglang/srt/models/deepseek_v4_dspark.py b/python/sglang/srt/models/deepseek_v4_dspark.py
 index ad8d59e3..1e6c0236 100644
 --- a/python/sglang/srt/models/deepseek_v4_dspark.py
