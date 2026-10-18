@@ -161,7 +161,15 @@ SM120 attention no longer reads an uninitialized padding page (#3), and
   `KT_ROUTING_DUMP` and SGLang's `--init-expert-location`.
 - Tool namespaces and the new `drop_thinking` turn boundary are not in SGLang's
   DeepSeek-V4 chat encoding.
-- Not run here: one GPU, more than two GPUs, AMD GPUs, CPUs with AVX-512.
+- Tested on 2 × RTX 5070 Ti (SM120) with Zen 2 CPUs only.
+- CPUs with AVX-512 should work: the experts run on the AVX2 kernels, which those CPUs
+  also have.
+- One GPU, or more than two: `serve.sh` sets tensor parallelism from the GPUs it sees;
+  not tested. One GPU needs about 24 GB at a 1M context.
+- Other NVIDIA GPUs: the MXFP4 Marlin path stops at load on anything but SM90 or SM120
+  (RTX 30/40, A100), and the DeepSeek-V4 attention in this SGLang branch is written for
+  SM90 and newer.
+- AMD GPUs: not supported (kv-vmm and kt-kernel use CUDA).
 
 ## License
 
