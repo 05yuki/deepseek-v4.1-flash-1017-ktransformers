@@ -105,6 +105,9 @@ switch marked "on" is on in `serve.sh`.
 - `SGLANG_DSV4_VISION_ON_DEMAND` (on): the vision tower waits in pinned host memory and
   is on the GPU only while a batch's images are encoded. The prefill plan accounts for it
   in requests with images.
+- `SGLANG_DSV41_ENGRAM_PREFETCH_ROWS` (on): in decode, each engram layer's row lookup starts
+  with the token on a side stream instead of when its layer comes. The all-reduce, `wkv` and
+  the gate stay in place, so the values are unchanged.
 - The padded query buffer of a prefill is part of the prefill's scratch memory.
 
 ### Attention and indexer
@@ -125,8 +128,11 @@ switch marked "on" is on in `serve.sh`.
 `distributed/device_communicators/ll_allreduce.py`, `distributed/device_communicators/host_staged_allreduce.py`,
 `distributed/parallel_state.py`
 
-- Block-FP8 GEMMs with one or a few rows (decode) use a split-K tiling
-  (`SGLANG_FP8_SKINNY`, on by default in the code).
+- Block-FP8 GEMMs with up to four rows (decode) run through a GEMV kernel that steps K by
+  several scale groups at a time (`kernels/ops/quantization/fp8_block_gemv.py`,
+  `SGLANG_FP8_GEMV`, on). Same arithmetic up to the fp32 summation order.
+- Otherwise, block-FP8 GEMMs with a few rows use a split-K tiling (`SGLANG_FP8_SKINNY`, on by
+  default in the code).
 - Two GPUs without peer access: small all-reduces (decode) through pinned host memory in
   NCCL's LL form (`SGLANG_LL_ALLREDUCE`), large ones (prefill) staged through pinned host
   memory with the copy engines (`SGLANG_HOST_STAGED_ALLREDUCE`). `serve.sh` turns both on

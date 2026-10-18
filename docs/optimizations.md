@@ -21,9 +21,9 @@ How it was measured:
 
 ## Decode
 
-Where the time goes now (1017, defaults): the CPU experts take 18.7 ms of a 27.7 ms token.
-They read about 88 GB/s a socket, 78% of what the two sockets' eight CCDs can read
-(226 GB/s). The GPU's part and the hand-over take the remaining 9 ms.
+Where the time goes now (1017, defaults, nsys): a token takes 22.5 ms. The first GPU is busy
+for 13.0 ms of it and waits 9.0 ms for the CPU experts, which read about 88 GB/s a socket,
+78% of what the two sockets' eight CCDs can read (226 GB/s).
 
 | change | before → after | release |
 |---|---|---|
@@ -36,6 +36,8 @@ They read about 88 GB/s a socket, 78% of what the two sockets' eight CCDs can re
 | … and in the driver's idle memory above a 1 GiB floor (`KT_KV_HOT_SPARE_FLOOR_MB`) | 31.73 → 34.43 tok/s | 1017 |
 | The vision tower in host memory between images (`SGLANG_DSV4_VISION_ON_DEMAND`) | 925.7 MiB a GPU back; hot slots 394 → 501 | 1017 |
 | The CPU's MXFP4 scales as one-byte codes instead of fp32 (`KT_MXFP4_SCALE_CODES`) | 34.81 → 36.06 tok/s, output bit-identical | 1017 |
+| The engram row lookups start with the token on a side stream, not at layers 1 and 14 (`SGLANG_DSV41_ENGRAM_PREFETCH_ROWS`) | 0.7 ms a layer of GPU idle gone; 35.9 → 37.4 tok/s, values unchanged | 1017 |
+| Decode's block-FP8 GEMMs through a GEMV stepping K by 512 instead of the 32-value scale group (`SGLANG_FP8_GEMV`) | `wq_b` 78.9 → 33.7 µs, engram `wkv` 552 → 208 µs; 37.4 → 44.2 tok/s | 1017 |
 
 The GPU experts run on Triton kernels in the checkpoint's own MXFP4 layout
 (`SGLANG_MXFP4_MOE_FP32`), rounding to bf16 once, at the weighted sum. Marlin rounded seven
@@ -84,4 +86,4 @@ None of these takes tokens from the KV pool. The 1M-token pool comes first.
 
 - On fresh builds of this repository, one launch in four gave an NLL 0.002 away from the
   others. The cause is not found.
-- The GPU's 9 ms of a decode token has not been profiled.
+- 9 ms of a decode token is the GPU waiting for the CPU experts.

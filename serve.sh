@@ -90,6 +90,12 @@ export SGLANG_MARLIN_MOE_FP32_GLUE="${SGLANG_MARLIN_MOE_FP32_GLUE:-1}"
 # the GPU experts (resident and hot) without Marlin: the checkpoint's MXFP4 layout through
 # Triton kernels that round once, at the weighted top-k sum (0: Marlin, with the glue above)
 export SGLANG_MXFP4_MOE_FP32="${SGLANG_MXFP4_MOE_FP32:-1}"
+# decode's block-FP8 GEMMs (up to four rows) through a GEMV that steps K by several scale
+# groups (0: the block kernel)
+export SGLANG_FP8_GEMV="${SGLANG_FP8_GEMV:-1}"
+# decode's engram row lookups start with the token on a side stream, not at their layers
+# (0: at the layers)
+export SGLANG_DSV41_ENGRAM_PREFETCH_ROWS="${SGLANG_DSV41_ENGRAM_PREFETCH_ROWS:-1}"
 
 # hot experts: the resident ones, and with the hot lend 16 more a layer in the KV
 # pool's free pages outside prefill (KT_KV_HOT_LEND=0 turns it off)
