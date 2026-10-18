@@ -17,8 +17,10 @@ MODEL=/models/dsv41-1017 ./setup.sh
 MODEL=/models/dsv41-1017 ./serve.sh
 ```
 
-The server speaks SGLang's OpenAI-compatible API on port 8080. The same setup also
-serves the earlier DeepSeek-V4.1-Flash release: point `MODEL` at it.
+The server speaks SGLang's OpenAI-compatible API on `127.0.0.1:8080`, one request at a
+time. To serve other machines, set `SGLANG_HOST=0.0.0.0` and `SGLANG_API_KEY=<key>`
+(clients then send `Authorization: Bearer <key>`). The same setup also serves the earlier
+DeepSeek-V4.1-Flash release: point `MODEL` at it.
 
 ## What it needs
 
@@ -53,7 +55,8 @@ serves the earlier DeepSeek-V4.1-Flash release: point `MODEL` at it.
 
 ## What setup.sh does
 
-1. Clones sgl-project/sglang at `1aa0e962` (the `dsv4.1` branch) and applies
+1. Clones sgl-project/sglang at `1aa0e962` (from its former `dsv4.1` branch, also tagged
+   `dsv41-1aa0e962` in 05yuki/sglang-upstream) and applies
    `patches/sglang-dsv41-tree.patch`. The patch adds:
    - the KTransformers expert wrapper's placement, streaming and lend paths
    - host-memory all-reduce
@@ -70,7 +73,8 @@ serves the earlier DeepSeek-V4.1-Flash release: point `MODEL` at it.
 6. With `MODEL` set, writes the engram manifest from the checkpoint's headers
    (`tools/make-engram-manifest.py`). It then runs the 1017 kernel's test on this GPU.
 
-Re-running skips the finished steps. If the libnuma or hwloc headers live outside the
+Re-running skips the finished steps. Each patch is checked against its pinned tree before it
+is applied; one that does not fit stops the setup with nothing applied. If the libnuma or hwloc headers live outside the
 system paths, pass them in through `CPLUS_INCLUDE_PATH` and `LIBRARY_PATH`. CMake
 flags go in `CMAKE_ARGS`.
 

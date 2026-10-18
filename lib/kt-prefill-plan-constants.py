@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The prefill plan's constants from a setup's prefill-lend records
-(start-qwen38-next-nvidia-v0519.sh, KT_PREFILL_PLAN=1). Prints
+(lib/kt-lend-auto.sh, KT_PREFILL_PLAN=1). Prints
 
   <free MiB at a window's start, at the cap chunk> <KiB a row> <FIXED_MiB,ROW_B,SEQ_B,CARRY_MiB or -> <delta MiB>
 
@@ -17,12 +17,12 @@ or nothing when the setup has no measurement yet.
   by least squares over every forward of every rank, then FIXED raised by the
   KT_PREFILL_PLAN_ENVELOPE quantile of the residuals (0.95). Allocated, not
   reserved: the reserved peak carries whatever torch's cache had grown to
-  earlier in the window (1.05-1.65 x allocated on Flash-Next) and a tight
+  earlier in the window (1.05-1.65 x allocated, measured) and a tight
   window gets that back (34,816 rows: 7,192 allocated, 7,356 reserved, 7,780
   free with the loan); the plan's margin (KT_PREFILL_PLAN_MARGIN_MB, 128 in the
   launcher) covers that gap. RESV_FACTOR (1.00) scales the target if needed.
   CARRY is what a later chunk of the same window holds from the earlier ones
-  (Flash-Next: ~250 MiB).
+  (~250 MiB measured).
   Used only with 24 forwards or more over rows that at least double, a per-row
   cost within 0.7-1.5 x the lend's measured allocated bytes a row, and a
   sequence term under a quarter of the row term; else "-" (the per-row model).

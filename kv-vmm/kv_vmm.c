@@ -209,7 +209,7 @@ static void* alloc_range(ssize_t size, int device, int lazy) {
   // least KV_VMM_BIG_MB, 64): every other tensor sglang makes in the KV region
   // (Mamba state, req-to-token, a draft's pool) at the device granularity, or
   // each of torch's 2 MiB segments would hold a whole chunk (0.55 GB a card lost
-  // on the Flash-Next GGUF stack at 8 MiB)
+  // at 8 MiB on one setup)
   const char* eb = getenv("KV_VMM_BIG_MB");
   size_t big = (size_t)(eb && atol(eb) > 0 ? atol(eb) : 64) << 20;
   size_t chunk = (size_t)size >= big && lazy != 2 ? chunk_for(device) : gran_for(device);

@@ -1,5 +1,5 @@
-# Sourced by a launcher: the hot lend on by default (patches/kv-vmm/kt_kv_hot_lend.py,
-# native-ubuntu/KV-HOT-LEND-20261017.md). Outside prefill, the KV pool's free pages
+# Sourced by a launcher: the hot lend on by default (sglang/srt/layers/moe/kt_kv_hot_lend.py
+# in the SGLang tree patch). Outside prefill, the KV pool's free pages
 # hold X more hot experts; the pool never shrinks (they leave when KV needs the
 # pages). Needs the KV pool on kv-vmm, so the prefill plan's set (KT_KV_VMM,
 # KT_PREFILL_KV_LEND, KT_PREFILL_PLAN, KT_PREFILL_SWA_LEND on SWA models) comes on
@@ -12,11 +12,9 @@
 # the hot placement, libkv_vmm.so and the tree's kt_kv_hot_lend.py exist, and
 # KT_KV_VMM is not 0. Then KT_KV_HOT_PLACEMENT is the placement to use. Otherwise
 # KT_KV_HOT_LEND=0 and KT_KV_HOT_PLACEMENT is empty.
-# 10-17 (one launch an arm, same placement both sides): V4.1 decode 28.95 -> 29.98,
-# MiMo 31.97 -> 32.80, Vision 41.90 -> 42.57 / 43.54, paired NLL within spread.
 kt_kv_hot_default() {
   local hot="$1" keep="$2" n="$3" x="$4" tree="$5" swa="${6:-}"
-  local lib="${KT_KV_VMM_LIB:-${root:-.}/runtime/kv-vmm/libkv_vmm.so}" why=""
+  local lib="${KT_KV_VMM_LIB:-${here:-.}/build/libkv_vmm.so}" why=""
   KT_KV_HOT_PLACEMENT=""
   if [[ "${KT_KV_HOT_LEND:-1}" != 1 ]]; then
     why="KT_KV_HOT_LEND=${KT_KV_HOT_LEND}"
@@ -29,9 +27,9 @@ kt_kv_hot_default() {
   elif [[ ! -f "$hot" ]]; then
     why="$hot missing"
   elif [[ ! -f "$lib" ]]; then
-    why="$lib missing (build patches/kv-vmm/kv_vmm.c)"
+    why="$lib missing (./setup.sh builds it from kv-vmm/kv_vmm.c)"
   elif [[ ! -f "$tree/sglang/srt/layers/moe/kt_kv_hot_lend.py" ]]; then
-    why="the tree has no kt_kv_hot_lend.py (patches/kv-vmm/sglang-kt-kv-hot-lend.py)"
+    why="the tree has no kt_kv_hot_lend.py (patches/sglang-dsv41-tree.patch not applied?)"
   elif [[ "${KT_KV_VMM:-1}" == 0 ]]; then
     why="KT_KV_VMM=0"
   fi

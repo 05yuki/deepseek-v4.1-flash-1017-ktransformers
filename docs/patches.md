@@ -4,7 +4,7 @@
 
 | file | applies to |
 |---|---|
-| `patches/sglang-dsv41-tree.patch` | sgl-project/sglang `1aa0e962` (the `dsv4.1` branch) |
+| `patches/sglang-dsv41-tree.patch` | sgl-project/sglang `1aa0e962` (formerly the `dsv4.1` branch) |
 | `patches/kt-kernel-tree.patch` | kvcache-ai/ktransformers `95009ea` |
 | `patches/kt-kernel-llama-cpp.patch` | ktransformers' `third_party/llama.cpp` submodule |
 | `patches/kt-kernel-load-prefetch.py` | the installed kt-kernel (parallel expert loading) |

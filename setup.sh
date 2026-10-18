@@ -20,19 +20,33 @@ set -Eeuo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$here"
 SGLANG_COMMIT=1aa0e962b206102b7c439a4a0c4981cfec6e87bc
+SGLANG_TAG=dsv41-1aa0e962  # the same commit, tagged in 05yuki/sglang-upstream
 KT_COMMIT=95009ea6856c0799e517e93cb12be5e8494bc7ce
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 mkdir -p third_party build state
 step() { printf '\n== %s\n' "$*"; }
+# a patch is checked against the pinned tree first; nothing is applied when it does not fit
+apply_checked() {
+  local tree="$1" patch="$2"
+  if ! git -C "$tree" apply --check --whitespace=nowarn "$patch"; then
+    echo "$patch does not apply to $tree; the tree was left as checked out" >&2
+    exit 4
+  fi
+  git -C "$tree" apply --whitespace=nowarn "$patch"
+}
 
-step "SGLang dsv4.1 @ ${SGLANG_COMMIT:0:8}"
+step "SGLang @ ${SGLANG_COMMIT:0:8}"
 if [[ ! -d third_party/sglang/.git ]]; then
   git clone --filter=blob:none https://github.com/sgl-project/sglang.git third_party/sglang
 fi
 if [[ ! -f third_party/sglang/.dsv41-1017-patched ]]; then
-  git -C third_party/sglang fetch --quiet origin "$SGLANG_COMMIT" 2>/dev/null || git -C third_party/sglang fetch --quiet origin dsv4.1
-  git -C third_party/sglang checkout --quiet "$SGLANG_COMMIT"
-  git -C third_party/sglang apply --whitespace=nowarn "$here/patches/sglang-dsv41-tree.patch"
+  # the dsv4.1 branch this commit came from is gone from sgl-project/sglang; the commit is
+  # still fetchable there, and tagged in a fork as a fallback
+  git -C third_party/sglang fetch --quiet origin "$SGLANG_COMMIT" 2>/dev/null \
+    || git -C third_party/sglang fetch --quiet https://github.com/05yuki/sglang-upstream.git "refs/tags/$SGLANG_TAG"
+  git -C third_party/sglang checkout --quiet --force "$SGLANG_COMMIT"
+  git -C third_party/sglang clean -fdq
+  apply_checked third_party/sglang "$here/patches/sglang-dsv41-tree.patch"
   touch third_party/sglang/.dsv41-1017-patched
 fi
 
@@ -41,10 +55,12 @@ if [[ ! -d third_party/ktransformers/.git ]]; then
   git clone --filter=blob:none https://github.com/kvcache-ai/ktransformers.git third_party/ktransformers
 fi
 if [[ ! -f third_party/ktransformers/.dsv41-1017-patched ]]; then
-  git -C third_party/ktransformers checkout --quiet "$KT_COMMIT"
-  git -C third_party/ktransformers submodule update --init --quiet third_party/llama.cpp third_party/pybind11
-  git -C third_party/ktransformers apply --whitespace=nowarn "$here/patches/kt-kernel-tree.patch"
-  git -C third_party/ktransformers/third_party/llama.cpp apply --whitespace=nowarn "$here/patches/kt-kernel-llama-cpp.patch"
+  git -C third_party/ktransformers checkout --quiet --force "$KT_COMMIT"
+  git -C third_party/ktransformers clean -fdq
+  git -C third_party/ktransformers submodule update --init --force --quiet third_party/llama.cpp third_party/pybind11
+  git -C third_party/ktransformers/third_party/llama.cpp clean -fdq
+  apply_checked third_party/ktransformers "$here/patches/kt-kernel-tree.patch"
+  apply_checked third_party/ktransformers/third_party/llama.cpp "$here/patches/kt-kernel-llama-cpp.patch"
   touch third_party/ktransformers/.dsv41-1017-patched
 fi
 

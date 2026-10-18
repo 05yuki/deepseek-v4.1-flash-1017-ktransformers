@@ -101,6 +101,9 @@ export KT_KV_HOT_SPARE_FLOOR_MB="${KT_KV_HOT_SPARE_FLOOR_MB:-1024}"
 placement="${KT_EXPERT_PLACEMENT:-${KT_KV_HOT_PLACEMENT:-$here/placements/dsv41-expert-placement-${gpu_experts}.json}}"
 if [[ "$placement" != "none" && -f "$placement" ]]; then
   extra_args+=(--init-expert-location "$placement")
+elif [[ "$placement" != "none" ]]; then
+  echo "WARNING: no placement $placement: the $gpu_experts GPU experts a layer are experts 0..$((gpu_experts - 1)), not the hottest" >&2
+  echo "         (placements/ has 5; record your own with KT_ROUTING_DUMP, or KT_EXPERT_PLACEMENT=none)" >&2
 fi
 # the resident experts through Marlin (W4A16, matches the checkpoint)
 if [[ "$gpu_experts" != "0" && "${KT_HOT_BACKEND:-marlin}" == "marlin" ]]; then
@@ -205,9 +208,12 @@ export SGLANG_NUMA_BIND_V2="${SGLANG_NUMA_BIND_V2:-0}"
 # installs the engram hook in every worker
 export PYTHONPATH="$source_dir:$adapter_dir${PYTHONPATH:+:$PYTHONPATH}"
 
+# SGLANG_HOST=0.0.0.0 serves other machines too; then set SGLANG_API_KEY, which every
+# request must send as "Authorization: Bearer <key>"
+[[ -n "${SGLANG_API_KEY:-}" ]] && extra_args+=(--api-key "$SGLANG_API_KEY")
 command=(
   "$python" -m sglang.launch_server
-  --host "${SGLANG_HOST:-0.0.0.0}"
+  --host "${SGLANG_HOST:-127.0.0.1}"
   --port "$port"
   --model-path "$model"
   --load-format safetensors

@@ -1,0 +1,13 @@
+deepseek-v4.1-flash-1017-ktransformers
+Copyright 2026 05yuki
+
+Licensed under the Apache License, Version 2.0 (see LICENSE), except as noted below.
+
+engram-adapter/engram_backend.py, engram-adapter/row_store.cpp and
+engram-adapter/sitecustomize.py are derived from the adapter in
+https://github.com/0xSero/deepseek-v4.1-flash-4x-rtx-pro-6000
+(Copyright (c) 2026 0xSero, MIT License); the MIT terms apply to those files, as
+their headers say.
+
+The patches under patches/ modify sgl-project/sglang (commit 1aa0e962) and
+kvcache-ai/ktransformers (kt-kernel, commit 95009ea), both Apache-2.0.

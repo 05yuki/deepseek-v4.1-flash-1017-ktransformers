@@ -5,9 +5,8 @@ https://github.com/0xSero/deepseek-v4.1-flash-4x-rtx-pro-6000
 Copyright (c) 2026 0xSero, MIT License. Modifications for the KTransformers
 dual-EPYC host:
   - the manifest names the file and the byte offsets of the weight and scale
-    tensors, so the rows can come either from the flat tables written by
-    tools/extract_engram_tables.py or straight out of the checkpoint shards
-    (tools/make_engram_shard_manifest.py), which costs no extra disk;
+    tensors, so the rows come straight out of the checkpoint shards
+    (tools/make-engram-manifest.py), which costs no extra disk;
   - libcudart is located through torch, not hard-coded site-packages globs;
   - callback errors are counted, not aborted; check_errors() raises after sync;
   - per-table cache budget comes from DSV41_CACHE_GIB split by layers and

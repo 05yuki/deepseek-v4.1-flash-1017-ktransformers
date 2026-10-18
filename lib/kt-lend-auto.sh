@@ -1,6 +1,6 @@
-# Sourced by a launcher under KT_PREFILL_LEND=1 (patches/kt_lend.py): picks the
-# prefill chunk from what the server measured, calibrating once when there is
-# nothing to go on. Flash-Next's launcher has its own copy of the same steps.
+# Sourced by a launcher under KT_PREFILL_LEND=1 (sglang/srt/layers/moe/kt_lend.py in the
+# SGLang tree patch): picks the prefill chunk from what the server measured,
+# calibrating once when there is nothing to go on.
 #
 #   kt_lend_auto <launcher> <chunk env var> <port> <key part>...
 #
@@ -275,11 +275,11 @@ print(f"{max(r, (c + 512) * 1.02 / m):.4f}")
 PY
 }
 
-# KT_PREFILL_PLAN=1 (patches/kv-vmm/kt_prefill_plan.py, with KT_KV_VMM=1 and
+# KT_PREFILL_PLAN=1 (sglang/srt/layers/moe/kt_prefill_plan.py, with KT_KV_VMM=1 and
 # KT_PREFILL_KV_LEND=1): the chunk planned per request. Called after kt_lend_auto:
 # the launch chunk becomes the cap (KT_PREFILL_PLAN_CAP, 36864) and the room and
 # the cost a row come from the lend's measurements of this setup
-# (tools/kt-prefill-plan-constants.py over the hint files); without them the plan
+# (lib/kt-prefill-plan-constants.py over the hint files); without them the plan
 # is off for this launch. KT_PREFILL_SWA_LEND=1 (a hybrid SWA model): the
 # sliding-window pool is sized for the cap (KT_PREFILL_SWA_TOKENS) outside the KV
 # budget, its free pages unmapped outside prefill, and kt_lend_swa_ratio keeps the
@@ -288,7 +288,7 @@ PY
 # SWA pool out of the KV budget, so the cap stays the lend's chunk there.
 kt_prefill_plan_setup() {
   [[ "${KT_PREFILL_PLAN:-0}" == 1 && -z "${KT_PREFILL_LEND_CALIBRATING:-}" && -n "${KT_PREFILL_LEND_HINT:-}" ]] || return 0
-  local lib="${KT_KV_VMM_LIB:-${root:-.}/runtime/kv-vmm/libkv_vmm.so}"
+  local lib="${KT_KV_VMM_LIB:-${here:-.}/build/libkv_vmm.so}"
   if [[ ! -f "$lib" ]]; then
     echo "$lib missing (build kv_vmm.c, or set KT_KV_VMM_LIB): prefill plan off" >&2
     export KT_PREFILL_PLAN=0 KT_PREFILL_SWA_LEND=0
