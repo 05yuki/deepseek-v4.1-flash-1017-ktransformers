@@ -103,6 +103,8 @@ that took about 15 minutes, before the one-time chunk calibration. Later launche
 reuse the cache (`~/.cache/sglang-dsv41-1017`) and are ready in about 4 minutes, with
 the checkpoint on NVMe and loaded once before.
 
+What each patch changes, feature by feature, with its switch: [docs/patches.md](docs/patches.md).
+
 ## The 1017 change: o in FP8 before `wo_a`
 
 1017's reference inference code quantizes the attention output `o` to FP8 and back
