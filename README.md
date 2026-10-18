@@ -108,6 +108,8 @@ reuse the cache (`~/.cache/sglang-dsv41-1017`) and are ready in about 4 minutes,
 the checkpoint on NVMe and loaded once before.
 
 What each patch changes, feature by feature, with its switch: [docs/patches.md](docs/patches.md).
+What made it this fast, measured change by change, and what was tried and dropped:
+[docs/optimizations.md](docs/optimizations.md).
 
 ## The 1017 change: o in FP8 before `wo_a`
 
