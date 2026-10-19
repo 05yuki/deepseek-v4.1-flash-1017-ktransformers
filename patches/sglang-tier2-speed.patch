@@ -1,89 +1,3 @@
-diff --git a/python/sglang/kernels/ops/attention/flash_mla_sm120.py b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
-index 906d4aa2..1dcaec4c 100644
---- a/python/sglang/kernels/ops/attention/flash_mla_sm120.py
-+++ b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
-@@ -246,6 +246,33 @@ def _flash_mla_sm120_prefill(
-         if extra_indices is not None and extra_indices.dim() == 3
-         else extra_indices
-     )
-+    # FlashInfer 0.6.18's SM120 prefill orchestrator does not bound the index
-+    # lanes past topk_length (flashinfer-ai/flashinfer#5095, fix pending in
-+    # #5075): prompts over 64 tokens read stale lanes and come back corrupted.
-+    # Mask them to -1 here, which the kernel already treats as "no entry".
-+    if topk_length is not None:
-+        ar = torch.arange(idx.shape[-1], device=idx.device)
-+        idx = torch.where(ar[None, :] < topk_length.view(-1, 1), idx, torch.full_like(idx, -1))
-+    if extra_idx is not None and extra_topk_length is not None:
-+        ar = torch.arange(extra_idx.shape[-1], device=extra_idx.device)
-+        extra_idx = torch.where(
-+            ar[None, :] < extra_topk_length.view(-1, 1), extra_idx, torch.full_like(extra_idx, -1)
-+        )
-+    # V4.1 ratio-1/2 sources use 256/128-token pages. The prefill
-+    # specialization needs 64-token pages for both sources, with independent
-+    # scratch buffers so converting the extra source cannot overwrite SWA.
-+    # V4-Flash's ratio-128 source has 2-entry pages, which the decode path
-+    # already hands over unconverted; only pages that are a multiple of 64
-+    # get split (09-16).
-+    if (
-+        extra_kv_u8 is not None
-+        and extra_kv_u8.shape[1] > _PBS_DST
-+        and extra_kv_u8.shape[1] % _PBS_DST == 0
-+    ):
-+        extra_kv_u8 = _split_kv_pages_to_64(
-+            extra_kv_u8, extra_kv_u8.shape[1],
-+            touched_indices=extra_idx, buffer_tag="extra",
-+        )
-     output = q2.new_empty((num_tokens, num_heads, head_dim_v), dtype=torch.bfloat16)
-     out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=dev)
-     _sparse_mla_sm120_paged_attention(
-@@ -391,6 +418,21 @@ def _page_split_kernel(
-     if page_idx >= N_pages:
-         return
- 
-+    # SGLang's paged allocator reserves page 0 for padding. FlashInfer maps
-+    # negative indices to entry 0 before masking scores; a masked NaN value
-+    # still poisons XV (0 * NaN). The touched-page optimization otherwise
-+    # leaves this scratch page uninitialized, or copies dummy-token garbage.
-+    # Clear it on every conversion, including captured replays, without an
-+    # extra launch. Other sub-pages keep their existing conversion behavior.
-+    # (dsv41-flash-dual-epyc#3)
-+    if pid == 0:
-+        sentinel = dst_ptr.to(tl.pointer_type(tl.uint64))
-+        for start in tl.range(0, dst_stride0 // 8, BLOCK_SIZE):
-+            offs = start + tl.arange(0, BLOCK_SIZE)
-+            tl.store(sentinel + offs, tl.full((BLOCK_SIZE,), 0, tl.uint64),
-+                     mask=offs < dst_stride0 // 8)
-+        return
-+
-     if HAS_MASK:
-         if tl.load(mask_ptr + page_idx) == 0:
-             return
-@@ -449,6 +491,7 @@ def _split_kv_pages_to_64(
-     kv_u8: torch.Tensor,
-     src_pbs: int,
-     touched_indices: Optional[torch.Tensor] = None,
-+    buffer_tag: str = "primary",
- ) -> torch.Tensor:
-     """Split pbs=N footer-format pages into pbs=64 footer-format pages.
- 
-@@ -472,7 +515,7 @@ def _split_kv_pages_to_64(
-     # Pre-allocated grow-only buffer for page-split output per device.
-     dev = kv_u8.device
-     buffers = get_resources().buffers
--    key = f"flash_mla_sm120_split:{dev}"
-+    key = f"flash_mla_sm120_split:{dev}:{buffer_tag}"
-     buf = buffers.get(key)
-     if buf is None or buf.shape[0] < num_dst_pages:
-         # The first allocation can happen under inference mode (autotune), but
-@@ -501,7 +544,7 @@ def _split_kv_pages_to_64(
-     if use_mask:
-         # Persistent per-device int8 mask, zeroed each call (cheap memset,
-         # captured cleanly by CUDA graph). 1 = page is referenced this step.
--        mkey = f"flash_mla_sm120_mask:{dev}"
-+        mkey = f"flash_mla_sm120_mask:{dev}:{buffer_tag}"
-         mbuf = buffers.get(mkey)
-         if mbuf is None or mbuf.shape[0] < N:
-             # The first allocation can happen under inference mode (autotune),
 diff --git a/python/sglang/kernels/ops/quantization/fp8_block_gemv.py b/python/sglang/kernels/ops/quantization/fp8_block_gemv.py
 new file mode 100644
 index 00000000..29b39b30
@@ -346,364 +260,8 @@ index 799264b8..d304a9af 100644
              self.is_image_understandable_model = True
  
          # Models expose audio_config at different nesting levels:
-diff --git a/python/sglang/srt/distributed/device_communicators/host_staged_allreduce.py b/python/sglang/srt/distributed/device_communicators/host_staged_allreduce.py
-new file mode 100644
-index 00000000..e4901c84
---- /dev/null
-+++ b/python/sglang/srt/distributed/device_communicators/host_staged_allreduce.py
-@@ -0,0 +1,151 @@
-+"""All-reduce for two GPUs without peer access, staged through pinned host
-+memory with the copy engines, driven entirely from the GPU streams.
-+
-+NCCL's SHM transport on this host moves a 20 MB all-reduce at 1.9 GB/s (its
-+kernels read host memory over PCIe one line at a time; NCCL_SHM_USE_CUDA_MEMCPY
-+fixes that but doubles the latency of the 10 KB decode all-reduces). Here
-+each rank DMAs its input to a shared pinned buffer in pieces and publishes a
-+counter with cuStreamWriteValue32; the peer's stream waits on that counter
-+with cuStreamWaitValue32, DMAs the piece back and adds it. The D2H and H2D
-+copy engines overlap and the CPU never blocks, so kernel launches for the
-+next layer keep running ahead. 20 MB: ~1.4 ms against NCCL's 10.9 ms.
-+
-+Used only for messages of at least SGLANG_HOST_STAGED_ALLREDUCE_MIN_BYTES
-+(default 1 MiB) outside CUDA graph capture; decode keeps NCCL. Enable with
-+SGLANG_HOST_STAGED_ALLREDUCE=1.
-+"""
-+import ctypes
-+import logging
-+import mmap
-+import os
-+import time
-+
-+import numpy as np
-+import torch
-+
-+logger = logging.getLogger(__name__)
-+
-+_FLAG_BYTES = 4096  # one page of uint32 flags at the head of the mapping
-+_NBUF = 2  # double buffer per rank
-+_PIECE = int(os.environ.get("SGLANG_HOST_STAGED_ALLREDUCE_PIECE", str(4 << 20)))
-+
-+_cuda = None
-+
-+
-+def _libcuda():
-+    global _cuda
-+    if _cuda is None:
-+        _cuda = ctypes.CDLL("libcuda.so.1")
-+        _cuda.cuMemHostGetDevicePointer_v2.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_void_p, ctypes.c_uint]
-+        _cuda.cuStreamWriteValue32_v2.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint]
-+        _cuda.cuStreamWaitValue32_v2.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint]
-+    return _cuda
-+
-+
-+class HostStagedAllReduce:
-+    def __init__(self, group, rank_in_group: int, world_size: int, device: torch.device,
-+                 region_bytes: int = 32 << 20):
-+        assert world_size == 2, "host-staged all-reduce is written for two ranks"
-+        self.rank = rank_in_group
-+        self.peer = 1 - rank_in_group
-+        self.device = device
-+        self.region_bytes = region_bytes
-+        self.min_bytes = int(os.environ.get("SGLANG_HOST_STAGED_ALLREDUCE_MIN_BYTES", str(1 << 20)))
-+        # Both ranks must agree on the file; rank 0 picks the name and the
-+        # gloo group carries it (init time only, before any forward).
-+        name = [f"/dev/shm/sgl_host_ar_{os.getpid()}_{time.time_ns()}" if rank_in_group == 0 else None]
-+        src = torch.distributed.get_process_group_ranks(group)[0]
-+        torch.distributed.broadcast_object_list(name, src=src, group=group)
-+        self.path = name[0]
-+        self.total = _FLAG_BYTES + world_size * _NBUF * region_bytes
-+        if rank_in_group == 0:
-+            with open(self.path, "wb") as f:
-+                f.truncate(self.total)
-+        torch.distributed.barrier(group=group)
-+        fd = os.open(self.path, os.O_RDWR)
-+        self.mm = mmap.mmap(fd, self.total)
-+        os.close(fd)
-+        buf = np.frombuffer(self.mm, dtype=np.uint8)
-+        self.flags = np.frombuffer(self.mm, dtype=np.uint32, count=_FLAG_BYTES // 4)
-+        with torch.cuda.device(device):
-+            err = torch.cuda.cudart().cudaHostRegister(buf.ctypes.data, self.total, 3)  # Portable | Mapped
-+            if err != 0:
-+                raise RuntimeError(f"cudaHostRegister failed: {err}")
-+            dptr = ctypes.c_uint64()
-+            rc = _libcuda().cuMemHostGetDevicePointer_v2(ctypes.byref(dptr), buf.ctypes.data, 0)
-+            if rc != 0:
-+                raise RuntimeError(f"cuMemHostGetDevicePointer failed: {rc}")
-+        self.dflags = dptr.value  # device address of the flag page
-+        self.host = torch.from_numpy(buf)
-+        self.regions = [[self._region(r, i) for i in range(_NBUF)] for r in range(world_size)]
-+        self.tmp = torch.empty(region_bytes, dtype=torch.uint8, device=device)
-+        self.seq = 0
-+        self.published = 0  # pieces this rank has published, ever
-+        self.d2h = torch.cuda.Stream(device=device)
-+        self.h2d = torch.cuda.Stream(device=device)
-+        if rank_in_group == 0:
-+            self.flags[:] = 0
-+        torch.distributed.barrier(group=group)
-+        if rank_in_group == 1:
-+            os.unlink(self.path)  # the mappings keep it alive
-+        logger.info("host-staged all-reduce ready: %s, %d MB/region, %d MB pieces, min %d KB",
-+                    self.path, region_bytes >> 20, _PIECE >> 20, self.min_bytes >> 10)
-+
-+    def _region(self, r, i):
-+        off = _FLAG_BYTES + (r * _NBUF + i) * self.region_bytes
-+        return self.host[off:off + self.region_bytes]
-+
-+    # flags (uint32, monotonic): [r] = pieces rank r has landed in host
-+    # memory, [2 + r] = all-reduces rank r has finished reading back.
-+    def _write(self, stream, idx, value):
-+        rc = _libcuda().cuStreamWriteValue32_v2(stream.cuda_stream, self.dflags + 4 * idx, value, 0)
-+        if rc != 0:
-+            raise RuntimeError(f"cuStreamWriteValue32 failed: {rc}")
-+
-+    def _wait(self, stream, idx, value):
-+        rc = _libcuda().cuStreamWaitValue32_v2(stream.cuda_stream, self.dflags + 4 * idx, value, 0)  # GEQ
-+        if rc != 0:
-+            raise RuntimeError(f"cuStreamWaitValue32 failed: {rc}")
-+
-+    def should_use(self, t: torch.Tensor) -> bool:
-+        return (t.is_cuda and t.is_contiguous()
-+                and t.numel() * t.element_size() >= self.min_bytes
-+                and not torch.cuda.is_current_stream_capturing())
-+
-+    def all_reduce(self, t: torch.Tensor) -> torch.Tensor:
-+        flat = t.view(-1).view(torch.uint8)
-+        nbytes = flat.numel()
-+        cur = torch.cuda.current_stream(self.device)
-+        self.d2h.wait_stream(cur)
-+        self.h2d.wait_stream(cur)
-+        r, p = self.rank, self.peer
-+        for off in range(0, nbytes, self.region_bytes):
-+            n = min(self.region_bytes, nbytes - off)
-+            self.seq += 1
-+            seq = self.seq
-+            slot = seq % _NBUF
-+            mine = self.regions[r][slot]
-+            theirs = self.regions[p][slot]
-+            src = flat[off:off + n]
-+            pieces = [(a, min(_PIECE, n - a)) for a in range(0, n, _PIECE)]
-+            # the peer must have read this slot back from two calls ago
-+            if seq > _NBUF:
-+                self._wait(self.d2h, 2 + p, seq - _NBUF)
-+            with torch.cuda.stream(self.d2h):
-+                for a, m in pieces:
-+                    mine[a:a + m].copy_(src[a:a + m], non_blocking=True)
-+                    self.published += 1
-+                    self._write(self.d2h, r, self.published)
-+            base = self.published - len(pieces)
-+            with torch.cuda.stream(self.h2d):
-+                for i, (a, m) in enumerate(pieces):
-+                    self._wait(self.h2d, p, base + i + 1)
-+                    self.tmp[a:a + m].copy_(theirs[a:a + m], non_blocking=True)
-+                # Our own pieces must have left src before the add overwrites
-+                # it; otherwise the peer can DMA a half-summed src (09-26,
-+                # patches/sglang-host-staged-allreduce-race.py).
-+                self.h2d.wait_stream(self.d2h)
-+                src.view(t.dtype).add_(self.tmp[:n].view(t.dtype))
-+                self._write(self.h2d, 2 + r, seq)
-+        cur.wait_stream(self.h2d)
-+        return t
-diff --git a/python/sglang/srt/distributed/device_communicators/ll_allreduce.py b/python/sglang/srt/distributed/device_communicators/ll_allreduce.py
-new file mode 100644
-index 00000000..dc9b9a5b
---- /dev/null
-+++ b/python/sglang/srt/distributed/device_communicators/ll_allreduce.py
-@@ -0,0 +1,135 @@
-+"""Decode-sized all-reduce for two GPUs without peer access, through pinned
-+host memory in NCCL's LL form. See patches/sglang-ll-allreduce.py."""
-+import ctypes
-+import logging
-+import mmap
-+import os
-+import time
-+
-+import numpy as np
-+import torch
-+
-+logger = logging.getLogger(__name__)
-+
-+_HEADER = 4096
-+
-+_SRC = r"""
-+#include <torch/extension.h>
-+#include <cuda_bf16.h>
-+#include <c10/cuda/CUDAStream.h>
-+
-+// asm volatile: a plain load in the spin below was hoisted out of the loop
-+// as pure, and the loop then assumed to exit at once.
-+__device__ __forceinline__ unsigned long long ld_sys(const unsigned long long* p) {
-+  unsigned long long v;
-+  asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
-+  return v;
-+}
-+__device__ __forceinline__ void st_sys(unsigned long long* p, unsigned long long v) {
-+  asm volatile("st.relaxed.sys.global.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
-+}
-+
-+// Every 8-byte word is (seq << 32 | two bf16): the reader needs no separate
-+// flag, which over PCIe arrived ahead of the data it guarded. Slots are
-+// [rank][seq parity]; the peer can be at most one call ahead, and its next
-+// call writes the other parity.
-+__global__ void ll_ar_kernel(const unsigned* in, unsigned* out, int nw, char* base, int rank,
-+                             long long slot_bytes, unsigned* counter) {
-+  __shared__ unsigned seq;
-+  if (threadIdx.x == 0) seq = *counter + 1;
-+  __syncthreads();
-+  const unsigned s = seq;
-+  unsigned long long* mine = (unsigned long long*)(base + 4096 + (rank * 2 + (s & 1)) * slot_bytes);
-+  const unsigned long long* theirs =
-+      (const unsigned long long*)(base + 4096 + ((1 - rank) * 2 + (s & 1)) * slot_bytes);
-+  for (int i = threadIdx.x; i < nw; i += blockDim.x) st_sys(&mine[i], ((unsigned long long)s << 32) | in[i]);
-+  for (int i = threadIdx.x; i < nw; i += blockDim.x) {
-+    unsigned long long v;
-+    do { v = ld_sys(&theirs[i]); } while ((int)((unsigned)(v >> 32) - s) < 0);
-+    unsigned a = in[i], b = (unsigned)v;
-+    __nv_bfloat162 r = __hadd2(*(__nv_bfloat162*)&a, *(__nv_bfloat162*)&b);
-+    out[i] = *(unsigned*)&r;
-+  }
-+  __syncthreads();
-+  if (threadIdx.x == 0) *counter = s;
-+}
-+
-+void ll_ar(torch::Tensor t, int64_t base, int64_t rank, int64_t slot_bytes, torch::Tensor counter) {
-+  auto stream = c10::cuda::getCurrentCUDAStream();
-+  ll_ar_kernel<<<1, 512, 0, stream>>>((const unsigned*)t.data_ptr(), (unsigned*)t.data_ptr(),
-+                                      (int)(t.numel() / 2), (char*)base, (int)rank, slot_bytes,
-+                                      (unsigned*)counter.data_ptr());
-+}
-+"""
-+_CPP = "void ll_ar(torch::Tensor t, int64_t base, int64_t rank, int64_t slot_bytes, torch::Tensor counter);"
-+
-+
-+class LLAllReduce:
-+    def __init__(self, group, rank_in_group: int, world_size: int, device: torch.device):
-+        assert world_size == 2, "LL all-reduce is written for two ranks"
-+        self.rank = rank_in_group
-+        self.max_bytes = int(os.environ.get("SGLANG_LL_ALLREDUCE_MAX_BYTES", str(64 << 10)))
-+        # an LL word carries 4 data bytes in 8
-+        self.slot_bytes = 2 * self.max_bytes
-+        total = _HEADER + 4 * self.slot_bytes
-+
-+        from torch.utils.cpp_extension import load_inline
-+
-+        def build():
-+            return load_inline("sgl_ll_allreduce", _CPP, cuda_sources=_SRC, functions=["ll_ar"],
-+                               extra_cuda_cflags=["-O3"], verbose=False)
-+
-+        # one builder, the other loads the cached module
-+        self.ext = build() if rank_in_group == 0 else None
-+        torch.distributed.barrier(group=group)
-+        if self.ext is None:
-+            self.ext = build()
-+
-+        name = [f"/dev/shm/sgl_ll_ar_{os.getpid()}_{time.time_ns()}" if rank_in_group == 0 else None]
-+        src = torch.distributed.get_process_group_ranks(group)[0]
-+        torch.distributed.broadcast_object_list(name, src=src, group=group)
-+        self.path = name[0]
-+        if rank_in_group == 0:
-+            with open(self.path, "wb") as f:
-+                f.truncate(total)
-+        torch.distributed.barrier(group=group)
-+        fd = os.open(self.path, os.O_RDWR)
-+        self.mm = mmap.mmap(fd, total)
-+        os.close(fd)
-+        buf = np.frombuffer(self.mm, dtype=np.uint8)
-+        # the reader first-touches the peer's slots
-+        peer = 1 - rank_in_group
-+        buf[_HEADER + peer * 2 * self.slot_bytes: _HEADER + (peer + 1) * 2 * self.slot_bytes] = 0
-+        torch.distributed.barrier(group=group)
-+        # one rank at a time: both registering the same pages at once failed
-+        # now and then with cudaErrorInvalidValue
-+        for r in range(world_size):
-+            if r == rank_in_group:
-+                with torch.cuda.device(device):
-+                    err = torch.cuda.cudart().cudaHostRegister(buf.ctypes.data, total, 3)  # Portable | Mapped
-+                    if int(err) != 0:
-+                        raise RuntimeError(f"cudaHostRegister failed: {int(err)}")
-+            torch.distributed.barrier(group=group)
-+        dptr = ctypes.c_uint64()
-+        cuda = ctypes.CDLL("libcuda.so.1")
-+        cuda.cuMemHostGetDevicePointer_v2.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_void_p, ctypes.c_uint]
-+        with torch.cuda.device(device):
-+            rc = cuda.cuMemHostGetDevicePointer_v2(ctypes.byref(dptr), buf.ctypes.data, 0)
-+        if rc != 0:
-+            raise RuntimeError(f"cuMemHostGetDevicePointer failed: {rc}")
-+        self.base = dptr.value
-+        self.counter = torch.zeros(1, dtype=torch.int32, device=device)
-+        self._buf = buf
-+        torch.distributed.barrier(group=group)
-+        if rank_in_group == 0:
-+            os.unlink(self.path)  # both ranks hold the mapping
-+        logger.info("[AR] LL all-reduce through host memory for bf16 up to %d KiB", self.max_bytes >> 10)
-+
-+    def should_use(self, t: torch.Tensor) -> bool:
-+        n = t.numel() * t.element_size()
-+        return (t.dtype == torch.bfloat16 and t.is_contiguous() and 0 < n <= self.max_bytes
-+                and t.numel() % 2 == 0)
-+
-+    def all_reduce(self, t: torch.Tensor) -> torch.Tensor:
-+        self.ext.ll_ar(t, self.base, self.rank, self.slot_bytes, self.counter)
-+        return t
-diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
-index efb3ff07..788311e8 100644
---- a/python/sglang/srt/distributed/parallel_state.py
-+++ b/python/sglang/srt/distributed/parallel_state.py
-@@ -508,6 +508,40 @@ class GroupCoordinator:
-                 device=self.device,
-             )
- 
-+        # Two GPUs without peer access: large all-reduces (prefill) staged
-+        # through pinned host memory with the copy engines instead of NCCL's
-+        # SHM transport (1.9 GB/s here). See host_staged_allreduce.py.
-+        self.host_staged_comm = None
-+        if (
-+            os.environ.get("SGLANG_HOST_STAGED_ALLREDUCE") == "1"
-+            and self.world_size == 2
-+            and is_cuda_alike()
-+        ):
-+            from sglang.srt.distributed.device_communicators.host_staged_allreduce import (
-+                HostStagedAllReduce,
-+            )
-+
-+            self.host_staged_comm = HostStagedAllReduce(
-+                self.cpu_group, self.rank_in_group, self.world_size, self.device
-+            )
-+
-+        # Same two GPUs, decode-sized all-reduces: one kernel through host
-+        # memory in NCCL's LL form, 5 us against NCCL's 22-25. See
-+        # patches/sglang-ll-allreduce.py.
-+        self.ll_comm = None
-+        if (
-+            os.environ.get("SGLANG_LL_ALLREDUCE") == "1"
-+            and self.world_size == 2
-+            and is_cuda_alike()
-+        ):
-+            from sglang.srt.distributed.device_communicators.ll_allreduce import (
-+                LLAllReduce,
-+            )
-+
-+            self.ll_comm = LLAllReduce(
-+                self.cpu_group, self.rank_in_group, self.world_size, self.device
-+            )
-+
-         # Create communicator for other hardware backends
-         from sglang.srt.distributed.device_communicators.hpu_communicator import (
-             HpuCommunicator,
-@@ -676,6 +710,12 @@ class GroupCoordinator:
-                 torch.distributed.all_reduce(input_, group=self.device_group)
-             return input_
- 
-+        if self.host_staged_comm is not None and self.host_staged_comm.should_use(input_):
-+            return self.host_staged_comm.all_reduce(input_)
-+
-+        if self.ll_comm is not None and self.ll_comm.should_use(input_):
-+            return self.ll_comm.all_reduce(input_)
-+
-         if self.hpu_communicator is not None and not self.hpu_communicator.disabled:
-             return self.hpu_communicator.all_reduce(input_)
- 
 diff --git a/python/sglang/srt/entrypoints/openai/serving_chat.py b/python/sglang/srt/entrypoints/openai/serving_chat.py
-index 232f0c59..a700d265 100644
+index 9901f1cb..dc1eb63d 100644
 --- a/python/sglang/srt/entrypoints/openai/serving_chat.py
 +++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
 @@ -1115,7 +1115,15 @@ class OpenAIServingChat(OpenAIServingBase):
@@ -774,7 +332,7 @@ index 232f0c59..a700d265 100644
                  prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
              elif is_dsv41:
                  if request.task is not None:
-@@ -2643,10 +2679,12 @@ class OpenAIServingChat(OpenAIServingBase):
+@@ -2645,10 +2681,12 @@ class OpenAIServingChat(OpenAIServingBase):
                  )
              if mode in ("explicit_thinking", "explicit_enable_thinking"):
                  toggle = mode.replace("explicit_", "")
@@ -823,246 +381,6 @@ index 2608621f..3a433970 100644
 +        async for _ in tokenizer_manager.generate_request(req, None):
 +            pass
 +        logger.info(f"[kt-warmup] extend of {n} tokens + 8 sampled in {time.perf_counter() - t0:.2f} s")
-diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-index 6e66a8e0..b12fe031 100644
---- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-+++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-@@ -299,6 +299,38 @@ def two_level_decode_logits(
- 
- # Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
- _TORCH_INDEXER_SCORE_BUDGET_BYTES = 1 << 30
-+# rows of a prefill chunk scored at a time by the dense low-ratio indexer
-+# (patches/sglang-dsv4-indexer-query-step.py); 0 scores the whole chunk at once
-+_INDEXER_QUERY_STEP = int(__import__("os").environ.get("SGLANG_DSV41_INDEXER_QUERY_STEP", "512"))
-+# a slice's fp32 logits [rows, prefix] stay within this many MiB (long prefixes)
-+_INDEXER_SLICE_BYTES = int(__import__("os").environ.get("SGLANG_DSV41_INDEXER_SLICE_MB", "256")) << 20
-+_INDEXER_QUERY_CHECK = __import__("os").environ.get("SGLANG_DSV41_INDEXER_QUERY_CHECK") == "1"
-+
-+
-+def _sink_non_candidates(scores: torch.Tensor, mask: torch.Tensor, block_size: int) -> None:
-+    """scores [n, w] in place: -inf where mask is False. mask is either per
-+    position [n, w] or per block [n, ceil(w / block_size)]; a block mask goes
-+    through a [n, blocks, block_size] view of scores, so no per-position copy
-+    of it is made (sglang-dsv4-candidate-mask-blocks.py)."""
-+    w = scores.shape[-1]
-+    if mask.shape[-1] == w:
-+        scores.masked_fill_(~mask, -torch.inf)
-+        return
-+    full = w - w % block_size
-+    nb = full // block_size
-+    if full:
-+        scores[:, :full].unflatten(-1, (nb, block_size)).masked_fill_(
-+            ~mask[:, :nb, None], -torch.inf
-+        )
-+    if full < w:
-+        scores[:, full:].masked_fill_(~mask[:, nb : nb + 1], -torch.inf)
-+
-+
-+def _expand_candidates(mask: torch.Tensor, width: int, block_size: int) -> torch.Tensor:
-+    """A per-position copy of a block mask (the check path only)."""
-+    if mask.shape[-1] == width:
-+        return mask
-+    return mask.repeat_interleave(block_size, dim=-1)[..., :width]
- 
- 
- def _mask_topk_scores(
-@@ -3112,26 +3144,136 @@ class DeepseekV4AttnBackend(
-             q_lens.to(torch.int64),
-             output_size=num_tokens,
-         )
--        logits = _dense_fp4_mqa_logits(
--            (q_fp4, q_sf),
--            (k_fp4, k_sf),
--            weights,
--            ks,
--            ks + compress_lens,
--            # the fused top-k reads score rows through 16-byte vectors
--            ceil_align(max(lc_per_req), 4),
--        )
--        if indexer.is_candidate_source or indexer.uses_candidates:
--            self._publish_or_consume_candidates(
--                indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
--            )
-         topk = indexer.index_topk
-         selected = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
--        topk_transform_ragged_v2(
--            logits, compress_lens, out_offsets=ks, out_indices=selected
--        )
--        if indexer.uses_candidates and not indexer.is_candidate_source:
--            selected = _mask_topk_scores(logits, selected, ks)
-+        two_level = indexer.is_candidate_source or indexer.uses_candidates
-+        if _INDEXER_QUERY_STEP <= 0:
-+            logits = _dense_fp4_mqa_logits(
-+                (q_fp4, q_sf),
-+                (k_fp4, k_sf),
-+                weights,
-+                ks,
-+                ks + compress_lens,
-+                # the fused top-k reads score rows through 16-byte vectors
-+                ceil_align(max(lc_per_req), 4),
-+            )
-+            if two_level:
-+                self._publish_or_consume_candidates(
-+                    indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
-+                )
-+            topk_transform_ragged_v2(
-+                logits, compress_lens, out_offsets=ks, out_indices=selected
-+            )
-+            if indexer.uses_candidates and not indexer.is_candidate_source:
-+                selected = _mask_topk_scores(logits, selected, ks)
-+        else:
-+            # per request, per slice of rows: one slice's [rows, prefix] scores
-+            # live at a time instead of the whole chunk's (384 MiB at 48K)
-+            step = _INDEXER_QUERY_STEP
-+            publish = [] if indexer.is_candidate_source else None
-+            tok_start = 0
-+            for b, (lc, t_len) in enumerate(zip(lc_per_req, q_lens_cpu)):
-+                r0 = tok_start
-+                tok_start += t_len
-+                if t_len == 0 or lc == 0:
-+                    if t_len:
-+                        selected[r0 : r0 + t_len].fill_(-1)
-+                    if publish is not None:
-+                        publish.append(empty_mask)
-+                    continue
-+                j = torch.arange(lc, device=device)
-+                # the candidate mask of this request, written slice by slice
-+                # (no torch.cat of the pieces: that held two copies at once)
-+                # per block: block_size times smaller than per position
-+                mask_b = (
-+                    torch.empty(
-+                        (t_len, -(-lc // indexer.candidate_block_size)),
-+                        dtype=torch.bool,
-+                        device=device,
-+                    )
-+                    if publish is not None and two_level
-+                    else None
-+                )
-+                # fewer rows a slice where the prefix is long (SGLANG_DSV41_INDEXER_SLICE_MB)
-+                step_b = max(16, min(step, _INDEXER_SLICE_BYTES // (ceil_align(lc, 4) * 4)))
-+                for s0 in range(0, t_len, step_b):
-+                    rows = slice(r0 + s0, r0 + min(s0 + step_b, t_len))
-+                    lens = compress_lens[rows]
-+                    ks_rows = ks[rows]
-+                    logits = _dense_fp4_mqa_logits(
-+                        (q_fp4[rows], q_sf[rows]),
-+                        (k_fp4, k_sf),
-+                        weights[rows],
-+                        ks_rows,
-+                        ks_rows + lens,
-+                        ceil_align(lc, 4),
-+                    )
-+                    if two_level:
-+                        scores = logits[:, :lc]
-+                        if publish is None:
-+                            _sink_non_candidates(
-+                                scores,
-+                                self.candidate_masks[b][s0 : s0 + scores.shape[0]],
-+                                indexer.candidate_block_size,
-+                            )
-+                        else:
-+                            lens2 = lens[:, None]
-+                            scores.masked_fill_(j[None, :] >= lens2, -torch.inf)
-+                            mask_b[s0 : s0 + scores.shape[0]] = select_candidate_blocks(
-+                                scores,
-+                                lens2,
-+                                topk_blocks=indexer.candidate_topk_blocks,
-+                                block_size=indexer.candidate_block_size,
-+                                expand=False,
-+                            )
-+                    out = selected[rows]
-+                    topk_transform_ragged_v2(logits, lens, out_offsets=ks_rows, out_indices=out)
-+                    if indexer.uses_candidates and not indexer.is_candidate_source:
-+                        out.copy_(_mask_topk_scores(logits, out, ks_rows))
-+                if publish is not None:
-+                    publish.append(mask_b)
-+            if publish is not None:
-+                self.candidate_masks = publish
-+            if _INDEXER_QUERY_CHECK:
-+                # the whole-chunk path on the same inputs, row by row
-+                ref = torch.empty_like(selected)
-+                logits = _dense_fp4_mqa_logits(
-+                    (q_fp4, q_sf), (k_fp4, k_sf), weights, ks, ks + compress_lens,
-+                    ceil_align(max(lc_per_req), 4),
-+                )
-+                if two_level:
-+                    saved = self.candidate_masks
-+                    self._publish_or_consume_candidates(
-+                        indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
-+                    )
-+                    if publish is not None:
-+                        same_masks = all(
-+                            bool(
-+                                (
-+                                    _expand_candidates(
-+                                        a, b_.shape[-1], indexer.candidate_block_size
-+                                    )
-+                                    == b_
-+                                ).all()
-+                            )
-+                            if a.numel() and b_.numel()
-+                            else a.numel() == b_.numel()
-+                            for a, b_ in zip(saved, self.candidate_masks)
-+                        )
-+                        self.candidate_masks = saved
-+                    else:
-+                        same_masks = True
-+                else:
-+                    same_masks = True
-+                topk_transform_ragged_v2(logits, compress_lens, out_offsets=ks, out_indices=ref)
-+                if indexer.uses_candidates and not indexer.is_candidate_source:
-+                    ref = _mask_topk_scores(logits, ref, ks)
-+                a = selected.masked_fill(selected < 0, torch.iinfo(torch.int32).max).sort(dim=-1).values
-+                b_ = ref.masked_fill(ref < 0, torch.iinfo(torch.int32).max).sort(dim=-1).values
-+                bad = int((a != b_).any(dim=-1).sum())
-+                print(f"[indexer-check] layer {layer.layer_id} ratio {ratio} rows {num_tokens} "
-+                      f"lc {lc_per_req} step {step}: rows differing {bad}, masks same {same_masks}, "
-+                      f"source {indexer.is_candidate_source} uses {indexer.uses_candidates}", flush=True)
-         # ascending positions, padding last: the layout the consumers expect
-         unselected = torch.iinfo(torch.int32).max
-         selected = selected.masked_fill(selected < 0, unselected).sort(dim=-1).values
-@@ -3160,7 +3302,7 @@ class DeepseekV4AttnBackend(
-                 continue
-             scores = logits[rows, :lc]
-             if publish is None:
--                scores.masked_fill_(~self.candidate_masks[b], -torch.inf)
-+                _sink_non_candidates(scores, self.candidate_masks[b], indexer.candidate_block_size)
-                 continue
-             lens = compress_lens[rows, None]
-             # the block selection tells unreachable positions apart by -inf
-diff --git a/python/sglang/srt/layers/attention/dsv4/indexer.py b/python/sglang/srt/layers/attention/dsv4/indexer.py
-index 7dba72ae..aec621a3 100644
---- a/python/sglang/srt/layers/attention/dsv4/indexer.py
-+++ b/python/sglang/srt/layers/attention/dsv4/indexer.py
-@@ -1133,14 +1133,19 @@ def select_candidate_blocks(
-     compress_lens: torch.Tensor | int,
-     topk_blocks: int,
-     block_size: int,
-+    expand: bool = True,
- ) -> torch.Tensor:
-     """Level one of the two-level top-k: a bool mask over positions keeping the
-     topk_blocks best-scoring blocks per query. Unreachable positions are already -inf
-     in logits, so an all -inf block means not reachable yet; the block holding the
-     query's newest position is always kept."""
-     width = logits.size(-1)
--    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
--    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
-+    # no padded copy of the [T, prefix] logits (384 MiB at 48K, and the OOM of
-+    # a long prefill): block maxima over the full blocks, the tail on its own
-+    full = width - width % block_size
-+    scores = logits[..., :full].unflatten(-1, (-1, block_size)).amax(dim=-1)
-+    if full < width:
-+        scores = torch.cat([scores, logits[..., full:].amax(dim=-1, keepdim=True)], dim=-1)
-     num_blocks = scores.size(-1)
- 
-     last = (compress_lens - 1) // block_size
-@@ -1152,4 +1157,6 @@ def select_candidate_blocks(
-     keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
-         -1, top.indices, top.values > -torch.inf
-     )
-+    if not expand:
-+        return keep  # [..., blocks]: the decision per block, not yet per position
-     return keep.repeat_interleave(block_size, dim=-1)[..., :width]
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py b/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
 index 7f76b261..66b99985 100644
 --- a/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
@@ -1180,17 +498,10 @@ index a1f0e7f0..bcd700b7 100644
  
          self._weight_loader_impl(
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 36c15cf1..c56eee77 100644
+index 97982532..c56eee77 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-@@ -7,12 +7,14 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
- (using any quantization method) and CPU experts (using AMX/AVX instructions).
- """
- 
-+import os
- from dataclasses import dataclass
- from typing import TYPE_CHECKING, Optional
- 
+@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Optional
  import torch
  
  from sglang.srt.arg_groups.overrides import model_config_of
@@ -1198,7 +509,7 @@ index 36c15cf1..c56eee77 100644
  from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
  from sglang.srt.runtime_context import (
      get_exec,
-@@ -37,6 +39,42 @@ except ImportError:
+@@ -38,6 +39,42 @@ except ImportError:
      KTRANSFORMERS_AVAILABLE = False
  
  
@@ -1241,12 +552,12 @@ index 36c15cf1..c56eee77 100644
  @dataclass
  class KTConfig:
      """Configuration for KTransformers heterogeneous computing CPU part.
-@@ -114,6 +152,64 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
+@@ -115,14 +152,50 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
      return topk_ids
  
  
 +_routing_dump_prefix = os.environ.get("KT_ROUTING_DUMP")
-+_gpu_mask_zero = os.environ.get("KT_GPU_MASK_ZERO") == "1"
+ _gpu_mask_zero = os.environ.get("KT_GPU_MASK_ZERO") == "1"
 +_hot_check = os.environ.get("KT_HOT_CHECK") == "1"
 +_routing_state = {}
 +# layer_idx -> KTEPWrapperMethod on the rank that owns the kt-kernel wrapper
@@ -1280,33 +591,32 @@ index 36c15cf1..c56eee77 100644
 +        threading.Thread(target=dump, daemon=True, name="kt-routing-dump").start()
 +    ids = topk_ids.reshape(-1).to(torch.int64)
 +    st["counts"][layer_idx].index_add_(0, ids, st["ones"].expand(ids.numel()))
-+
-+
-+def _kt_swiglu_kwargs(layer: torch.nn.Module) -> dict:
+ 
+ 
+ def _kt_swiglu_kwargs(layer: torch.nn.Module) -> dict:
+-    """{"swiglu_limit": limit} for KTMoEWrapper when the layer clamps its SwiGLU, else {}.
+-    The value is what the resident GPU runner applies: moe_runner_config.swiglu_limit
+-    (DeepSeek V4: gate <= limit, |up| <= limit before silu(gate) * up). Without it the
+-    CPU experts run unclamped. KT_SWIGLU_CLAMP=0 leaves it out."""
 +    """{"swiglu_limit": limit} for KTMoEWrapper when the layer clamps its
 +    SwiGLU, else {} (older kt-kernel builds keep working for models without
 +    a clamp). The value is what the resident GPU runner applies:
 +    moe_runner_config.swiglu_limit (DeepSeek V4: gate <= limit, |up| <= limit
 +    before silu(gate) * up). KT_SWIGLU_CLAMP=0 leaves it out, the behaviour
 +    before 10-12."""
-+    if os.environ.get("KT_SWIGLU_CLAMP", "1") == "0":
-+        return {}
-+    cfg = getattr(layer, "moe_runner_config", None)
-+    limit = getattr(cfg, "swiglu_limit", None)
-+    if not limit:
-+        return {}
-+    if getattr(cfg, "gemm1_alpha", None) is not None or getattr(cfg, "gemm1_clamp_limit", None) is not None:
-+        raise RuntimeError(
-+            "KT_SWIGLU_CLAMP: this layer uses gemm1_alpha/gemm1_clamp_limit, which "
+     if os.environ.get("KT_SWIGLU_CLAMP", "1") == "0":
+         return {}
+     cfg = getattr(layer, "moe_runner_config", None)
+@@ -132,7 +205,7 @@ def _kt_swiglu_kwargs(layer: torch.nn.Module) -> dict:
+     if getattr(cfg, "gemm1_alpha", None) is not None or getattr(cfg, "gemm1_clamp_limit", None) is not None:
+         raise RuntimeError(
+             "KT_SWIGLU_CLAMP: this layer uses gemm1_alpha/gemm1_clamp_limit, which "
+-            "the KT CPU wrapper does not map; set KT_SWIGLU_CLAMP=0"
 +            "the KT CPU wrapper in this tree does not map; set KT_SWIGLU_CLAMP=0"
-+        )
-+    return {"swiglu_limit": float(limit)}
-+
-+
- class KTEPWrapperMethod(FusedMoEMethodBase):
-     """Wrapper for any MoE quantization method to enable CPU-GPU expert parallelism.
+         )
+     return {"swiglu_limit": float(limit)}
  
-@@ -212,23 +308,45 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -235,6 +308,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
              params_dtype=params_dtype,
              **extra_weight_attrs,
          )
@@ -1319,29 +629,20 @@ index 36c15cf1..c56eee77 100644
  
          # 2. Initialize KT wrapper for CPU experts
          # CPU experts: num_gpu_experts to num_experts-1
-         if self.tp_rank == 0:
-+            # kt-kernel 0.7.0 inference API takes an explicit boolean mask of
-+            # GPU-resident experts instead of num_gpu_experts (SFT-only).
-+            # GPU experts occupy ordinals 0..num_gpu_experts-1 (see above).
-+            gpu_mask = torch.zeros(num_experts, dtype=torch.bool)
-+            gpu_mask[: self.num_gpu_experts] = True
+@@ -244,6 +323,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+             # GPU experts occupy ordinals 0..num_gpu_experts-1 (see above).
+             gpu_mask = torch.zeros(num_experts, dtype=torch.bool)
+             gpu_mask[: self.num_gpu_experts] = True
 +            KT_LAYERS[self.kt_config.layer_idx] = self
              self.wrapper = KTMoEWrapper(
                  layer_idx=self.kt_config.layer_idx,
                  num_experts=num_experts,
-                 num_experts_per_tok=num_experts_per_tok,
-                 hidden_size=hidden_size,
-                 moe_intermediate_size=intermediate_size_full,
--                num_gpu_experts=self.num_gpu_experts,
-+                gpu_experts_mask=gpu_mask,
-                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
-                 threadpool_count=self.kt_config.threadpool_count,
-                 weight_path=self.kt_config.weight_path,
+@@ -257,7 +337,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                  chunked_prefill_size=self.kt_config.chunked_prefill_size,
                  method=self.kt_config.method,
                  max_deferred_experts_per_token=layer_max_deferred,
 +                # patches/sglang-kt-swiglu-clamp.py (KT_SWIGLU_CLAMP)
-+                **_kt_swiglu_kwargs(layer),
+                 **_kt_swiglu_kwargs(layer),
 +                # KT_NUMA_NODES="1" pins a single pool to node 1, the node
 +                # that does not host the TP0 scheduler, for the prefill-decay
 +                # isolation; unset keeps kt-kernel's sequential default.
@@ -1353,7 +654,7 @@ index 36c15cf1..c56eee77 100644
              )
  
      def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-@@ -238,7 +356,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -267,7 +356,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
              layer: The MoE layer module
          """
          # 1. Process GPU weights
@@ -1366,7 +667,7 @@ index 36c15cf1..c56eee77 100644
              self.gpu_method.process_weights_after_loading(layer)
  
          # 2. Load CPU weights using KT wrapper
-@@ -255,7 +377,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -284,7 +377,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                  .physical_to_logical_map_cpu[self.kt_config.layer_idx]
                  .contiguous()
              )
@@ -1386,7 +687,7 @@ index 36c15cf1..c56eee77 100644
  
      def create_moe_runner(
          self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
-@@ -297,6 +431,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -326,6 +431,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          topk_output = dispatch_output.topk_output
          topk_weights, topk_ids, _ = topk_output
  
@@ -1398,7 +699,7 @@ index 36c15cf1..c56eee77 100644
          # Submit forward task to CPU (non-blocking)
          self.wrapper.submit_forward(
              x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
-@@ -344,10 +483,62 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -373,10 +483,62 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
  
          x = dispatch_output.hidden_states
          topk_output = dispatch_output.topk_output
@@ -1463,51 +764,45 @@ index 36c15cf1..c56eee77 100644
  
          # Step 2: Prepare GPU computation by masking CPU expert IDs
          # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
-@@ -355,23 +546,69 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
-         masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
- 
-         # Create modified dispatch output for GPU computation
--        masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
-+        if _gpu_mask_zero:
-+            # KT_GPU_MASK_ZERO=1: the Marlin MoE path cannot take -1 ids (its
-+            # alignment kernels index weights with them: illegal address at
+@@ -387,10 +549,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         if _gpu_mask_zero:
+             # KT_GPU_MASK_ZERO=1: the Marlin MoE path cannot take -1 ids (its
+             # alignment kernels index weights with them: illegal address at
+-            # graph capture). Send the CPU-bound rows to GPU expert 0 with a
+-            # zero routing weight instead (the second GEMM multiplies by the
+-            # weight, so they add nothing) and hand the ids over as int64 so
+-            # fused_marlin_moe takes its generic alignment path.
 +            # graph capture, 09-13). Send the CPU-bound rows to GPU expert 0
 +            # with a zero routing weight instead — the second GEMM multiplies
 +            # by the weight, so they add nothing — and hand the ids over as
 +            # int64 so fused_marlin_moe takes its generic alignment path,
 +            # which is fine with duplicate ids within a token.
-+            m = masked_topk_ids < 0
-+            masked_topk_output = topk_output._replace(
-+                topk_ids=torch.where(m, torch.zeros_like(masked_topk_ids), masked_topk_ids).to(torch.int64),
-+                topk_weights=torch.where(m, torch.zeros_like(topk_output.topk_weights), topk_output.topk_weights),
-+            )
-+        else:
-+            masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
-         masked_dispatch_output = dispatch_output._replace(
-             topk_output=masked_topk_output
-         )
+             m = masked_topk_ids < 0
+             masked_topk_output = topk_output._replace(
+                 topk_ids=torch.where(m, torch.zeros_like(masked_topk_ids), masked_topk_ids).to(torch.int64),
+@@ -404,20 +567,48 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
  
          # Step 3: Execute GPU expert computation (any quantization method)
--        # This runs in parallel with CPU computation
--        gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
-+        # This runs in parallel with CPU computation. With no resident GPU
+         # This runs in parallel with CPU computation. With no resident GPU
+-        # experts (--kt-num-gpu-experts 0) there is nothing to run, and the
+-        # FlashInfer MXFP4 runner refuses a zero-expert workspace.
 +        # experts (--kt-num-gpu-experts 0, every slot given to the streamer
 +        # and the KV pool) there is nothing to run and the FlashInfer MXFP4
 +        # runner refuses a zero-expert workspace (09-16).
-+        if self.num_gpu_experts > 0:
+         if self.num_gpu_experts > 0:
+-            output = self.gpu_method.apply(layer, masked_dispatch_output).hidden_states
 +            gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
 +            output = gpu_combine_input.hidden_states
 +            if streamer is not None and _hot_check:
 +                from sglang.srt.layers.moe.kt_stream_prefill import hot_reference_check
 +
 +                hot_reference_check(self, layer, x, physical_ids, topk_output.topk_weights, output, streamer)
-+        else:
-+            output = torch.zeros_like(x)
+         else:
+             output = torch.zeros_like(x)
 +        if hot is not None:
 +            output = output + kt_kv_hot_lend.apply(self, hot[1])
  
          # Step 4: Synchronize CPU results and merge with GPU results
--        output = gpu_combine_input.hidden_states
 -        if self.tp_rank == 0:
 +        if streamer is not None:
 +            output = output + streamer.run(self, layer, dispatch_output, physical_ids)
@@ -7853,21 +7148,6 @@ index cd539390..2aae320c 100644
              output = self._forward_raw(
                  forward_batch,
                  pp_proxy_tensors,
-diff --git a/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py b/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
-index e3c22d6f..24f9b5e4 100644
---- a/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
-+++ b/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
-@@ -48,7 +48,9 @@ logger = logging.getLogger(__name__)
- _is_npu = is_npu()
- 
- 
--UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
-+UNBALANCED_MODEL_LOADING_TIMEOUT_S = int(
-+    os.environ.get("SGLANG_UNBALANCED_LOAD_TIMEOUT_S", "480")
-+)  # leave more time for post data processing
- 
- 
- def maybe_precompile_model_kernels_after_loading(model, device: str) -> None:
 diff --git a/python/sglang/srt/model_executor/pool_configurator.py b/python/sglang/srt/model_executor/pool_configurator.py
 index 95803724..c6684a37 100644
 --- a/python/sglang/srt/model_executor/pool_configurator.py
@@ -8100,112 +7380,6 @@ index fd659e7c..4e03dbe6 100644
          return result
  
      # Sliding window: max_workers loading + 1 prefetched.
-diff --git a/python/sglang/srt/models/deepseek_common/o_fp8_qdq.py b/python/sglang/srt/models/deepseek_common/o_fp8_qdq.py
-new file mode 100644
-index 00000000..3a062ae8
---- /dev/null
-+++ b/python/sglang/srt/models/deepseek_common/o_fp8_qdq.py
-@@ -0,0 +1,100 @@
-+"""In-place FP8 (e4m3) quantize-dequantize of an activation in blocks along its last dim,
-+with power-of-two scales: the reference act_quant(x, block, "ue8m0", ..., inplace=True)
-+of DeepSeek's inference code. amax is floored at 1e-4, the scale is 2^ceil(log2(amax/448)),
-+the value x/scale is clamped to +-448, rounded to e4m3 and multiplied back (bit-exact
-+against the reference: the scale is a power of two).
-+
-+DeepSeek-V4.1-Flash-1017 runs the attention output o through it (block 32) before the
-+bf16 wo_a einsum; the earlier V4.1 checkpoint did not.
-+
-+The e4m3 rounding uses the hardware conversion on sm89 and newer. Older GPUs (Ampere
-+and before, where Triton has no e4m3 type) get the same rounding in fp32 arithmetic
-+(round half to even onto the e4m3 grid, signed zero kept); O_FP8_QDQ_EMULATE=1 forces
-+that path anywhere, for testing.
-+"""
-+import os
-+
-+import torch
-+import triton
-+import triton.language as tl
-+
-+
-+@triton.jit
-+def _o_fp8_qdq_kernel(x_ptr, n_blocks, BLOCK: tl.constexpr, ROWS: tl.constexpr, NATIVE: tl.constexpr):
-+    pid = tl.program_id(0)
-+    rows = pid * ROWS + tl.arange(0, ROWS)
-+    cols = tl.arange(0, BLOCK)
-+    mask = rows[:, None] < n_blocks
-+    offs = rows[:, None].to(tl.int64) * BLOCK + cols[None, :]
-+    x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-+    amax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
-+    t = amax * (1.0 / 448.0)
-+    bits = t.to(tl.int32, bitcast=True)
-+    e = ((bits >> 23) & 0xFF) - 127 + tl.where((bits & 0x7FFFFF) != 0, 1, 0)
-+    s = ((e + 127) << 23).to(tl.float32, bitcast=True)
-+    v = tl.minimum(tl.maximum(x / s[:, None], -448.0), 448.0)
-+    if NATIVE:
-+        q = v.to(tl.float8e4nv).to(tl.float32)
-+    else:
-+        # the e4m3 grid: 3 mantissa bits, exponents down to -6, subnormal step 2^-9
-+        a = tl.abs(v)
-+        ea = tl.maximum(((a.to(tl.int32, bitcast=True) >> 23) & 0xFF) - 127, -6)
-+        ulp = ((ea - 3 + 127) << 23).to(tl.float32, bitcast=True)
-+        r = a / ulp  # exact: ulp is a power of two; r < 16
-+        r = (r + 12582912.0) - 12582912.0  # round half to even (1.5 * 2^23)
-+        q = r * ulp
-+        # the sign by its bit: Triton's -q is 0 - q, which turns -0 into +0
-+        sign = v.to(tl.int32, bitcast=True) & -2147483648
-+        q = (q.to(tl.int32, bitcast=True) | sign).to(tl.float32, bitcast=True)
-+    y = q * s[:, None]
-+    tl.store(x_ptr + offs, y.to(x_ptr.dtype.element_ty), mask=mask)
-+
-+
-+_NATIVE = {}
-+
-+
-+def _native_fp8(device) -> bool:
-+    if os.environ.get("O_FP8_QDQ_EMULATE", "0") == "1":
-+        return False
-+    idx = device.index if device.index is not None else torch.cuda.current_device()
-+    if idx not in _NATIVE:
-+        _NATIVE[idx] = torch.cuda.get_device_capability(idx) >= (8, 9)
-+    return _NATIVE[idx]
-+
-+
-+def o_fp8_qdq_(x: torch.Tensor, block: int) -> torch.Tensor:
-+    """x in place (made contiguous first if it is not); returns the tensor holding the result."""
-+    if x.shape[-1] % block:
-+        raise ValueError(f"last dim {x.shape[-1]} is not a multiple of block {block}")
-+    if not x.is_contiguous():
-+        x = x.contiguous()
-+    n_blocks = x.numel() // block
-+    if n_blocks:
-+        rows = 64
-+        _o_fp8_qdq_kernel[(triton.cdiv(n_blocks, rows),)](
-+            x, n_blocks, BLOCK=block, ROWS=rows, NATIVE=_native_fp8(x.device)
-+        )
-+    return x
-+
-+
-+def e4m3_round_emulated(v: torch.Tensor) -> torch.Tensor:
-+    """The non-native kernel path's rounding in torch (fp32 in, fp32 out, |v| <= 448)."""
-+    a = v.abs()
-+    ea = (((a.view(torch.int32) >> 23) & 0xFF) - 127).clamp_min(-6)
-+    ulp = ((ea - 3 + 127) << 23).view(torch.float32)
-+    r = a / ulp
-+    r = (r + 12582912.0) - 12582912.0
-+    q = r * ulp
-+    return torch.where(v.view(torch.int32) < 0, -q, q)
-+
-+
-+def o_fp8_qdq_reference(x: torch.Tensor, block: int) -> torch.Tensor:
-+    """The same in plain torch, out of place (for the self-test)."""
-+    shape = x.shape
-+    f = x.float().reshape(-1, block)
-+    amax = f.abs().amax(dim=1).clamp_min(1e-4)
-+    bits = (amax * (1.0 / 448.0)).view(torch.int32)
-+    e = ((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0).to(torch.int32)
-+    s = ((e + 127) << 23).view(torch.float32)[:, None]
-+    v = (f / s).clamp(-448.0, 448.0)
-+    return (v.to(torch.float8_e4m3fn).float() * s).to(x.dtype).reshape(shape)
 diff --git a/python/sglang/srt/models/deepseek_common/wo_a_fp8_gemv.py b/python/sglang/srt/models/deepseek_common/wo_a_fp8_gemv.py
 new file mode 100644
 index 00000000..8ff875fa
@@ -8368,7 +7542,7 @@ index 8f3cf1da..dd9cea0c 100644
              pre_quant_input = None
              shared_output = None
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 228af858..17e15b2d 100644
+index 8d4f076d..17e15b2d 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
 @@ -1,6 +1,7 @@
@@ -8441,7 +7615,7 @@ index 228af858..17e15b2d 100644
      image_token_types,
      materialize_image_gpu,
  )
-@@ -453,6 +495,179 @@ if _is_hip:
+@@ -453,6 +495,65 @@ if _is_hip:
              _wo_a_fp8_mxscale_fused_invrope = apply_wo_a_fp8_mxscale_fused_invrope
  
  
@@ -8504,17 +7678,13 @@ index 228af858..17e15b2d 100644
 +    )
 +
 +
-+def _o_fp8_qdq_block() -> int:
-+    """SGLANG_DSV4_O_FP8_QDQ_BLOCK (sglang-dsv4-o-fp8-qdq.py): FP8 quant-dequant of the
-+    attention output before a bf16 wo_a, in blocks of this many; 0 = off."""
-+    import os
-+
-+    return int(os.environ.get("SGLANG_DSV4_O_FP8_QDQ_BLOCK", "0") or 0)
-+
-+
-+_O_FP8_QDQ_BLOCK = _o_fp8_qdq_block()
-+
-+
+ def _o_fp8_qdq_block() -> int:
+     """SGLANG_DSV4_O_FP8_QDQ_BLOCK (sglang-dsv4-o-fp8-qdq.py): FP8 quant-dequant of the
+     attention output before a bf16 wo_a, in blocks of this many; 0 = off."""
+@@ -464,6 +565,109 @@ def _o_fp8_qdq_block() -> int:
+ _O_FP8_QDQ_BLOCK = _o_fp8_qdq_block()
+ 
+ 
 +# sglang-dsv4-vision-on-demand.py
 +_VISION_ON_DEMAND = __import__("os").environ.get("SGLANG_DSV4_VISION_ON_DEMAND", "0") == "1"
 +
@@ -8621,7 +7791,7 @@ index 228af858..17e15b2d 100644
  def _apply_wo_a_bf16_matmul(
      o: torch.Tensor, wo_a: torch.Tensor, is_decode: bool
  ) -> torch.Tensor:
-@@ -795,6 +1010,17 @@ class MqaAttentionBase(nn.Module):
+@@ -806,6 +1010,17 @@ class MqaAttentionBase(nn.Module):
          else:
              wo_a_quant_config = None
  
@@ -8639,7 +7809,7 @@ index 228af858..17e15b2d 100644
          self.fuse_wqa_wkv = fuse
          self.wo_a_fp8 = fp8
  
-@@ -842,8 +1068,13 @@ class MqaAttentionBase(nn.Module):
+@@ -853,8 +1068,13 @@ class MqaAttentionBase(nn.Module):
              prefix=add_prefix("wo_a", prefix),
              tp_rank=self.attn_tp_rank,
              tp_size=self.attn_tp_size,
@@ -8654,7 +7824,7 @@ index 228af858..17e15b2d 100644
          if fp8:
              from sglang.srt.layers import deep_gemm_wrapper
  
-@@ -1870,7 +2101,11 @@ class MQALayer(MqaAttentionBase):
+@@ -1881,7 +2101,11 @@ class MQALayer(MqaAttentionBase):
                      or tuple(q_padded.shape) != want
                      or q_padded.dtype != x.dtype
                  ):
@@ -8667,14 +7837,9 @@ index 228af858..17e15b2d 100644
                      if meta is not None:
                          try:
                              meta.q_pad_buffer = q_padded
-@@ -2061,8 +2296,36 @@ class MQALayer(MqaAttentionBase):
-                 )
-                 o = output
-             else:
-+                if _O_FP8_QDQ_BLOCK:
-+                    from sglang.srt.models.deepseek_common.o_fp8_qdq import o_fp8_qdq_
-+
-+                    o = o_fp8_qdq_(o, _O_FP8_QDQ_BLOCK)
+@@ -2077,7 +2301,31 @@ class MQALayer(MqaAttentionBase):
+ 
+                     o = o_fp8_qdq_(o, _O_FP8_QDQ_BLOCK)
                  wo_a_weight = getattr(self.wo_a, "weight", None)
 -                if wo_a_weight is not None:
 +                wo_a_fp8_copy = getattr(self, "_wo_a_fp8_copy", None)
@@ -8705,7 +7870,7 @@ index 228af858..17e15b2d 100644
                      wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
                      o = _apply_wo_a_bf16_matmul(
                          o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
-@@ -3399,6 +3662,20 @@ class DeepseekV4Model(nn.Module):
+@@ -3414,6 +3662,20 @@ class DeepseekV4Model(nn.Module):
          ):
              self.engram_prefetch_stream = torch.cuda.Stream()
              logger.info("Engram layer 14 KV prefetch enabled for BS=1 decode")
@@ -8726,7 +7891,7 @@ index 228af858..17e15b2d 100644
  
          self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
          self.use_fused_mhc_post_pre = (
-@@ -3537,6 +3814,27 @@ class DeepseekV4Model(nn.Module):
+@@ -3552,6 +3814,27 @@ class DeepseekV4Model(nn.Module):
                      hash_ids[:, engram.layer_hash_index]
                  )
              hash_ids.record_stream(prefetch_stream)
@@ -8754,7 +7919,7 @@ index 228af858..17e15b2d 100644
          tail = None
          if (
              self.late_layer_start is not None
-@@ -3572,6 +3870,18 @@ class DeepseekV4Model(nn.Module):
+@@ -3587,6 +3870,18 @@ class DeepseekV4Model(nn.Module):
                          hidden_states, prefetched_engram_kv
                      )
                      prefetched_engram_kv = None
@@ -8773,7 +7938,7 @@ index 228af858..17e15b2d 100644
                  else:
                      hidden_states = engram(
                          hidden_states,
-@@ -4052,7 +4362,19 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4067,7 +4362,19 @@ class DeepseekV4ForCausalLM(nn.Module):
          self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
          self.determine_num_fused_shared_experts()
          self.vision = None
@@ -8794,7 +7959,7 @@ index 228af858..17e15b2d 100644
              if (
                  get_parallel().attn_cp_size != 1
                  or get_pp_group().world_size != 1
-@@ -4068,6 +4390,9 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4083,6 +4390,9 @@ class DeepseekV4ForCausalLM(nn.Module):
              self.image_start = nn.Parameter(torch.empty(config.hidden_size))
              self.image_end = nn.Parameter(torch.empty(config.hidden_size))
              self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
@@ -8804,7 +7969,7 @@ index 228af858..17e15b2d 100644
          self.model = DeepseekV4Model(
              config, quant_config, prefix=add_prefix("model", prefix)
          )
-@@ -4140,7 +4465,14 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4155,7 +4465,14 @@ class DeepseekV4ForCausalLM(nn.Module):
              )
              features = self.aligner(self.vision(patches, h, w), h, w)
              r = self.config.vision_downsample_ratio
@@ -8820,7 +7985,7 @@ index 228af858..17e15b2d 100644
              span = torch.empty(
                  (len(types), self.config.hidden_size), device=device, dtype=dtype
              )
-@@ -4148,23 +4480,27 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4163,23 +4480,27 @@ class DeepseekV4ForCausalLM(nn.Module):
              span[types == 1] = features.to(dtype)
              span[types == 2] = self.image_newline
              span[types == 3] = self.image_end
@@ -8859,7 +8024,7 @@ index 228af858..17e15b2d 100644
          forward_batch.mm_input_embeds = input_embeds
          return input_embeds
  
-@@ -4360,6 +4696,10 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4375,6 +4696,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                  attn.wo_a.weight_scale_inv.format_ue8m0 = False
  
      def post_load_weights(self, is_nextn=False, weight_names=None):
@@ -8870,7 +8035,7 @@ index 228af858..17e15b2d 100644
          if self.wo_a_fp8:
              self._setup_fp8_wo_a_scales(is_nextn)
  
-@@ -4554,6 +4894,8 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4569,6 +4894,8 @@ class DeepseekV4ForCausalLM(nn.Module):
  
          cache_compressor_weight = {}
          COMPRESSOR_PART = ".compressor.w"
@@ -8879,7 +8044,7 @@ index 228af858..17e15b2d 100644
  
          fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
          cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
-@@ -4603,11 +4945,21 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4618,11 +4945,21 @@ class DeepseekV4ForCausalLM(nn.Module):
                  try:
                      use_async_loading = should_async_load(loaded_weight)
  
@@ -8901,7 +8066,7 @@ index 228af858..17e15b2d 100644
  
                      # V4.1 checkpoint tensors with no module in the text model yet;
                      # the per-group count is logged after loading.
-@@ -5043,6 +5395,9 @@ def _prepare_deepseek_v4_weights(
+@@ -5058,6 +5395,9 @@ def _prepare_deepseek_v4_weights(
      if quant_config is not None and quant_config.get_name() == "expert_pack":
          logger.info("Keep Expert Pack GGUF weights on the streaming load path")
          return weights
@@ -8911,25 +8076,6 @@ index 228af858..17e15b2d 100644
      return _dequant_fp8_wo_a_streaming(weights)
  
  
-diff --git a/python/sglang/srt/models/deepseek_v4_dspark.py b/python/sglang/srt/models/deepseek_v4_dspark.py
-index ad8d59e3..1e6c0236 100644
---- a/python/sglang/srt/models/deepseek_v4_dspark.py
-+++ b/python/sglang/srt/models/deepseek_v4_dspark.py
-@@ -351,6 +351,14 @@ class DSparkAttention(MqaAttentionBase):
-             self.n_local_groups,
-             o.shape[1] * o.shape[2] // self.n_local_groups,
-         )
-+        import os
-+
-+        # sglang-dsv4-o-fp8-qdq.py: the 1017 reference quantizes o before wo_a here too
-+        _qdq = int(os.environ.get("SGLANG_DSV4_O_FP8_QDQ_BLOCK", "0") or 0)
-+        if _qdq:
-+            from sglang.srt.models.deepseek_common.o_fp8_qdq import o_fp8_qdq_
-+
-+            o = o_fp8_qdq_(o, _qdq)
-         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-         if self._use_fast_kernel:
-             o = torch.einsum("bgd,grd->bgr", o, wo_a)
 diff --git a/python/sglang/srt/multimodal/deepseek_v41_image_processing.py b/python/sglang/srt/multimodal/deepseek_v41_image_processing.py
 index ab9ecd01..5490ed16 100644
 --- a/python/sglang/srt/multimodal/deepseek_v41_image_processing.py

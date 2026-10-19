@@ -36,6 +36,9 @@ alias_name="${SGLANG_SERVED_NAME:-$(basename "$model")}"
 [[ -x "$python" ]] || { echo "run ./setup.sh first (.venv missing)" >&2; exit 3; }
 [[ -f "$source_dir/sglang/srt/layers/engram.py" ]] || { echo "run ./setup.sh first (patched SGLang missing)" >&2; exit 3; }
 [[ -f "$adapter_dir/librow_store.so" ]] || { echo "run ./setup.sh first (engram-adapter/librow_store.so missing)" >&2; exit 3; }
+# the tier setup.sh applied (an empty marker, from before tiers, is the full tree)
+tier="$(cat "$here/third_party/sglang/.dsv41-1017-patched" 2>/dev/null || true)"
+tier="${tier:-3}"
 if [[ ! -f "$engram_dir/engram-manifest.json" ]]; then
   "$python" "$here/tools/make-engram-manifest.py" "$model" "$engram_dir" >&2
 fi
@@ -97,14 +100,21 @@ export SGLANG_FP8_GEMV="${SGLANG_FP8_GEMV:-1}"
 # (0: at the layers)
 export SGLANG_DSV41_ENGRAM_PREFETCH_ROWS="${SGLANG_DSV41_ENGRAM_PREFETCH_ROWS:-1}"
 
-# hot experts: the resident ones, and with the hot lend 16 more a layer in the KV
-# pool's free pages outside prefill (KT_KV_HOT_LEND=0 turns it off)
-source "$here/lib/kt-kv-hot-default.sh"
-kt_kv_hot_default "$here/placements/dsv41-expert-placement-hot64.json" 5 "$gpu_experts" 16 "$source_dir" swa
-# in decode the hot lend's slots also take the driver's idle memory above a 1 GiB floor
-# (-1: only the KV pool's free pages)
-export KT_KV_HOT_SPARE_FLOOR_MB="${KT_KV_HOT_SPARE_FLOOR_MB:-1024}"
-placement="${KT_EXPERT_PLACEMENT:-${KT_KV_HOT_PLACEMENT:-$here/placements/dsv41-expert-placement-${gpu_experts}.json}}"
+if (( tier >= 2 )); then
+  # hot experts: the resident ones, and with the hot lend 16 more a layer in the KV
+  # pool's free pages outside prefill (KT_KV_HOT_LEND=0 turns it off)
+  source "$here/lib/kt-kv-hot-default.sh"
+  kt_kv_hot_default "$here/placements/dsv41-expert-placement-hot64.json" 5 "$gpu_experts" 16 "$source_dir" swa
+  # in decode the hot lend's slots also take the driver's idle memory above a 1 GiB floor
+  # (-1: only the KV pool's free pages)
+  export KT_KV_HOT_SPARE_FLOOR_MB="${KT_KV_HOT_SPARE_FLOOR_MB:-1024}"
+  placement="${KT_EXPERT_PLACEMENT:-${KT_KV_HOT_PLACEMENT:-$here/placements/dsv41-expert-placement-${gpu_experts}.json}}"
+else
+  # below tier 2 the wrapper keeps experts 0..N-1 on the GPU: no placement, no hot lend,
+  # no prefill lend (docs/patches.md)
+  placement=none
+  export KT_PREFILL_LEND="${KT_PREFILL_LEND:-0}"
+fi
 if [[ "$placement" != "none" && -f "$placement" ]]; then
   extra_args+=(--init-expert-location "$placement")
 elif [[ "$placement" != "none" ]]; then
@@ -256,8 +266,8 @@ command=(
 
 printf '%s\n' "DeepSeek-V4.1-Flash on SGLang + KTransformers: $model"
 printf '%s\n' "GPUs ${CUDA_VISIBLE_DEVICES} (sm $cap), TP $tp on NUMA nodes $numa_list; CPU experts: $cpu_threads threads in $threadpools pools; GPU experts $gpu_experts a layer"
-printf '%s\n' "context $context_length; attention output FP8 before wo_a: block ${SGLANG_DSV4_O_FP8_QDQ_BLOCK:-0}"
-printf '%s\n' "wo_a native FP8: $SGLANG_DSV4_WO_A_FP8_NATIVE; vision tower on demand: $SGLANG_DSV4_VISION_ON_DEMAND; MXFP4 MoE fp32: $SGLANG_MXFP4_MOE_FP32; Marlin MoE fp32 glue: $SGLANG_MARLIN_MOE_FP32_GLUE; CPU scale codes: $KT_MXFP4_SCALE_CODES; hot lend spare floor: $KT_KV_HOT_SPARE_FLOOR_MB MiB"
+printf '%s\n' "patch tier $tier; context $context_length; attention output FP8 before wo_a: block ${SGLANG_DSV4_O_FP8_QDQ_BLOCK:-0}"
+(( tier >= 2 )) && printf '%s\n' "wo_a native FP8: $SGLANG_DSV4_WO_A_FP8_NATIVE; vision tower on demand: $SGLANG_DSV4_VISION_ON_DEMAND; MXFP4 MoE fp32: $SGLANG_MXFP4_MOE_FP32; Marlin MoE fp32 glue: $SGLANG_MARLIN_MOE_FP32_GLUE; CPU scale codes: $KT_MXFP4_SCALE_CODES; hot lend spare floor: $KT_KV_HOT_SPARE_FLOOR_MB MiB"
 printf '%s\n' "Run directory: $run_dir"
 ln -sfn "$run_dir" "$log_root/$log_name/current"
 if [[ "$mode" == "--background" ]]; then

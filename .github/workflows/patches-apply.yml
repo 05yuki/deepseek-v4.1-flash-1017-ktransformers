@@ -1,6 +1,6 @@
 name: patches apply
 
-# Do the three patches still apply to their pinned upstream commits? Fetches only those
+# Do the patches still apply to their pinned upstream commits? Fetches only those
 # commits (no GPU, no build), every push and pull request and once a week, so an upstream
 # commit that disappears or a patch that no longer fits shows up here first.
 on:
@@ -30,7 +30,11 @@ jobs:
                  git fetch -q --depth 1 https://github.com/05yuki/sglang-upstream.git "refs/tags/$SGLANG_TAG"; }
           git checkout -q FETCH_HEAD
           test "$(git rev-parse HEAD)" = "$SGLANG_COMMIT"
-          git apply --check --whitespace=nowarn ../patches/sglang-dsv41-tree.patch
+          # the tiers stack: each is checked on top of the ones below it
+          for t in ../patches/sglang-tier0-run.patch ../patches/sglang-tier1-long-prompts.patch ../patches/sglang-tier2-speed.patch ../patches/sglang-tier3-no-p2p.patch; do
+            git apply --check --whitespace=nowarn "$t"
+            git apply --whitespace=nowarn "$t"
+          done
 
       - name: ktransformers and its llama.cpp
         run: |

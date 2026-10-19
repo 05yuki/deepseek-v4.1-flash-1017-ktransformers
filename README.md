@@ -56,24 +56,32 @@ DeepSeek-V4.1-Flash release: point `MODEL` at it.
 ## What setup.sh does
 
 1. Clones sgl-project/sglang at `1aa0e962` (from its former `dsv4.1` branch, also tagged
-   `dsv41-1aa0e962` in 05yuki/sglang-upstream) and applies
-   `patches/sglang-dsv41-tree.patch`. The patch adds:
-   - the KTransformers expert wrapper's placement, streaming and lend paths
-   - host-memory all-reduce
-   - the KV pool on remappable memory (kv-vmm)
-   - the indexer and load fixes
-   - the 1017 step below
+   `dsv41-1aa0e962` in 05yuki/sglang-upstream) and applies the SGLang patches up to `TIER`
+   (default 3), each tier on top of the ones below it:
+
+   | `TIER` | patch | what it adds |
+   |---|---|---|
+   | 0 | `sglang-tier0-run.patch` | what 1017 needs to run correctly on the KTransformers hybrid MoE: the FP8 step below, the SwiGLU clamp passed to the CPU experts, the expert mask kt-kernel takes, `-1` ids kept out of the Marlin MoE, a configurable load barrier, the chat encoding of the current reference (tool namespaces, the `drop_thinking` turn boundary, the reasoning-effort budgets), and the SM12x sparse attention fixes (RTX 50, RTX PRO Blackwell, DGX Spark; the code runs on nothing else) |
+   | 1 | `sglang-tier1-long-prompts.patch` | the indexer's memory on long prompts |
+   | 2 | `sglang-tier2-speed.patch` | streamed prefill, the lends, hot experts and placement, the KV pool on remappable memory, the GPU MoE and FP8 kernels (the streamed prefill needs SM89 or newer) |
+   | 3 | `sglang-tier3-no-p2p.patch` | all-reduce through pinned host memory, for two GPUs without peer access |
+
+   Below tier 2 a long prompt's experts run on the CPU (about 40 tok/s of prefill here, decode
+   about 11 tok/s); the speed in Results is tier 3's.
+
 2. Clones kvcache-ai/ktransformers at `95009ea` with its llama.cpp and pybind11
-   submodules, and applies `patches/kt-kernel-tree.patch` and
-   `patches/kt-kernel-llama-cpp.patch`.
+   submodules. From tier 2 it also applies `patches/kt-kernel-tree.patch` (the CPU kernels'
+   speed, shared expert memory, the stream hand-over) and `patches/kt-kernel-llama-cpp.patch`;
+   below tier 2 kt-kernel is built as pinned.
 3. Creates `.venv` from `requirements.txt` and installs the patched SGLang.
-4. Builds kt-kernel for this CPU and the visible GPUs' compute capability, with
-   parallel expert loading (`patches/kt-kernel-load-prefetch.py`).
+4. Builds kt-kernel for this CPU and the visible GPUs' compute capability; at tier 2
+   with parallel expert loading (`patches/kt-kernel-load-prefetch.py`).
 5. Builds `engram-adapter/librow_store.so` and `build/libkv_vmm.so`.
 6. With `MODEL` set, writes the engram manifest from the checkpoint's headers
    (`tools/make-engram-manifest.py`). It then runs the 1017 kernel's test on this GPU.
 
-Re-running skips the finished steps. Each patch is checked against its pinned tree before it
+Re-running skips the finished steps; a different `TIER` re-applies the patches and
+rebuilds kt-kernel. `serve.sh` reads the tier and leaves out what needs tier 2. Each patch is checked against its pinned tree before it
 is applied; one that does not fit stops the setup with nothing applied. If the libnuma or hwloc headers live outside the
 system paths, pass them in through `CPLUS_INCLUDE_PATH` and `LIBRARY_PATH`. CMake
 flags go in `CMAKE_ARGS`.
@@ -176,8 +184,8 @@ SM120 attention no longer reads an uninitialized padding page (#3), and
   release's routing on Japanese prose. It loads and runs with 1017, but it is not
   1017's hottest set, and it fits no other workload better. To record your own, use
   `KT_ROUTING_DUMP` and SGLang's `--init-expert-location`.
-- Tool namespaces and the new `drop_thinking` turn boundary are not in SGLang's
-  DeepSeek-V4 chat encoding.
+- A forced `tool_choice` (named or required) does not carry a tool's namespace: the
+  constrained decoding asks for the bare name.
 - Tested on 2 × RTX 5070 Ti (SM120) with Zen 2 CPUs only.
 - CPUs with AVX-512 should work: the experts run on the AVX2 kernels, which those CPUs
   also have.

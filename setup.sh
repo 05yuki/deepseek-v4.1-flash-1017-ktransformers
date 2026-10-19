@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
 # Build everything serve.sh needs, inside this directory:
-#   third_party/sglang         sgl-project/sglang dsv4.1 @ 1aa0e962 + patches/sglang-dsv41-tree.patch
-#   third_party/ktransformers  kvcache-ai/ktransformers @ 95009ea + patches/kt-kernel-tree.patch
-#                              (+ patches/kt-kernel-llama-cpp.patch in its llama.cpp submodule)
+#   third_party/sglang         sgl-project/sglang dsv4.1 @ 1aa0e962 + patches/sglang-tier*.patch
+#   third_party/ktransformers  kvcache-ai/ktransformers @ 95009ea (+ patches/kt-kernel-tree.patch
+#                              and patches/kt-kernel-llama-cpp.patch from tier 2)
 #   .venv                      Python 3.12, requirements.txt, kt-kernel built for this CPU and GPU
 #   engram-adapter/librow_store.so, build/libkv_vmm.so
 #   state/engram-<model>/engram-manifest.json   when MODEL=<checkpoint dir> is given
 #
-# usage: [MODEL=<checkpoint dir>] ./setup.sh
+# usage: [MODEL=<checkpoint dir>] [TIER=0|1|2|3] ./setup.sh
 #
+# TIER picks how much of this repository's SGLang changes go in, each tier on top of the ones
+# below it (docs/patches.md):
+#   0  run DeepSeek-V4.1-Flash-1017 correctly on the hybrid MoE, on any GPU; KTransformers as pinned
+#   1  + the indexer's memory on long prompts
+#   2  + speed and memory: streamed prefill, lends, hot experts, the CPU kernels
+#   3  + all-reduce through host memory, for two GPUs without peer access (default)
+# Changing TIER re-applies the patches and rebuilds kt-kernel.
 # Needs: git, a C/C++ compiler, the CUDA toolkit (CUDA_HOME, default /usr/local/cuda;
 # built and run here with 13.1), libnuma and hwloc headers (Debian/Ubuntu: libnuma-dev
 # libhwloc-dev), and either uv or python3.12. Re-running skips the finished steps.
@@ -22,9 +29,21 @@ cd "$here"
 SGLANG_COMMIT=1aa0e962b206102b7c439a4a0c4981cfec6e87bc
 SGLANG_TAG=dsv41-1aa0e962  # the same commit, tagged in 05yuki/sglang-upstream
 KT_COMMIT=95009ea6856c0799e517e93cb12be5e8494bc7ce
+TIER="${TIER:-3}"
+[[ "$TIER" =~ ^[0123]$ ]] || { echo "TIER must be 0, 1, 2 or 3" >&2; exit 2; }
+SGLANG_TIER_PATCHES=(sglang-tier0-run.patch sglang-tier1-long-prompts.patch sglang-tier2-speed.patch sglang-tier3-no-p2p.patch)
+kt_variant=pinned
+(( TIER >= 2 )) && kt_variant=patched
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 mkdir -p third_party build state
 step() { printf '\n== %s\n' "$*"; }
+# a step's marker file holds what it built (an empty one, from before tiers, is the full build)
+built_as() {
+  local marker="$1" want="$2" full="$3" got
+  [[ -f "$marker" ]] || return 1
+  got="$(cat "$marker")"
+  [[ "$got" == "$want" || ( -z "$got" && "$want" == "$full" ) ]]
+}
 # a patch is checked against the pinned tree first; nothing is applied when it does not fit
 apply_checked() {
   local tree="$1" patch="$2"
@@ -35,33 +54,38 @@ apply_checked() {
   git -C "$tree" apply --whitespace=nowarn "$patch"
 }
 
-step "SGLang @ ${SGLANG_COMMIT:0:8}"
+step "SGLang @ ${SGLANG_COMMIT:0:8}, tier $TIER"
 if [[ ! -d third_party/sglang/.git ]]; then
   git clone --filter=blob:none https://github.com/sgl-project/sglang.git third_party/sglang
 fi
-if [[ ! -f third_party/sglang/.dsv41-1017-patched ]]; then
+# (a tree from before the tiers lacks tier 0's chat encoding: applied again)
+if ! built_as third_party/sglang/.dsv41-1017-patched "$TIER" none; then
   # the dsv4.1 branch this commit came from is gone from sgl-project/sglang; the commit is
   # still fetchable there, and tagged in a fork as a fallback
   git -C third_party/sglang fetch --quiet origin "$SGLANG_COMMIT" 2>/dev/null \
     || git -C third_party/sglang fetch --quiet https://github.com/05yuki/sglang-upstream.git "refs/tags/$SGLANG_TAG"
   git -C third_party/sglang checkout --quiet --force "$SGLANG_COMMIT"
   git -C third_party/sglang clean -fdq
-  apply_checked third_party/sglang "$here/patches/sglang-dsv41-tree.patch"
-  touch third_party/sglang/.dsv41-1017-patched
+  for ((t = 0; t <= TIER; t++)); do
+    apply_checked third_party/sglang "$here/patches/${SGLANG_TIER_PATCHES[$t]}"
+  done
+  echo "$TIER" > third_party/sglang/.dsv41-1017-patched
 fi
 
-step "KTransformers @ ${KT_COMMIT:0:8}"
+step "KTransformers @ ${KT_COMMIT:0:8}, $kt_variant"
 if [[ ! -d third_party/ktransformers/.git ]]; then
   git clone --filter=blob:none https://github.com/kvcache-ai/ktransformers.git third_party/ktransformers
 fi
-if [[ ! -f third_party/ktransformers/.dsv41-1017-patched ]]; then
+if ! built_as third_party/ktransformers/.dsv41-1017-patched "$kt_variant" patched; then
   git -C third_party/ktransformers checkout --quiet --force "$KT_COMMIT"
   git -C third_party/ktransformers clean -fdq
   git -C third_party/ktransformers submodule update --init --force --quiet third_party/llama.cpp third_party/pybind11
   git -C third_party/ktransformers/third_party/llama.cpp clean -fdq
-  apply_checked third_party/ktransformers "$here/patches/kt-kernel-tree.patch"
-  apply_checked third_party/ktransformers/third_party/llama.cpp "$here/patches/kt-kernel-llama-cpp.patch"
-  touch third_party/ktransformers/.dsv41-1017-patched
+  if [[ "$kt_variant" == patched ]]; then
+    apply_checked third_party/ktransformers "$here/patches/kt-kernel-tree.patch"
+    apply_checked third_party/ktransformers/third_party/llama.cpp "$here/patches/kt-kernel-llama-cpp.patch"
+  fi
+  echo "$kt_variant" > third_party/ktransformers/.dsv41-1017-patched
 fi
 
 step "Python environment (.venv)"
@@ -97,7 +121,7 @@ fi
 
 step "kt-kernel (CPU experts)"
 site="$("$py" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-if [[ ! -f build/.kt-kernel-done ]]; then
+if ! built_as build/.kt-kernel-done "$kt_variant" patched; then
   if [[ -z "${KT_CUDA_ARCHS:-}" ]] && command -v nvidia-smi >/dev/null; then
     KT_CUDA_ARCHS="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d . | sort -u | paste -sd';')"
   fi
@@ -109,8 +133,8 @@ if [[ ! -f build/.kt-kernel-done ]]; then
   echo "CUDA archs $CPUINFER_CUDA_ARCHS, CPU target $CPUINFER_CPU_INSTRUCT"
   pip_install --no-deps --no-build-isolation third_party/ktransformers/kt-kernel
   # each expert layer is read into the page cache in parallel before kt-kernel copies it
-  "$py" patches/kt-kernel-load-prefetch.py "$site"
-  touch build/.kt-kernel-done
+  [[ "$kt_variant" == patched ]] && "$py" patches/kt-kernel-load-prefetch.py "$site"
+  echo "$kt_variant" > build/.kt-kernel-done
 fi
 
 step "engram row store (engram-adapter/librow_store.so)"
