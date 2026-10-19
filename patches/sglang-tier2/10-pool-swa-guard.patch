@@ -1,0 +1,28 @@
+diff --git a/python/sglang/srt/model_executor/pool_configurator.py b/python/sglang/srt/model_executor/pool_configurator.py
+index 95803724..c6684a37 100644
+--- a/python/sglang/srt/model_executor/pool_configurator.py
++++ b/python/sglang/srt/model_executor/pool_configurator.py
+@@ -1152,6 +1152,23 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
+                 f"request_cap+headroom={self.swa_cap_tokens}, "
+                 f"prefix_tails={self.swa_prefix_tails}"
+             )
++        # The SWA pool has to hold a whole prefill chunk, or the scheduler can
++        # never seat a request: it re-queues the one it cannot admit and spins
++        # on a single core with the GPU idle and no prefill ever logged, which
++        # looks like a hung model rather than a pool sized too small. V4 leaves
++        # sliding_window_size as None, so the generic hybrid guard that would
++        # have caught this never fires.
++        chunk = get_schedule().chunked_prefill_size
++        if chunk and chunk > 0 and swa_tokens < chunk + page_size:
++            raise ValueError(
++                f"DSV4 SWA pool ({swa_tokens} tokens) is smaller than one "
++                f"prefill chunk ({chunk}) plus a page ({page_size}), so no "
++                f"request can be admitted. The pool is full_tokens "
++                f"({full_token}) * swa_full_tokens_ratio ({self.swa_ratio}); "
++                f"raise --swa-full-tokens-ratio or --max-total-tokens, or "
++                f"lower --chunked-prefill-size."
++            )
++
+         return _DSV4PoolSizes(
+             full_max_total_num_tokens=full_token,
+             swa_max_total_num_tokens=swa_tokens,

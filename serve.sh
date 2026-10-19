@@ -39,6 +39,12 @@ alias_name="${SGLANG_SERVED_NAME:-$(basename "$model")}"
 # the tier setup.sh applied (an empty marker, from before tiers, is the full tree)
 tier="$(cut -d' ' -f1 "$here/third_party/sglang/.dsv41-1017-patched" 2>/dev/null || true)"
 tier="${tier:-3}"
+# the tier-2 features setup.sh applied (one per line; without the file, all of them)
+features_file="$here/third_party/sglang/.dsv41-1017-features"
+has() {
+  (( tier >= 2 )) || return 1
+  [[ ! -f "$features_file" ]] || grep -qx "$1" "$features_file"
+}
 if [[ ! -f "$engram_dir/engram-manifest.json" ]]; then
   "$python" "$here/tools/make-engram-manifest.py" "$model" "$engram_dir" >&2
 fi
@@ -100,7 +106,7 @@ export SGLANG_FP8_GEMV="${SGLANG_FP8_GEMV:-1}"
 # (0: at the layers)
 export SGLANG_DSV41_ENGRAM_PREFETCH_ROWS="${SGLANG_DSV41_ENGRAM_PREFETCH_ROWS:-1}"
 
-if (( tier >= 2 )); then
+if has hot-lend; then
   # hot experts: the resident ones, and with the hot lend 16 more a layer in the KV
   # pool's free pages outside prefill (KT_KV_HOT_LEND=0 turns it off)
   source "$here/lib/kt-kv-hot-default.sh"
@@ -108,13 +114,22 @@ if (( tier >= 2 )); then
   # in decode the hot lend's slots also take the driver's idle memory above a 1 GiB floor
   # (-1: only the KV pool's free pages)
   export KT_KV_HOT_SPARE_FLOOR_MB="${KT_KV_HOT_SPARE_FLOOR_MB:-1024}"
+else
+  export KT_KV_HOT_LEND=0
+  if has kv-lend-plan; then
+    # the KV pool on remappable memory, its free pages lent to the prefill, the chunk planned
+    export KT_KV_VMM="${KT_KV_VMM:-1}" KT_PREFILL_KV_LEND="${KT_PREFILL_KV_LEND:-1}"
+    export KT_PREFILL_PLAN="${KT_PREFILL_PLAN:-1}" KT_PREFILL_SWA_LEND="${KT_PREFILL_SWA_LEND:-1}"
+  fi
+fi
+if has placement; then
   placement="${KT_EXPERT_PLACEMENT:-${KT_KV_HOT_PLACEMENT:-$here/placements/dsv41-expert-placement-${gpu_experts}.json}}"
 else
-  # below tier 2 the wrapper keeps experts 0..N-1 on the GPU: no placement, no hot lend,
-  # no prefill lend (docs/patches.md)
+  # without the placement feature the wrapper keeps experts 0..N-1 on the GPU
   placement=none
-  export KT_PREFILL_LEND="${KT_PREFILL_LEND:-0}"
 fi
+# the prefill lend needs its feature (calibrated once per setup)
+has prefill-lend || export KT_PREFILL_LEND="${KT_PREFILL_LEND:-0}"
 if [[ "$placement" != "none" && -f "$placement" ]]; then
   extra_args+=(--init-expert-location "$placement")
 elif [[ "$placement" != "none" ]]; then
@@ -271,7 +286,8 @@ command=(
 printf '%s\n' "DeepSeek-V4.1-Flash on SGLang + KTransformers: $model"
 printf '%s\n' "GPUs ${CUDA_VISIBLE_DEVICES} (sm $cap), TP $tp on NUMA nodes $numa_list; CPU experts: $cpu_threads threads in $threadpools pools; GPU experts $gpu_experts a layer"
 printf '%s\n' "patch tier $tier; context $context_length; attention output FP8 before wo_a: block ${SGLANG_DSV4_O_FP8_QDQ_BLOCK:-0}"
-(( tier >= 2 )) && printf '%s\n' "wo_a native FP8: $SGLANG_DSV4_WO_A_FP8_NATIVE; vision tower on demand: $SGLANG_DSV4_VISION_ON_DEMAND; MXFP4 MoE fp32: $SGLANG_MXFP4_MOE_FP32; Marlin MoE fp32 glue: $SGLANG_MARLIN_MOE_FP32_GLUE; CPU scale codes: $KT_MXFP4_SCALE_CODES; hot lend spare floor: $KT_KV_HOT_SPARE_FLOOR_MB MiB"
+(( tier >= 2 )) && printf '%s\n' "tier-2 features: $( [[ -f "$features_file" ]] && tr '\n' ' ' < "$features_file" || echo all)"
+(( tier >= 2 )) && printf '%s\n' "wo_a native FP8: $SGLANG_DSV4_WO_A_FP8_NATIVE; vision tower on demand: $SGLANG_DSV4_VISION_ON_DEMAND; MXFP4 MoE fp32: $SGLANG_MXFP4_MOE_FP32; Marlin MoE fp32 glue: $SGLANG_MARLIN_MOE_FP32_GLUE; CPU scale codes: $KT_MXFP4_SCALE_CODES; hot lend spare floor: ${KT_KV_HOT_SPARE_FLOOR_MB:-off} MiB"
 printf '%s\n' "Run directory: $run_dir"
 ln -sfn "$run_dir" "$log_root/$log_name/current"
 if [[ "$mode" == "--background" ]]; then

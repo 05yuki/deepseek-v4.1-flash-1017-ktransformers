@@ -1,0 +1,335 @@
+diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+index 97982532..9f0cc8ee 100644
+--- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
++++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+@@ -38,6 +38,42 @@ except ImportError:
+     KTRANSFORMERS_AVAILABLE = False
+ 
+ 
++
++def _drop_checkpoint_cache(layer_idx: int, num_layers: int = 0) -> None:
++    """KT_GPU_STREAM_DROP_CACHE=<dir>: posix_fadvise(DONTNEED) every file
++    under it, so the arenas kt-kernel is about to create find free 2 MB
++    blocks (patches/sglang-kt-drop-cache-per-layer.py)."""
++    import os
++    import time
++
++    root_dir = os.environ.get("KT_GPU_STREAM_DROP_CACHE", "")
++    if not root_dir:
++        return
++    # the loader's prefetch evicts each finished layer itself; a whole-tree
++    # drop here would throw away the next layer's background read
++    # (the loader reads the last KT_LOAD_PREFETCH_TAIL layers after their
++    # arena exists; this drop runs again for them so the arena finds 2 MB
++    # blocks, as it did before the prefetch)
++    if layer_idx > 0 and int(os.environ.get("KT_LOAD_PREFETCH", "0") or 0) > 0:
++        tail = int(os.environ.get("KT_LOAD_PREFETCH_TAIL", "4"))
++        if not num_layers or layer_idx < num_layers - tail - 1:
++            return
++    t0, n = time.time(), 0
++    for root, _, files in os.walk(root_dir, followlinks=True):
++        for name in files:
++            try:
++                fd = os.open(os.path.join(root, name), os.O_RDONLY)
++            except OSError:
++                continue
++            try:
++                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
++                n += 1
++            finally:
++                os.close(fd)
++    if layer_idx == 0 or os.environ.get("KT_GPU_STREAM_TIMING") == "1":
++        print(f"[kt-stream] layer {layer_idx}: dropped the page cache of {n} files in "
++              f"{time.time() - t0:.1f} s", flush=True)
++
+ @dataclass
+ class KTConfig:
+     """Configuration for KTransformers heterogeneous computing CPU part.
+@@ -257,7 +293,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
+                 method=self.kt_config.method,
+                 max_deferred_experts_per_token=layer_max_deferred,
++                # patches/sglang-kt-swiglu-clamp.py (KT_SWIGLU_CLAMP)
+                 **_kt_swiglu_kwargs(layer),
++                # KT_NUMA_NODES="1" pins a single pool to node 1, the node
++                # that does not host the TP0 scheduler, for the prefill-decay
++                # isolation; unset keeps kt-kernel's sequential default.
++                numa_nodes=(
++                    [int(x) for x in os.environ["KT_NUMA_NODES"].split(",")]
++                    if os.environ.get("KT_NUMA_NODES")
++                    else None
++                ),
+             )
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+@@ -267,7 +312,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+             layer: The MoE layer module
+         """
+         # 1. Process GPU weights
+-        if hasattr(self.gpu_method, "process_weights_after_loading"):
++        # Empty resident weights need no GPU repacking; still load CPU experts below.
++        # (dsv41-flash-dual-epyc#2)
++        if self.num_gpu_experts > 0 and hasattr(
++            self.gpu_method, "process_weights_after_loading"
++        ):
+             self.gpu_method.process_weights_after_loading(layer)
+ 
+         # 2. Load CPU weights using KT wrapper
+@@ -284,6 +333,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+                 .physical_to_logical_map_cpu[self.kt_config.layer_idx]
+                 .contiguous()
+             )
++            _drop_checkpoint_cache(self.kt_config.layer_idx, getattr(self.kt_config, "num_layers", 0) or 0)
+             self.wrapper.load_weights(physical_to_logical_map_cpu)
+ 
+     def create_moe_runner(
+diff --git a/python/sglang/srt/model_loader/weight_utils.py b/python/sglang/srt/model_loader/weight_utils.py
+index fd659e7c..4e03dbe6 100644
+--- a/python/sglang/srt/model_loader/weight_utils.py
++++ b/python/sglang/srt/model_loader/weight_utils.py
+@@ -1079,6 +1079,69 @@ def _drop_file_cache_after_load(path: str) -> None:
+             os.close(fd)
+ 
+ 
++
++_KT_SKIP_CPU_EXPERTS = os.environ.get("KT_LOAD_SKIP_CPU_EXPERTS", "1") == "1"
++_KT_SKIP_CPU_EXPERTS_RE = re.compile(
++    os.environ.get("KT_LOAD_SKIP_CPU_EXPERTS_RE", r"(?:^|\.)layers\.(\d+)\..*\.experts\.(\d+)\.")
++)
++_kt_skip_state = {}
++
++
++def _kt_cpu_expert_key(name: str) -> bool:
++    """True for a checkpoint key the MoE weight_loader would drop unread: a routed
++    expert whose every physical slot is a KT CPU expert (same test as
++    fused_moe_triton/layer.py `_is_kt_cpu_expert`, asked before the read)."""
++    if not _KT_SKIP_CPU_EXPERTS:
++        return False
++    m = _KT_SKIP_CPU_EXPERTS_RE.search(name)
++    if m is None:
++        return False
++    st = _kt_skip_state
++    if "n" not in st:
++        try:
++            from sglang.srt.runtime_context import get_exec
++
++            moe = get_exec().moe
++            st["n"] = (
++                int(moe.kt_num_gpu_experts) if moe.kt_weight_path is not None else -1
++            )
++            # kt_kv_hot_lend: the experts the hot lend's shadows hold are read too
++            try:
++                from sglang.srt.layers.moe import kt_kv_hot_lend
++
++                st["n"] = kt_kv_hot_lend.load_count(st["n"])
++            except ImportError:
++                pass
++        except Exception:
++            st["n"] = -1
++        try:
++            from sglang.srt.eplb.expert_location import (
++                get_global_expert_location_metadata,
++            )
++
++            st["meta"] = get_global_expert_location_metadata()
++        except Exception:
++            st["meta"] = None
++        st["skipped"] = 0
++    n = st["n"]
++    if n < 0:
++        return False
++    layer, eid = int(m.group(1)), int(m.group(2))
++    meta = st["meta"]
++    if meta is not None:
++        try:
++            phys = meta.logical_to_all_physical(layer, eid)
++        except Exception:
++            phys = [eid]
++    else:
++        phys = [eid]
++    if any(p < n for p in phys):
++        return False
++    st["skipped"] += 1
++    if st["skipped"] % 50000 == 0:
++        print(f"[kt-load] {st['skipped']} CPU-expert tensors skipped unread (GPU experts per layer: {n})", flush=True)
++    return True
++
+ def safetensors_weights_iterator(
+     hf_weights_files: List[str],
+     disable_mmap: bool = False,
+@@ -1193,7 +1256,7 @@ def multi_thread_safetensors_weights_iterator(
+                 result = safetensors.torch.load(f.read())
+         else:
+             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+-                result = {k: f.get_tensor(k) for k in f.keys()}
++                result = {k: f.get_tensor(k) for k in f.keys() if not _kt_cpu_expert_key(k)}
+ 
+         return st_file, result
+ 
+@@ -1220,6 +1283,76 @@ def multi_thread_safetensors_weights_iterator(
+                 _drop_file_cache_after_load(st_file)
+ 
+ 
++_DENSE_PREFETCH_THREADS = int(os.environ.get("KT_LOAD_PREFETCH", "0") or 0)
++_DENSE_PREFETCH_PIECE = int(os.environ.get("KT_LOAD_PREFETCH_PIECE_MB", "16")) << 20
++_DENSE_PREFETCH_SKIP = re.compile(os.environ.get("KT_LOAD_PREFETCH_SKIP", r"\.experts\.|\.engram\.embed\."))
++
++
++def _prefetch_dense_tensors(st_file: str) -> None:
++    """KT_LOAD_PREFETCH=<threads>: pread this shard's tensors whose names do
++    not contain KT_LOAD_PREFETCH_SKIP (default `.mlp.experts.`) in 16 MiB
++    pieces on a thread pool, so the weight loaders' mmap faults find the
++    pages in the cache instead of reading one readahead window at a time."""
++    if _DENSE_PREFETCH_THREADS <= 0:
++        return
++    import time
++
++    t0 = time.time()
++    with open(st_file, "rb") as fh:
++        n = struct.unpack("<Q", fh.read(8))[0]
++        meta = json.loads(fh.read(n))
++    ranges = []
++    for k, v in meta.items():
++        if k == "__metadata__" or _DENSE_PREFETCH_SKIP.search(k):
++            continue
++        b, e = v["data_offsets"]
++        ranges.append((8 + n + b, e - b))
++    if not ranges:
++        return
++    ranges.sort()
++    merged = []
++    cur_off, cur_end = ranges[0][0], ranges[0][0] + ranges[0][1]
++    for off, sz in ranges[1:]:
++        if off <= cur_end + (1 << 20):
++            cur_end = max(cur_end, off + sz)
++        else:
++            merged.append((cur_off, cur_end))
++            cur_off, cur_end = off, off + sz
++    merged.append((cur_off, cur_end))
++    pieces = []
++    for a, b in merged:
++        p = a
++        while p < b:
++            pieces.append((p, min(_DENSE_PREFETCH_PIECE, b - p)))
++            p += _DENSE_PREFETCH_PIECE
++    local = threading.local()
++    fd = os.open(st_file, os.O_RDONLY)
++
++    def read(piece):
++        off, sz = piece
++        buf = getattr(local, "buf", None)
++        if buf is None or len(buf) < sz:
++            buf = local.buf = bytearray(max(sz, _DENSE_PREFETCH_PIECE))
++        mv = memoryview(buf)[:sz]
++        got = 0
++        while got < sz:
++            r = os.preadv(fd, [mv[got:]], off + got)
++            if r <= 0:
++                break
++            got += r
++        return got
++
++    try:
++        with concurrent.futures.ThreadPoolExecutor(_DENSE_PREFETCH_THREADS) as ex:
++            done = sum(ex.map(read, pieces))
++    finally:
++        os.close(fd)
++    logger.info(
++        "[dense prefetch] %s: %.2f GiB in %.2f s (%d tensors)",
++        os.path.basename(st_file), done / 2**30, time.time() - t0, len(ranges),
++    )
++
++
+ def buffered_multi_thread_safetensors_weights_iterator(
+     hf_weights_files: List[str],
+     max_workers: int,
+@@ -1247,8 +1380,9 @@ def buffered_multi_thread_safetensors_weights_iterator(
+             with open(st_file, "rb") as f:
+                 result = safetensors.torch.load(f.read())
+         else:
++            _prefetch_dense_tensors(st_file)
+             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+-                result = {k: f.get_tensor(k) for k in f.keys()}
++                result = {k: f.get_tensor(k) for k in f.keys() if not _kt_cpu_expert_key(k)}
+         return result
+ 
+     # Sliding window: max_workers loading + 1 prefetched.
+diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+index 692242ea..a546b3a9 100644
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -20,6 +20,7 @@ from typing import (
+     Union,
+ )
+ 
++import re
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+@@ -49,6 +50,45 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+ from sglang.srt.environ import envs
+ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
++
++
++_KT_EXPERT_NAME = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.")
++
++
++def _kt_cpu_only_experts(model) -> dict:
++    """{layer_id: frozenset(logical expert ids with no GPU slot)} for every
++    MoE layer whose quant method is the KT wrapper; {} when there is none or
++    KT_LOAD_SKIP_CPU_EXPERTS=0."""
++    import os
++
++    if os.environ.get("KT_LOAD_SKIP_CPU_EXPERTS", "1") != "1":
++        return {}
++    from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
++    from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
++    from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
++
++    meta = get_global_expert_location_metadata()
++    out = {}
++    for module in model.modules():
++        qm = getattr(module, "quant_method", None)
++        if not isinstance(module, FusedMoE) or not isinstance(qm, KTEPWrapperMethod):
++            continue
++        if qm.num_gpu_experts == -1 or getattr(module, "layer_id", None) is None:
++            continue
++        cpu_only = set()
++        for logical in range(meta.num_logical_experts):
++            on_gpu = False
++            for phys in meta.logical_to_all_physical(module.layer_id, logical):
++                local = module._map_global_expert_id_to_local_expert_id(phys)
++                # kt_kv_hot_lend: the shadow's experts load too
++                if 0 <= local < module.num_local_experts and local < getattr(
++                        qm, "load_gpu_experts", qm.num_gpu_experts):
++                    on_gpu = True
++                    break
++            if not on_gpu:
++                cpu_only.add(logical)
++        out[module.layer_id] = frozenset(cpu_only)
++    return out
+ from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
+ from sglang.srt.layers.attention.dsa.utils import (
+     can_dsa_cp_split,
+@@ -4833,6 +4873,8 @@ class DeepseekV4ForCausalLM(nn.Module):
+ 
+         cache_compressor_weight = {}
+         COMPRESSOR_PART = ".compressor.w"
++        kt_cpu_only = _kt_cpu_only_experts(self) if not is_nextn else {}
++        kt_skipped = 0
+ 
+         fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
+@@ -4892,6 +4934,11 @@ class DeepseekV4ForCausalLM(nn.Module):
+                         is_nextn=is_nextn,
+                         num_hidden_layers=self.config.num_hidden_layers,
+                     )
++                    if kt_cpu_only:
++                        m = _KT_EXPERT_NAME.match(name)
++                        if m and int(m.group(2)) in kt_cpu_only.get(int(m.group(1)), ()):
++                            kt_skipped += 1
++                            continue
+ 
+                     # V4.1 checkpoint tensors with no module in the text model yet;
+                     # the per-group count is logged after loading.

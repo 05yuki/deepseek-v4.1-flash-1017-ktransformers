@@ -1,0 +1,80 @@
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+index a1f0e7f0..bcd700b7 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+@@ -1073,6 +1073,13 @@ class FusedMoE(torch.nn.Module):
+         ):
+             if self.quant_method.num_gpu_experts != -1:
+                 if expert_id >= self.quant_method.num_gpu_experts:
++                    # kt_kv_hot_lend: experts N..N+X-1 load into the layer's shadow
++                    from sglang.srt.layers.moe import kt_kv_hot_lend
++
++                    hot = kt_kv_hot_lend.shadow_param(self.quant_method, self, param, expert_id)
++                    if hot is not None:
++                        self._weight_loader_impl(param=hot[0], loaded_weight=loaded_weight,
++                                                 weight_name=weight_name, shard_id=shard_id, expert_id=hot[1])
+                     return
+ 
+         self._weight_loader_impl(
+diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+index 5e5cdd9b..c56eee77 100644
+--- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
++++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+@@ -308,6 +308,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+             params_dtype=params_dtype,
+             **extra_weight_attrs,
+         )
++        # kt_kv_hot_lend: the next X experts' weights on a shadow layer, for the
++        # KV pool's free pages
++        from sglang.srt.layers.moe import kt_kv_hot_lend
++
++        kt_kv_hot_lend.make_shadow(self, layer, hidden_size, intermediate_size_per_partition,
++                                   params_dtype, extra_weight_attrs)
+ 
+         # 2. Initialize KT wrapper for CPU experts
+         # CPU experts: num_gpu_experts to num_experts-1
+@@ -373,6 +379,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+             )
+             _drop_checkpoint_cache(self.kt_config.layer_idx, getattr(self.kt_config, "num_layers", 0) or 0)
+             self.wrapper.load_weights(physical_to_logical_map_cpu)
++        # kt_kv_hot_lend: experts N..N+X-1 to pinned memory and the shadow slots
++        from sglang.srt.layers.moe import kt_kv_hot_lend
++
++        kt_kv_hot_lend.split(self, layer)
+         # Last layer loaded on this rank: optionally build the streamer and
+         # pin every layer's arenas now (KT_GPU_STREAM_EARLY_INIT).
+         num_layers = getattr(self.kt_config, "num_layers", None)
+@@ -520,10 +530,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+                 self.submit(layer, cpu_do)
+                 cpu_share = True
+ 
++        # kt_kv_hot_lend: routes to the experts lent the KV pool's free pages go to
++        # their slots, and to the CPU at weight 0
++        from sglang.srt.layers.moe import kt_kv_hot_lend
++
++        hot = kt_kv_hot_lend.route(self, dispatch_output) if streamer is None else None
+ 
+         # Step 1: Submit CPU expert computation (non-blocking)
+         if streamer is None and self.tp_rank == 0:
+-            self.submit(layer, dispatch_output)
++            self.submit(layer, hot[0] if hot is not None else dispatch_output)
+ 
+         # Step 2: Prepare GPU computation by masking CPU expert IDs
+         # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
+@@ -564,6 +579,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+                 hot_reference_check(self, layer, x, physical_ids, topk_output.topk_weights, output, streamer)
+         else:
+             output = torch.zeros_like(x)
++        if hot is not None:
++            output = output + kt_kv_hot_lend.apply(self, hot[1])
+ 
+         # Step 4: Synchronize CPU results and merge with GPU results
+         if streamer is not None:
+@@ -574,6 +591,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+             cpu_output = self.sync(x)
+             output = output + cpu_output
+ 
++        kt_kv_hot_lend.check(self, layer, dispatch_output, hot, output)
+         return StandardCombineInput(hidden_states=output)
+ 
+     def _logical_to_physical(self, device):

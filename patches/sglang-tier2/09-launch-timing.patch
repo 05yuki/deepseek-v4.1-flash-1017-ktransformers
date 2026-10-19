@@ -1,0 +1,419 @@
+diff --git a/python/sglang/srt/layers/moe/kt_launch_timing.py b/python/sglang/srt/layers/moe/kt_launch_timing.py
+new file mode 100644
+index 00000000..ca4bce4b
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/kt_launch_timing.py
+@@ -0,0 +1,397 @@
++"""KT_LAUNCH_TIMING=1: a per-step timeline of the weight load (launch-time
++instrument, no behaviour change). Installed from ModelRunner.load_model
++(patches/sglang-kt-launch-timing.py); wraps the load's functions in place and
++prints, per rank process:
++
++  [kt-launch HH:MM:SS.mmm r<rank>] <step> <seconds> s | disk <GB> (<GB/s>) | <extra>
++
++"disk" is this process's /proc/self/io read_bytes over the step (bytes the
++block layer fetched for it: read() and mmap page faults that missed the page
++cache). Steps that run many times (a tensor fetch, a layer's CPU experts) are
++summed per kind and printed in a table when the target's load ends.
++"""
++import functools
++import os
++import re
++import resource
++import threading
++import time
++from collections import defaultdict
++
++ENABLED = os.environ.get("KT_LAUNCH_TIMING") == "1"
++_installed = False
++_rank = None
++_lock = threading.Lock()
++_sums = defaultdict(lambda: [0, 0.0, 0, 0])  # kind -> [count, seconds, bytes copied, disk bytes]
++_t_install = None
++
++
++def _io():
++    try:
++        with open("/proc/self/io") as f:
++            d = dict(line.split(": ") for line in f.read().splitlines())
++        return int(d["read_bytes"]), int(d["rchar"])
++    except Exception:
++        return 0, 0
++
++
++def _faults():
++    r = resource.getrusage(resource.RUSAGE_SELF)
++    return r.ru_majflt, r.ru_minflt
++
++
++def _r():
++    global _rank
++    if _rank is None:
++        try:
++            from sglang.srt.distributed import get_tensor_model_parallel_rank
++
++            _rank = get_tensor_model_parallel_rank()
++        except Exception:
++            return "?"
++    return _rank
++
++
++def log(msg: str) -> None:
++    t = time.time()
++    print(f"[kt-launch {time.strftime('%H:%M:%S', time.localtime(t))}.{int(t * 1000) % 1000:03d} r{_r()}] {msg}", flush=True)
++
++
++class step:
++    """with step("name", nbytes=...): one timed step, printed at its end."""
++
++    def __init__(self, name, nbytes=0, quiet=False, kind=None):
++        self.name, self.nbytes, self.quiet, self.kind = name, nbytes, quiet, kind
++
++    def __enter__(self):
++        self.t0 = time.perf_counter()
++        self.io0 = _io()
++        self.f0 = _faults()
++        return self
++
++    def __exit__(self, *exc):
++        dt = time.perf_counter() - self.t0
++        io1 = _io()
++        f1 = _faults()
++        disk = io1[0] - self.io0[0]
++        if self.kind:
++            with _lock:
++                s = _sums[self.kind]
++                s[0] += 1
++                s[1] += dt
++                s[2] += self.nbytes
++                s[3] += disk
++        if not self.quiet:
++            extra = f" | copied {self.nbytes / 1e9:.2f} GB ({self.nbytes / 1e9 / max(dt, 1e-9):.2f} GB/s)" if self.nbytes else ""
++            log(f"{self.name} {dt:.2f} s | disk {disk / 1e9:.2f} GB ({disk / 1e9 / max(dt, 1e-9):.2f} GB/s)"
++                f" | majflt {f1[0] - self.f0[0]} minflt {f1[1] - self.f0[1]}{extra}")
++        return False
++
++
++def _wrap(obj, attr, name=None, kind=None, quiet=False, nbytes_of=None):
++    fn = getattr(obj, attr, None)
++    if fn is None or getattr(fn, "_kt_launch_wrapped", False):
++        return
++    label = name or f"{getattr(obj, '__name__', obj)}.{attr}"
++
++    @functools.wraps(fn)
++    def w(*a, **k):
++        st = step(label, kind=kind, quiet=quiet)
++        with st:
++            out = fn(*a, **k)
++            if nbytes_of is not None:
++                try:
++                    st.nbytes = nbytes_of(a, k, out)
++                except Exception:
++                    pass
++        return out
++
++    w._kt_launch_wrapped = True
++    if isinstance(obj, type) and isinstance(obj.__dict__.get(attr), staticmethod):
++        setattr(obj, attr, staticmethod(w))
++    else:
++        setattr(obj, attr, w)
++
++
++def _kind_gguf(name):
++    if "ngram_embedding" in name:
++        return "PLE table shard"
++    if name.endswith("qweight") or name.endswith("qweight_type"):
++        return "dense GGUF blocks"
++    return "dense bf16/f32"
++
++
++def _kind_safetensors(name):
++    """DeepSeek V4 / V4.1 checkpoint names (V4.1 launch, 10-12)."""
++    if ".experts." in name:
++        return "routed experts (KT: skipped or GPU slots)"
++    if ".engram." in name:
++        return "engram"
++    if ".wo_a." in name:
++        return "wo_a"
++    return "dense"
++
++
++def _wrap_iter(gen_fn_owner, attr, kind_of=_kind_gguf):
++    """A weight iterator: the time spent producing each item (the GGUF read and
++    dequant) and consuming it (the model's weight_loader: the GPU copy, the
++    PLE rows into pinned memory), per kind of tensor."""
++    fn = getattr(gen_fn_owner, attr)
++    if getattr(fn, "_kt_launch_wrapped", False):
++        return
++
++    @functools.wraps(fn)
++    def w(*a, **k):
++        t_all = time.perf_counter()
++        io_all = _io()
++        it = iter(fn(*a, **k))
++        n = 0
++        while True:
++            t0 = time.perf_counter()
++            io0 = _io()
++            try:
++                name, t = next(it)
++            except StopIteration:
++                break
++            t1 = time.perf_counter()
++            io1 = _io()
++            kd = kind_of(name)
++            nb = t.numel() * t.element_size() if hasattr(t, "numel") else 0
++            with _lock:
++                s = _sums["produce: " + kd]
++                s[0] += 1
++                s[1] += t1 - t0
++                s[2] += nb
++                s[3] += io1[0] - io0[0]
++            yield name, t
++            t2 = time.perf_counter()
++            io2 = _io()
++            with _lock:
++                s = _sums["consume: " + kd]
++                s[0] += 1
++                s[1] += t2 - t1
++                s[2] += nb
++                s[3] += io2[0] - io1[0]
++            n += 1
++        dt = time.perf_counter() - t_all
++        log(f"weight iterator {attr}: {n} tensors in {dt:.2f} s | disk {(_io()[0] - io_all[0]) / 1e9:.2f} GB")
++
++    w._kt_launch_wrapped = True
++    setattr(gen_fn_owner, attr, w)
++    return w
++
++
++def summary(title):
++    with _lock:
++        rows = sorted(_sums.items(), key=lambda kv: -kv[1][1])
++    log(f"--- {title}: summed steps (count, seconds, GB copied, GB from disk) ---")
++    for kind, (n, sec, nb, disk) in rows:
++        rate = f" {nb / 1e9 / sec:.2f} GB/s" if nb and sec > 0 else ""
++        log(f"  {kind:<48s} n={n:<6d} {sec:8.2f} s  {nb / 1e9:8.2f} GB{rate}  disk {disk / 1e9:.2f} GB")
++
++
++_stacks = defaultdict(int)
++_stack_samples = [0]
++_leaves = defaultdict(int)
++_stack_stop = threading.Event()
++
++
++def _stack_sampler(main_id, interval):
++    """KT_LAUNCH_TIMING_STACKS=<seconds>: samples the loading thread's stack;
++    the summary lists the frames by inclusive share of the samples."""
++    import sys
++
++    while not _stack_stop.wait(interval):
++        f = sys._current_frames().get(main_id)
++        leaf, g = [], f
++        while g is not None and len(leaf) < 5:
++            leaf.append(f"{'/'.join(g.f_code.co_filename.split('/')[-2:])}:{g.f_code.co_name}:{g.f_lineno}")
++            g = g.f_back
++        _leaves[" < ".join(leaf)] += 1
++        seen = set()
++        while f is not None:
++            c = f.f_code
++            fn = c.co_filename
++            short = "/".join(fn.split("/")[-2:])
++            key = f"{short}:{c.co_name}"
++            if key not in seen:
++                seen.add(key)
++                _stacks[key] += 1
++            f = f.f_back
++        _stack_samples[0] += 1
++
++
++def stack_summary(top=45):
++    n = _stack_samples[0]
++    if not n:
++        return
++    iv = float(os.environ.get("KT_LAUNCH_TIMING_STACKS", "0") or 0)
++    log(f"--- stack samples: {n} x {iv} s (inclusive) ---")
++    for k, c in sorted(_stacks.items(), key=lambda kv: -kv[1])[:top]:
++        log(f"  {c * iv:8.1f} s  {100.0 * c / n:5.1f}%  {k}")
++    log("--- innermost 5 frames (exclusive) ---")
++    for k, c in sorted(_leaves.items(), key=lambda kv: -kv[1])[:40]:
++        log(f"  {c * iv:8.1f} s  {k}")
++
++
++def install(runner=None) -> None:
++    global _installed, _t_install
++    if not ENABLED:
++        return
++    tag = "draft" if runner is not None and getattr(runner, "is_draft_worker", False) else "target"
++    log(f"load_model begin ({tag}) pid {os.getpid()}")
++    if _installed:
++        return
++    _installed = True
++    _t_install = time.perf_counter()
++    iv = float(os.environ.get("KT_LAUNCH_TIMING_STACKS", "0") or 0)
++    if iv > 0:
++        threading.Thread(target=_stack_sampler, args=(threading.get_ident(), iv), daemon=True,
++                         name="kt-launch-stacks").start()
++    try:
++        from kt_kernel.utils import loader as ktl
++
++        _wrap(ktl.GGUFLoader, "__init__", "GGUFLoader parse", kind="GGUFLoader parse (gguf-py)")
++
++        def _nb(a, k, out):
++            return out[0].numel()
++
++        # tensor fetch: mmap slice -> .copy() (page faults on the file, a fresh buffer)
++        _wrap(ktl.GGUFLoader, "get_undequanted_tensor_and_ggml_type", kind="GGUF tensor .copy() out of the mmap",
++              quiet=True, nbytes_of=_nb)
++    except Exception as e:
++        log(f"kt_kernel loader not wrapped: {e}")
++    try:
++        from kt_kernel.utils import llamafile as ktll
++
++        _wrap(ktll.LlamafileMoEWrapper, "__init__", kind="LlamafileMoEWrapper.__init__ (48 layers)", quiet=True)
++        _wrap(ktll.LlamafileMoEWrapper, "load_weights", kind="CPU experts load_weights (fetch + C++ load/repack)",
++              quiet=True)
++    except Exception as e:
++        log(f"llamafile wrapper not wrapped: {e}")
++    try:
++        from sglang.srt.layers.moe import kt_ep_wrapper as kew
++
++        _wrap(kew, "_drop_checkpoint_cache", kind="per-layer page-cache drop (KT_GPU_STREAM_DROP_CACHE)", quiet=True)
++        _wrap(kew.KTEPWrapperMethod, "process_weights_after_loading",
++              kind="KT MoE process_weights_after_loading (whole)", quiet=True)
++    except Exception as e:
++        log(f"kt_ep_wrapper not wrapped: {e}")
++    try:
++        from sglang.srt.layers.moe import kt_gguf_hot as kgh
++
++        for name, cls in vars(kgh).items():
++            if isinstance(cls, type) and "process_weights_after_loading" in cls.__dict__:
++                _wrap(cls, "process_weights_after_loading", kind=f"{name}.process_weights_after_loading (hot from GGUF)",
++                      quiet=True)
++    except Exception as e:
++        log(f"kt_gguf_hot not wrapped: {e}")
++    try:
++        from sglang.srt.layers.moe import kt_stream_prefill_gguf as ksg
++
++        _wrap(ksg.KTStreamPrefillGGUF, "__init__", "streamer __init__ (incl. GGUF geometry)")
++        _wrap(ksg.KTStreamPrefillGGUF, "build_all_banks", "streamer build_all_banks",
++              nbytes_of=lambda a, k, out: sum(sum(t.numel() for t in b) for b in a[0]._banks.values()))
++        _wrap(ksg.KTStreamPrefillGGUF, "_bank", kind="streamer _bank (per layer, threads overlap)", quiet=True)
++    except Exception as e:
++        log(f"stream gguf not wrapped: {e}")
++    try:
++        from sglang.srt.layers.moe import kt_hot_cache as khc
++
++        for attr in ("register", "seed", "_seed"):
++            if hasattr(khc, attr):
++                _wrap(khc, attr, kind=f"kt_hot_cache.{attr}", quiet=True)
++    except Exception as e:
++        log(f"kt_hot_cache not wrapped: {e}")
++    try:
++        from sglang.srt.layers.moe import kt_lend
++
++        _wrap(kt_lend, "bind_model", "kt_lend.bind_model")
++        _wrap(kt_lend, "_relayout", kind="kt_lend._relayout (per layer, pinned bounce)", quiet=True)
++        _wrap(kt_lend, "after_load", "kt_lend.after_load (relayout x48 + mirror)")
++    except Exception as e:
++        log(f"kt_lend not wrapped: {e}")
++    try:
++        from sglang.srt.layers.moe import kt_gguf_dense as kgd
++
++        _wrap_iter(kgd, "gguf_all_weights")
++        _wrap(kgd, "attach_hc_fp8", "attach_hc_fp8 (hc int8/fp8 copies)")
++        _wrap(kgd, "attach_ssm_out_perms", "attach_ssm_out_perms")
++    except Exception as e:
++        log(f"kt_gguf_dense not wrapped: {e}")
++    # Safetensors MXFP4 serves (V4.1 / V4-Flash / Vision-Exp / MiMo, 10-12):
++    # kt-kernel's native wrapper, the GPU-streamed prefill's arenas and the
++    # safetensors weight iterator.
++    try:
++        from kt_kernel.utils import amx as kta
++
++        _wrap(kta.NativeMoEWrapper, "__init__", kind="NativeMoEWrapper.__init__ (per layer)", quiet=True)
++        _wrap(kta.NativeMoEWrapper, "load_weights",
++              kind="CPU experts load_weights (Native: read + arena memcpy)", quiet=True)
++    except Exception as e:
++        log(f"kt_kernel native wrapper not wrapped: {e}")
++    try:
++        from sglang.srt.layers.moe import kt_stream_prefill as ksp
++
++        _wrap(ksp, "stream_prefill_init_early", "streamer early init (build + pin every arena)")
++        _wrap(ksp.KTStreamPrefill, "__init__", "streamer __init__ (slots + arena map)")
++        for attr in ("_register_arenas", "_map_expert_arenas", "_selftest_arenas"):
++            if hasattr(ksp.KTStreamPrefill, attr):
++                _wrap(ksp.KTStreamPrefill, attr, kind=f"streamer {attr}", quiet=True)
++    except Exception as e:
++        log(f"kt_stream_prefill not wrapped: {e}")
++    try:
++        from sglang.srt.model_loader import loader as sl0
++        from sglang.srt.model_loader import weight_utils as swu
++
++        w = _wrap_iter(swu, "safetensors_weights_iterator", kind_of=_kind_safetensors)
++        if w is not None and hasattr(sl0, "safetensors_weights_iterator"):
++            sl0.safetensors_weights_iterator = w
++    except Exception as e:
++        log(f"safetensors iterator not wrapped: {e}")
++    try:
++        from sglang.srt.models import deepseek_v4 as dv4
++
++        if hasattr(dv4, "_kt_cpu_only_experts"):
++            _wrap(dv4, "_kt_cpu_only_experts", "deepseek_v4 _kt_cpu_only_experts")
++    except Exception as e:
++        log(f"deepseek_v4 not wrapped: {e}")
++    try:
++        from sglang.srt.model_loader import loader as sl
++
++        _wrap(sl, "_initialize_model", "model build (_initialize_model, incl. KT wrappers)")
++        orig = sl.DefaultModelLoader.__dict__["load_weights_and_postprocess"]
++        fn = orig.__func__ if isinstance(orig, staticmethod) else orig
++        if not getattr(fn, "_kt_launch_wrapped", False):
++            src_ok = True
++
++            @functools.wraps(fn)
++            def lwp(model, weights, target_device):
++                # model.load_weights and the postprocess loop, timed apart through
++                # a wrapper on model.load_weights
++                ml = model.load_weights
++                st_lw = step("model.load_weights (weight iterator + weight_loaders)")
++
++                def timed_lw(*a, **k):
++                    with st_lw:
++                        return ml(*a, **k)
++
++                model.load_weights = timed_lw
++                try:
++                    with step("load_weights_and_postprocess (whole)"):
++                        return fn(model, weights, target_device)
++                finally:
++                    try:
++                        del model.load_weights
++                    except Exception:
++                        pass
++                    summary(f"after load_weights_and_postprocess ({type(model).__name__})")
++                    if _stack_samples[0] and not _stack_stop.is_set():
++                        _stack_stop.set()
++                        stack_summary()
++
++            lwp._kt_launch_wrapped = True
++            sl.DefaultModelLoader.load_weights_and_postprocess = staticmethod(lwp)
++    except Exception as e:
++        log(f"loader not wrapped: {e}")
++    log("installed")
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index cd539390..2d1e06ae 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -1144,6 +1144,11 @@ class ModelRunner:
+ 
+     def load_model(self):
+         tic_total = time.perf_counter()
++        if __import__("os").environ.get("KT_LAUNCH_TIMING") == "1":
++            # patches/sglang-kt-launch-timing.py
++            from sglang.srt.layers.moe import kt_launch_timing
++
++            kt_launch_timing.install(self)
+         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
+         logger.info(
+             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"

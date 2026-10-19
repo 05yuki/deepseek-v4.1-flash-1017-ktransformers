@@ -1,0 +1,555 @@
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py b/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
+index 7f76b261..66b99985 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
+@@ -103,6 +103,59 @@ def get_scalar_type(
+         return scalar_types.uint4b8 if num_bits == 4 else scalar_types.uint8b128
+ 
+ 
++# sglang-marlin-moe-fp32-glue.py
++_FP32_GLUE = __import__("os").environ.get("SGLANG_MARLIN_MOE_FP32_GLUE", "0") == "1"
++
++
++@triton.jit
++def _swiglu_fp32_kernel(in_ptr, out_ptr, d, limit, HAS_LIMIT: tl.constexpr, BLOCK: tl.constexpr):
++    row = tl.program_id(0).to(tl.int64)
++    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    m = cols < d
++    g = tl.load(in_ptr + row * 2 * d + cols, mask=m, other=0.0).to(tl.float32)
++    u = tl.load(in_ptr + row * 2 * d + d + cols, mask=m, other=0.0).to(tl.float32)
++    if HAS_LIMIT:
++        g = tl.minimum(g, limit)
++        u = tl.minimum(tl.maximum(u, -limit), limit)
++    h = g / (1.0 + tl.exp(-g)) * u
++    tl.store(out_ptr + row * d + cols, h.to(out_ptr.dtype.element_ty), mask=m)
++
++
++def _swiglu_fp32(output: torch.Tensor, input: torch.Tensor, limit) -> None:
++    """silu(gate) * up of [rows, 2d] bf16 (gate first) in fp32, one rounding into output."""
++    rows, d = input.shape[0], input.shape[1] // 2
++    if rows == 0:
++        return
++    assert input.is_contiguous() and output.is_contiguous()
++    lim = float(limit) if limit else 0.0
++    BLOCK = 1024
++    _swiglu_fp32_kernel[(rows, triton.cdiv(d, BLOCK))](input, output, d, lim, HAS_LIMIT=lim > 0, BLOCK=BLOCK)
++
++
++@triton.jit
++def _topk_wsum_fp32_kernel(y_ptr, w_ptr, out_ptr, K, scale, TOPK: tl.constexpr, BLOCK: tl.constexpr):
++    row = tl.program_id(0).to(tl.int64)
++    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    m = cols < K
++    acc = tl.zeros([BLOCK], dtype=tl.float32)
++    for t in tl.static_range(TOPK):
++        wt = tl.load(w_ptr + row * TOPK + t).to(tl.float32)
++        y = tl.load(y_ptr + (row * TOPK + t) * K + cols, mask=m, other=0.0).to(tl.float32)
++        acc += wt * y
++    tl.store(out_ptr + row * K + cols, (acc * scale).to(out_ptr.dtype.element_ty), mask=m)
++
++
++def _topk_wsum_fp32(y: torch.Tensor, weights: torch.Tensor, output: torch.Tensor, scale: float) -> None:
++    """output[m] = scale * sum_t weights[m, t] * y[m, t] in fp32, one rounding."""
++    M, topk, K = y.shape
++    if M == 0:
++        return
++    weights = weights.contiguous()
++    assert y.is_contiguous() and output.is_contiguous() and weights.shape == (M, topk)
++    BLOCK = 1024
++    _topk_wsum_fp32_kernel[(M, triton.cdiv(K, BLOCK))](y, weights, output, K, float(scale), TOPK=topk, BLOCK=BLOCK)
++
++
+ def swiglu_limit_func(
+     output: torch.Tensor,
+     input: torch.Tensor,  # first half is gate, second half is up
+@@ -340,6 +393,9 @@ def fused_marlin_moe(
+             gemm1_alpha,
+             clamp_limit,
+         )
++    elif activation == "silu" and is_gated and _FP32_GLUE:
++        # sglang-marlin-moe-fp32-glue.py: fp32 SwiGLU, one rounding
++        _swiglu_fp32(intermediate_cache2, intermediate_cache1.view(-1, gemm1_n), clamp_limit)
+     elif activation == "silu" and is_gated and clamp_limit is not None:
+         swiglu_limit_func(
+             intermediate_cache2,
+@@ -382,7 +438,8 @@ def fused_marlin_moe(
+         topk_weights,
+         moe_block_size=block_size_m,
+         top_k=1,
+-        mul_topk_weights=True,
++        # sglang-marlin-moe-fp32-glue.py: the weights go on in fp32 in the sum below
++        mul_topk_weights=not _FP32_GLUE,
+         is_ep=expert_map is not None,
+         b_q_type=scalar_type2,
+         size_m=M * topk,
+@@ -398,6 +455,13 @@ def fused_marlin_moe(
+     if output is None:
+         output = hidden_states if inplace else torch.empty_like(hidden_states)
+ 
++    if _FP32_GLUE:
++        # sglang-marlin-moe-fp32-glue.py: the routes' outputs times their weights, summed
++        # in fp32; the MXFP4 path's weights already carry routed scaling
++        scale = 1.0 if is_mxfp4_marlin or routed_scaling_factor is None else routed_scaling_factor
++        _topk_wsum_fp32(intermediate_cache3, topk_weights, output, scale)
++        return output
++
+     if is_mxfp4_marlin:
+         # Top-k weights (incl. routed scaling) are already applied above via
+         # mul_topk_weights, so this is a plain sum over the topk dim. The JIT
+diff --git a/python/sglang/srt/layers/moe/mxfp4_fp32_moe.py b/python/sglang/srt/layers/moe/mxfp4_fp32_moe.py
+new file mode 100644
+index 00000000..02a118ed
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/mxfp4_fp32_moe.py
+@@ -0,0 +1,385 @@
++"""MXFP4 MoE on the GPU with one rounding, in the checkpoint's layout
++(SGLANG_MXFP4_MOE_FP32=1, patches/sglang-mxfp4-fp32-moe.py installs this as
++sglang/srt/layers/moe/mxfp4_fp32_moe.py).
++
++Weights stay as loaded: w13 [E, 2I, H/2] and w2 [E, H, I/2] (two E2M1 values a byte, the
++low nibble first along K), scales [E, 2I, H/32] and [E, H, I/32] (E8M0). An E2M1 value
++times a power of two is exact in bf16 and the activations arrive in bf16, so the first
++GEMM's products are exact on the tensor cores and accumulate in fp32. Its output stays
++fp32, the clamped SwiGLU runs in fp32, and the second GEMM takes the fp32 activation as
++two bf16 halves (hi + lo, 16 bits of mantissa between them) into an fp32 accumulator.
++The routes' outputs stay fp32 until the weighted top-k sum, which rounds once into the
++bf16 output.
++
++mxfp4_fp32_moe(hidden_states, w13, w13_scale, w2, w2_scale, topk_weights, topk_ids,
++swiglu_limit) -> bf16 [M, H]. topk_ids index the layer's E experts; a route at weight 0
++adds 0 (KT_GPU_MASK_ZERO sends masked routes to expert 0 at weight 0).
++"""
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _e2m1(n):
++    """E2M1 code (int32, 0..15) to fp32, built from its bits: m = n & 7 is 0, 0.5, 1, 1.5,
++    2, 3, 4, 6, i.e. exponent e = m >> 1 (subnormal 0.5 * mant at e = 0) and one mantissa
++    bit."""
++    m = n & 7
++    e = m >> 1
++    mant = m & 1
++    bits = tl.where(e == 0, mant * (126 << 23), ((e + 126) << 23) | (mant << 22))
++    bits = bits | ((n & 8) << 28)
++    return bits.to(tl.float32, bitcast=True)
++
++
++@triton.jit
++def _e2m1_bf16(n):
++    """E2M1 code to bf16 (exact: the fp32 pattern's low 16 bits are zero)."""
++    m = n & 7
++    e = m >> 1
++    mant = m & 1
++    bits = tl.where(e == 0, mant * (126 << 7), ((e + 126) << 7) | (mant << 6)) | ((n & 8) << 12)
++    return bits.to(tl.int16).to(tl.bfloat16, bitcast=True)
++
++
++@triton.jit
++def _e2m1_pair(lut_ptr, packed):
++    """A byte of two E2M1 codes to their two fp32 values through a 256-entry table of bf16
++    pairs (low nibble in the low half): one gather instead of the bit construction."""
++    pairs = tl.load(lut_ptr + packed)
++    lo = (pairs << 16).to(tl.float32, bitcast=True)
++    hi = (pairs & -65536).to(tl.float32, bitcast=True)
++    return lo, hi
++
++
++_LUTS = {}
++
++
++def _e2m1_pair_lut(device):
++    t = _LUTS.get(device)
++    if t is None:
++        v = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], dtype=torch.bfloat16)
++        bits = v.view(torch.int16).to(torch.int32) & 0xFFFF
++        b = torch.arange(256)
++        t = (bits[b & 15] | (bits[b >> 4] << 16)).to(torch.int32).to(device)
++        _LUTS[device] = t
++    return t
++
++
++@triton.jit
++def _e8m0(s):
++    """E8M0 code (int32) to fp32: 2^(s - 127), exact (bit construction)."""
++    v = (s << 23).to(tl.float32, bitcast=True)
++    return tl.where(s == 0, 5.877471754111438e-39, v)
++
++
++@triton.jit
++def _mxfp4_moe_gemm_kernel(
++    a_ptr, b_ptr, bs_ptr, c_ptr,
++    sorted_ids_ptr, expert_ids_ptr, ntp_ptr,
++    rows_ptr, N, K, num_valid,
++    stride_am, stride_be, stride_bn, stride_se, stride_sn, stride_cm,
++    A_DIV: tl.constexpr, A_FP32: tl.constexpr, HAS_ROWS: tl.constexpr,
++    BM: tl.constexpr, BN: tl.constexpr, GROUPS: tl.constexpr,
++):
++    pid_m = tl.program_id(0)
++    pid_n = tl.program_id(1)
++    ntp = tl.load(ntp_ptr)
++    if pid_m * BM >= ntp:
++        return
++    ids = tl.load(sorted_ids_ptr + pid_m * BM + tl.arange(0, BM))
++    valid = ids < num_valid
++    e = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
++    if e < 0:
++        return
++    if HAS_ROWS:
++        rows = tl.load(rows_ptr + ids, mask=valid, other=0).to(tl.int64)
++    else:
++        rows = (ids // A_DIV).to(tl.int64)
++    offs_n = pid_n * BN + tl.arange(0, BN)
++    n_ok = offs_n < N
++    acc = tl.zeros((BM, BN), dtype=tl.float32)
++    b_base = b_ptr + e * stride_be + offs_n.to(tl.int64)[:, None] * stride_bn
++    s_base = bs_ptr + e * stride_se + offs_n.to(tl.int64) * stride_sn
++    for k0 in range(0, K, 32 * GROUPS):
++        for g in tl.static_range(GROUPS):
++            kk = k0 + g * 32
++            offs_k = kk + tl.arange(0, 32)
++            a = tl.load(a_ptr + rows[:, None] * stride_am + offs_k[None, :], mask=valid[:, None], other=0.0)
++            packed = tl.load(b_base + (kk // 2 + tl.arange(0, 16))[None, :], mask=n_ok[:, None], other=0)
++            packed = packed.to(tl.int32) & 0xFF
++            wb = tl.interleave(_e2m1_bf16(packed & 15), _e2m1_bf16(packed >> 4))  # [BN, 32], unscaled
++            sc = _e8m0(tl.load(s_base + kk // 32, mask=n_ok, other=127).to(tl.int32) & 0xFF)
++            if A_FP32:
++                a_hi = a.to(tl.bfloat16)
++                a_lo = (a - a_hi.to(tl.float32)).to(tl.bfloat16)
++                part = tl.dot(a_hi, tl.trans(wb)) + tl.dot(a_lo, tl.trans(wb))
++            else:
++                part = tl.dot(a.to(tl.bfloat16), tl.trans(wb))
++            acc += part * sc[None, :]
++    tl.store(c_ptr + ids.to(tl.int64)[:, None] * stride_cm + offs_n[None, :], acc,
++             mask=valid[:, None] & n_ok[None, :])
++
++
++@triton.jit
++def _mxfp4_moe_gemv_kernel(
++    a_ptr, b_ptr, bs_ptr, c_ptr, ids_ptr, w_ptr, lut_ptr,
++    N, K,
++    stride_am, stride_be, stride_bn, stride_se, stride_sn, stride_cm,
++    A_DIV: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
++):
++    """One route (row r of the flattened [M, topk]) times one block of N outputs, fp32
++    FMAs on the CUDA cores (decode sizes). A route at weight 0 writes zeros and reads no
++    weights (KT_GPU_MASK_ZERO's masked routes)."""
++    r = tl.program_id(0).to(tl.int64)
++    pid_n = tl.program_id(1)
++    offs_n = pid_n * BN + tl.arange(0, BN)
++    n_ok = offs_n < N
++    wt = tl.load(w_ptr + r)
++    acc = tl.zeros((BN,), dtype=tl.float32)
++    if wt != 0.0:
++        e = tl.load(ids_ptr + r).to(tl.int64)
++        a_row = a_ptr + (r // A_DIV) * stride_am
++        b_base = b_ptr + e * stride_be + offs_n.to(tl.int64)[:, None] * stride_bn
++        s_base = bs_ptr + e * stride_se + offs_n.to(tl.int64)[:, None] * stride_sn
++        acc2 = tl.zeros((BN, BK // 32), dtype=tl.float32)
++        for k0 in range(0, K, BK):
++            offs_k = k0 + tl.arange(0, BK)
++            a = tl.load(a_row + offs_k, mask=offs_k < K, other=0.0).to(tl.float32)
++            kb = (k0 // 2 + tl.arange(0, BK // 2))[None, :]
++            ks = (k0 // 32 + tl.arange(0, BK // 32))[None, :]
++            packed = tl.load(b_base + kb, mask=n_ok[:, None] & (kb < K // 2), other=0)
++            packed = packed.to(tl.int32) & 0xFF
++            lo, hi = _e2m1_pair(lut_ptr, packed)
++            w = tl.interleave(lo, hi)
++            sc = tl.load(s_base + ks, mask=n_ok[:, None] & (ks < K // 32), other=127)
++            sc = _e8m0(sc.to(tl.int32) & 0xFF)
++            acc2 += tl.sum(tl.reshape(w * a[None, :], (BN, BK // 32, 32)), axis=2) * sc
++        acc = tl.sum(acc2, axis=1)
++    tl.store(c_ptr + r * stride_cm + offs_n, acc, mask=n_ok)
++
++
++@triton.jit
++def _mxfp4_moe_gemv_gate_up_kernel(
++    a_ptr, b_ptr, bs_ptr, h_ptr, ids_ptr, w_ptr, lut_ptr,
++    I, K, limit,
++    stride_am, stride_be, stride_bn, stride_se, stride_sn, stride_hm,
++    A_DIV: tl.constexpr, HAS_LIMIT: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
++):
++    """The first GEMV for one route with the SwiGLU fused: BN gate rows and the same BN
++    up rows (I further down w13), both accumulated in fp32, then silu(gate) * up stored
++    in fp32. Weight-0 routes store zeros and read nothing."""
++    r = tl.program_id(0).to(tl.int64)
++    pid_n = tl.program_id(1)
++    offs_n = pid_n * BN + tl.arange(0, BN)
++    n_ok = offs_n < I
++    wt = tl.load(w_ptr + r)
++    hv = tl.zeros((BN,), dtype=tl.float32)
++    if wt != 0.0:
++        e = tl.load(ids_ptr + r).to(tl.int64)
++        a_row = a_ptr + (r // A_DIV) * stride_am
++        rows_g = offs_n.to(tl.int64)[:, None]
++        rows_u = rows_g + I
++        bg = b_ptr + e * stride_be + rows_g * stride_bn
++        bu = b_ptr + e * stride_be + rows_u * stride_bn
++        sg = bs_ptr + e * stride_se + rows_g * stride_sn
++        su = bs_ptr + e * stride_se + rows_u * stride_sn
++        acc_g = tl.zeros((BN, BK // 32), dtype=tl.float32)
++        acc_u = tl.zeros((BN, BK // 32), dtype=tl.float32)
++        for k0 in range(0, K, BK):
++            # K need not be a multiple of BK (a TP rank's intermediate: 1152 for V4.1 at TP2)
++            offs_k = k0 + tl.arange(0, BK)
++            a = tl.load(a_row + offs_k, mask=offs_k < K, other=0.0).to(tl.float32)[None, :]
++            kb = (k0 // 2 + tl.arange(0, BK // 2))[None, :]
++            ks = (k0 // 32 + tl.arange(0, BK // 32))[None, :]
++            mb = n_ok[:, None] & (kb < K // 2)
++            msk = n_ok[:, None] & (ks < K // 32)
++            pg = tl.load(bg + kb, mask=mb, other=0).to(tl.int32) & 0xFF
++            pu = tl.load(bu + kb, mask=mb, other=0).to(tl.int32) & 0xFF
++            cg = _e8m0(tl.load(sg + ks, mask=msk, other=127).to(tl.int32) & 0xFF)
++            cu = _e8m0(tl.load(su + ks, mask=msk, other=127).to(tl.int32) & 0xFF)
++            glo, ghi = _e2m1_pair(lut_ptr, pg)
++            ulo, uhi = _e2m1_pair(lut_ptr, pu)
++            pg_ = tl.reshape(tl.interleave(glo, ghi) * a, (BN, BK // 32, 32))
++            pu_ = tl.reshape(tl.interleave(ulo, uhi) * a, (BN, BK // 32, 32))
++            acc_g += tl.sum(pg_, axis=2) * cg
++            acc_u += tl.sum(pu_, axis=2) * cu
++        g = tl.sum(acc_g, axis=1)
++        u = tl.sum(acc_u, axis=1)
++        if HAS_LIMIT:
++            g = tl.minimum(g, limit)
++            u = tl.minimum(tl.maximum(u, -limit), limit)
++        hv = g / (1.0 + tl.exp(-g)) * u
++    tl.store(h_ptr + r * stride_hm + offs_n, hv, mask=n_ok)
++
++
++@triton.jit
++def _swiglu_f32_kernel(in_ptr, out_ptr, d, limit, HAS_LIMIT: tl.constexpr, BLOCK: tl.constexpr):
++    row = tl.program_id(0).to(tl.int64)
++    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    m = cols < d
++    g = tl.load(in_ptr + row * 2 * d + cols, mask=m, other=0.0)
++    u = tl.load(in_ptr + row * 2 * d + d + cols, mask=m, other=0.0)
++    if HAS_LIMIT:
++        g = tl.minimum(g, limit)
++        u = tl.minimum(tl.maximum(u, -limit), limit)
++    tl.store(out_ptr + row * d + cols, g / (1.0 + tl.exp(-g)) * u, mask=m)
++
++
++@triton.jit
++def _topk_wsum_inv_kernel(y_ptr, inv_ptr, w_ptr, out_ptr, K, TOPK: tl.constexpr, BLOCK: tl.constexpr):
++    """The weighted top-k sum over compacted route rows: inv[m * TOPK + t] is the row of
++    route (m, t) in y, or -1 (a weight-0 route, not computed). Fixed order: no atomics."""
++    row = tl.program_id(0).to(tl.int64)
++    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    m = cols < K
++    acc = tl.zeros([BLOCK], dtype=tl.float32)
++    for t in tl.static_range(TOPK):
++        j = tl.load(inv_ptr + row * TOPK + t).to(tl.int64)
++        if j >= 0:
++            wt = tl.load(w_ptr + row * TOPK + t).to(tl.float32)
++            acc += wt * tl.load(y_ptr + j * K + cols, mask=m, other=0.0)
++    tl.store(out_ptr + row * K + cols, acc.to(out_ptr.dtype.element_ty), mask=m)
++
++
++@triton.jit
++def _topk_wsum_kernel(y_ptr, w_ptr, out_ptr, K, TOPK: tl.constexpr, BLOCK: tl.constexpr):
++    row = tl.program_id(0).to(tl.int64)
++    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    m = cols < K
++    acc = tl.zeros([BLOCK], dtype=tl.float32)
++    for t in tl.static_range(TOPK):
++        wt = tl.load(w_ptr + row * TOPK + t).to(tl.float32)
++        acc += wt * tl.load(y_ptr + (row * TOPK + t) * K + cols, mask=m, other=0.0)
++    tl.store(out_ptr + row * K + cols, acc.to(out_ptr.dtype.element_ty), mask=m)
++
++
++# token counts up to this go through the per-route GEMV (decode)
++GEMV_MAX_TOKENS = 8
++# tensor-core tiles by size (swept on SM120 with a prefill chunk's route mix): small
++# batches of live routes, and the rest
++GEMM_SMALL = (64, 128, 4, 2)
++GEMM_LARGE = (128, 64, 4, 3)
++GEMV_BN, GEMV_BK, GEMV_WARPS, GEMV_STAGES = 8, 256, 4, 2  # BK divides both K (5120, 2304); swept on SM120
++
++
++def _gemm(a, b, bs, c, sorted_ids, expert_ids, ntp, n, k, num_valid, a_fp32, bm, rows=None):
++    bn, bk, warps, stages = GEMM_SMALL if bm == 16 else GEMM_LARGE
++    while k % bk:  # whole 32-value groups a step (a TP rank's intermediate: 1152 at TP2)
++        bk //= 2
++    grid = (triton.cdiv(sorted_ids.numel(), bm), triton.cdiv(n, bn))
++    _mxfp4_moe_gemm_kernel[grid](
++        a, b, bs, c, sorted_ids, expert_ids, ntp, rows if rows is not None else sorted_ids, n, k, num_valid,
++        a.stride(0), b.stride(0), b.stride(1), bs.stride(0), bs.stride(1), c.stride(0),
++        A_DIV=1, A_FP32=a_fp32, HAS_ROWS=rows is not None, BM=bm, BN=bn, GROUPS=bk // 32,
++        num_warps=warps, num_stages=stages)
++
++
++def mxfp4_fp32_moe(hidden_states, w13, w13_scale, w2, w2_scale, topk_weights, topk_ids, swiglu_limit=None,
++                   out=None):
++    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import moe_align_block_size
++
++    if _SYNC and not torch.cuda.is_current_stream_capturing():
++        torch.cuda.synchronize()
++        try:
++            return _mxfp4_fp32_moe(hidden_states, w13, w13_scale, w2, w2_scale, topk_weights, topk_ids,
++                                   swiglu_limit, out)
++        finally:
++            torch.cuda.synchronize()
++    return _mxfp4_fp32_moe(hidden_states, w13, w13_scale, w2, w2_scale, topk_weights, topk_ids, swiglu_limit, out)
++
++
++# SGLANG_MXFP4_MOE_FP32_SYNC=1 (a check, not for serving): the device synchronized before and
++# after each eager call, to tell a timing-dependent difference elsewhere from this path's own
++_SYNC = __import__("os").environ.get("SGLANG_MXFP4_MOE_FP32_SYNC", "0") == "1"
++
++
++def _mxfp4_fp32_moe(hidden_states, w13, w13_scale, w2, w2_scale, topk_weights, topk_ids, swiglu_limit, out):
++    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import moe_align_block_size
++
++    M, H = hidden_states.shape
++    topk = topk_ids.shape[1]
++    E, N2, Kp = w13.shape
++    I = N2 // 2
++    assert Kp * 2 == H and w2.shape[1] == H and w2.shape[2] * 2 == I and H % 32 == 0 and I % 32 == 0
++    w13 = w13.view(torch.uint8)
++    w2 = w2.view(torch.uint8)
++    s13 = w13_scale.view(torch.uint8)
++    s2 = w2_scale.view(torch.uint8)
++    hidden_states = hidden_states.contiguous()
++    num_valid = M * topk
++    dev = hidden_states.device
++    lim = float(swiglu_limit) if swiglu_limit else 0.0
++    # the compacted path syncs on the live-route count: a CUDA graph capture (decode at a
++    # larger batch) takes the per-route GEMV instead
++    if M <= GEMV_MAX_TOKENS or torch.cuda.is_current_stream_capturing():
++        h = torch.empty((num_valid, I), dtype=torch.float32, device=dev)
++        y = torch.empty((num_valid, H), dtype=torch.float32, device=dev)
++        ids = topk_ids.reshape(-1).contiguous()
++        wts = topk_weights.reshape(-1).contiguous()
++        bn, bk = GEMV_BN, GEMV_BK
++        lut = _e2m1_pair_lut(dev)
++        _mxfp4_moe_gemv_gate_up_kernel[(num_valid, triton.cdiv(I, bn))](
++            hidden_states, w13, s13, h, ids, wts, lut, I, H, lim,
++            hidden_states.stride(0), w13.stride(0), w13.stride(1), s13.stride(0), s13.stride(1), h.stride(0),
++            A_DIV=topk, HAS_LIMIT=lim > 0, BN=bn, BK=bk, num_warps=GEMV_WARPS)
++        _mxfp4_moe_gemv_kernel[(num_valid, triton.cdiv(H, bn))](
++            h, w2, s2, y, ids, wts, lut, H, I,
++            h.stride(0), w2.stride(0), w2.stride(1), s2.stride(0), s2.stride(1), y.stride(0),
++            A_DIV=1, BN=bn, BK=bk, num_warps=GEMV_WARPS)
++    else:
++        # only the routes with a weight (KT_GPU_MASK_ZERO sends a prefill chunk's CPU
++        # routes, most of them, to expert 0 at weight 0): compacted, one route a row
++        flat_w = topk_weights.reshape(-1)
++        pos = ((flat_w != 0) & (topk_ids.reshape(-1) >= 0)).nonzero().squeeze(1)
++        R = pos.numel()
++        if out is None:
++            out = torch.empty((M, H), dtype=hidden_states.dtype, device=dev)
++        if R == 0:
++            return out.zero_()
++        inv = torch.full((num_valid,), -1, dtype=torch.int32, device=dev)
++        inv[pos] = torch.arange(R, dtype=torch.int32, device=dev)
++        tok = (pos // topk).to(torch.int32)
++        bm = 16 if R <= 256 else 64
++        sorted_ids, expert_ids, ntp = moe_align_block_size(topk_ids.reshape(-1)[pos].view(R, 1), bm, E)
++        c1 = torch.empty((R, N2), dtype=torch.float32, device=dev)
++        _gemm(hidden_states, w13, s13, c1, sorted_ids, expert_ids, ntp, N2, H, R, False, bm, rows=tok)
++        h = torch.empty((R, I), dtype=torch.float32, device=dev)
++        _swiglu_f32_kernel[(R, triton.cdiv(I, 1024))](c1, h, I, lim, HAS_LIMIT=lim > 0, BLOCK=1024)
++        del c1
++        y = torch.empty((R, H), dtype=torch.float32, device=dev)
++        _gemm(h, w2, s2, y, sorted_ids, expert_ids, ntp, H, I, R, True, bm)
++        _topk_wsum_inv_kernel[(M, triton.cdiv(H, 1024))](y, inv, flat_w.contiguous(), out, H, TOPK=topk, BLOCK=1024)
++        return out
++    if out is None:
++        out = torch.empty((M, H), dtype=hidden_states.dtype, device=dev)
++    _topk_wsum_kernel[(M, triton.cdiv(H, 1024))](y, topk_weights.contiguous(), out, H, TOPK=topk, BLOCK=1024)
++    return out
++
++
++def mxfp4_moe_reference(hidden_states, w13, w13_scale, w2, w2_scale, topk_weights, topk_ids, swiglu_limit=None):
++    """fp64 reference of the same arithmetic (for tests)."""
++    e2m1 = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
++                        dtype=torch.float64, device=hidden_states.device)
++
++    def deq(q, s):
++        q = q.view(torch.uint8).long()
++        w = torch.stack((e2m1[q & 15], e2m1[q >> 4]), dim=-1).reshape(q.shape[0], -1)
++        return w * torch.exp2(s.view(torch.uint8).double() - 127).repeat_interleave(32, dim=1)
++
++    x = hidden_states.double()
++    out = torch.zeros_like(x)
++    lim = float(swiglu_limit) if swiglu_limit else 0.0
++    for e in topk_ids.unique().tolist():
++        w13e, w2e = deq(w13[e], w13_scale[e]), deq(w2[e], w2_scale[e])
++        tok, slot = ((topk_ids == e) & (topk_weights != 0)).nonzero(as_tuple=True)
++        if tok.numel() == 0:
++            continue
++        gu = x[tok] @ w13e.T
++        g, u = gu.chunk(2, dim=-1)
++        if lim:
++            g, u = g.clamp(max=lim), u.clamp(-lim, lim)
++        y = (torch.nn.functional.silu(g) * u) @ w2e.T
++        out.index_add_(0, tok, y * topk_weights[tok, slot].double()[:, None])
++    return out
+diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
+index 1bdf2ca0..e9fa7b02 100644
+--- a/python/sglang/srt/layers/quantization/fp8.py
++++ b/python/sglang/srt/layers/quantization/fp8.py
+@@ -5,6 +5,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import os
+ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+ 
+ import torch
+@@ -406,9 +407,13 @@ class Fp8Config(QuantizationConfig):
+ 
+             if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
+                 from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
++                    Mxfp4Fp32MoEMethod,
+                     Mxfp4MarlinMoEMethod,
+                 )
+ 
++                # sglang-mxfp4-fp32-moe.py: the checkpoint's layout, one rounding
++                if os.environ.get("SGLANG_MXFP4_MOE_FP32") == "1":
++                    return Mxfp4Fp32MoEMethod(fp8_method, prefix=prefix)
+                 return Mxfp4MarlinMoEMethod(fp8_method, prefix=prefix)
+ 
+             if self.is_fp4_experts and get_moe_runner_backend().is_humming():
+diff --git a/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py b/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
+index 52503455..9b8feda6 100644
+--- a/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
++++ b/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
+@@ -196,3 +196,35 @@ class Mxfp4MarlinMoEMethod:
+         )
+ 
+         return StandardCombineInput(hidden_states=runner_output.hidden_states)
++
++
++class Mxfp4Fp32MoEMethod(Mxfp4MarlinMoEMethod):
++    """MXFP4 MoE in the checkpoint's layout through Triton kernels with one rounding
++    (sglang-mxfp4-fp32-moe.py). The Marlin runner is still created for its config (the
++    SwiGLU clamp the streamed prefill and the kernels read); its kernel is not used."""
++
++    def process_weights_after_loading(self, layer: Module) -> None:
++        self._fp8.process_weights_after_loading(layer)
++        if getattr(layer, "_mega_moe_weights_built", False):
++            return
++        if self.runner.config.gemm1_alpha is not None:
++            raise RuntimeError("SGLANG_MXFP4_MOE_FP32: gemm1_alpha (GPT-OSS SwiGLU) is not supported")
++        layer._dsv4_mxfp4_backend = "mxfp4_fp32"
++
++    def apply(self, layer: Module, dispatch_output: DispatchOutput) -> CombineInput:
++        from sglang.srt.layers.moe.mxfp4_fp32_moe import mxfp4_fp32_moe
++        from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
++
++        topk_output = dispatch_output.topk_output
++        cfg = self.runner.config
++        out = mxfp4_fp32_moe(
++            dispatch_output.hidden_states,
++            layer.w13_weight,
++            layer.w13_weight_scale_inv,
++            layer.w2_weight,
++            layer.w2_weight_scale_inv,
++            topk_output.topk_weights,
++            topk_output.topk_ids,
++            swiglu_limit=cfg.swiglu_limit,
++        )
++        return StandardCombineInput(hidden_states=out)

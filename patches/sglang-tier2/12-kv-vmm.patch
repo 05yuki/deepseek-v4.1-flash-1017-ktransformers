@@ -1,0 +1,260 @@
+diff --git a/python/sglang/srt/layers/moe/kt_kv_vmm.py b/python/sglang/srt/layers/moe/kt_kv_vmm.py
+new file mode 100644
+index 00000000..cf208235
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/kt_kv_vmm.py
+@@ -0,0 +1,235 @@
++"""The KV pool on remappable memory (KT_KV_VMM=1; libkv_vmm.so, kv_vmm.c).
++
++Every tensor made inside region() is one virtual range backed by physical
++chunks that can be unmapped (release) and mapped again, zeroed (restore),
++while the range, the tensors on it and the CUDA graphs that read it stay put.
++sglang makes the KV pool inside memory_saver_adapter.region("kv_cache")
++(sglang-kt-kv-vmm.py routes that region here), so the free pages of the pool
++can lend their physical memory to a streamed prefill and take it back before
++decode (kt_lend's prefill window, M2).
++
++KT_KV_VMM_LIB overrides the library path (default: libkv_vmm.so next to this
++module, else $HOME/KTransformers/runtime/kv-vmm/libkv_vmm.so).
++"""
++import contextlib
++import ctypes
++import os
++from typing import Optional
++
++import torch
++
++def _torch_ok() -> bool:
++    """torch 2.13 runs the KV pool on this allocator through a MemPool; torch 2.9.1
++    (GLM-5.3's venv) segfaults at the first allocation in the pluggable-allocator
++    MemPool, CUDA initialised or not (10-15), so older torch takes the direct
++    path: region() makes the tensors itself (KT_KV_VMM_DIRECT=1 forces it)."""
++    try:
++        major, minor = (int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
++    except ValueError:
++        return False
++    return (major, minor) >= (2, 13)
++
++
++ENABLED = os.environ.get("KT_KV_VMM", "0") == "1"
++DIRECT = os.environ.get("KT_KV_VMM_DIRECT", "0" if _torch_ok() else "1") == "1"
++
++
++def _lib_path() -> str:
++    """KT_KV_VMM_LIB, else libkv_vmm.so next to this module (the patcher copies it
++    there when it is built beside it), else ~/KTransformers/runtime/kv-vmm/."""
++    env = os.environ.get("KT_KV_VMM_LIB")
++    if env:
++        return env
++    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libkv_vmm.so")
++    if os.path.exists(here):
++        return here
++    return os.path.join(os.path.expanduser("~"), "KTransformers/runtime/kv-vmm/libkv_vmm.so")
++
++
++_LIB_PATH = _lib_path()
++
++_lib = None
++_pool = None
++
++
++def _load():
++    global _lib, _pool
++    if _lib is not None:
++        return _lib
++    # 8 MiB chunks: a quarter of the map / unmap calls of the library's 2 MiB
++    # (a window's loan took ~0.2 s each way at 2 MiB, 10-15)
++    os.environ.setdefault("KV_VMM_CHUNK_MB", "8")
++    _lib = ctypes.CDLL(_LIB_PATH)
++    _lib.kv_vmm_release.restype = ctypes.c_longlong
++    _lib.kv_vmm_release.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t]
++    _lib.kv_vmm_restore.restype = ctypes.c_longlong
++    _lib.kv_vmm_restore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t]
++    _lib.kv_vmm_released_bytes.restype = ctypes.c_size_t
++    _lib.kv_vmm_released_bytes.argtypes = [ctypes.c_int]
++    _lib.kv_vmm_chunk_at.restype = ctypes.c_size_t
++    _lib.kv_vmm_chunk_at.argtypes = [ctypes.c_void_p]
++    _lib.kv_vmm_chunk_bytes.restype = ctypes.c_size_t
++    _lib.kv_vmm_chunk_bytes.argtypes = [ctypes.c_int]
++    _lib.kv_vmm_malloc.restype = ctypes.c_void_p
++    _lib.kv_vmm_malloc.argtypes = [ctypes.c_ssize_t, ctypes.c_int, ctypes.c_void_p]
++    _lib.kv_vmm_malloc_lazy.restype = ctypes.c_void_p
++    _lib.kv_vmm_malloc_lazy.argtypes = [ctypes.c_ssize_t, ctypes.c_int]
++    if hasattr(_lib, "kv_vmm_malloc_shadow"):
++        _lib.kv_vmm_malloc_shadow.restype = ctypes.c_void_p
++        _lib.kv_vmm_malloc_shadow.argtypes = [ctypes.c_ssize_t, ctypes.c_int]
++    _lib.kv_vmm_free.restype = None
++    _lib.kv_vmm_free.argtypes = [ctypes.c_void_p, ctypes.c_ssize_t, ctypes.c_int, ctypes.c_void_p]
++    if not DIRECT:
++        alloc = torch.cuda.memory.CUDAPluggableAllocator(_LIB_PATH, "kv_vmm_malloc", "kv_vmm_free")
++        _pool = torch.cuda.MemPool(alloc.allocator())
++    return _lib
++
++
++class _Block:
++    """One kv_vmm allocation, owned by the tensor made over it (torch keeps the
++    object of a __cuda_array_interface__ alive as long as the tensor)."""
++
++    def __init__(self, nbytes: int, device: int, lazy: bool = False, shadow: bool = False):
++        self.nbytes, self.device = nbytes, device
++        if shadow:
++            self.ptr = _lib.kv_vmm_malloc_shadow(nbytes, device)
++        else:
++            self.ptr = _lib.kv_vmm_malloc_lazy(nbytes, device) if lazy else _lib.kv_vmm_malloc(nbytes, device, None)
++        if not self.ptr:
++            raise torch.OutOfMemoryError(f"kv_vmm: {nbytes} bytes on cuda:{device}")
++        self.__cuda_array_interface__ = {"shape": (nbytes,), "typestr": "|u1", "data": (self.ptr, False),
++                                         "strides": None, "version": 3, "stream": None}
++
++    def __del__(self):
++        if getattr(self, "ptr", None) and _lib is not None:
++            _lib.kv_vmm_free(self.ptr, self.nbytes, self.device, None)
++            self.ptr = None
++
++
++# LAZY(shape, nbytes) -> bytes to map from the start, or None: a tensor made in
++# region() that it claims is a range with only those bytes and its last chunk
++# mapped (zeroed); the rest is mapped by restore when used (kt_kv_prefill_lend's
++# SWA pool widened for the prefill plan). LAZY_MADE lists them.
++LAZY = None
++LAZY_MADE = []
++
++
++def _lazy_tensor(shape, dtype, index: int, lead: int) -> torch.Tensor:
++    n = 1
++    for d in shape:
++        n *= int(d)
++    size_b = n * dtype.itemsize
++    with torch.cuda.device(index):
++        t = torch.as_tensor(_Block(max(1, size_b), index, lazy=True), device=f"cuda:{index}")
++    c = int(_lib.kv_vmm_chunk_at(ctypes.c_void_p(t.data_ptr())))
++    lead = min(size_b, -(-max(0, lead) // c) * c)
++    ok = lead <= 0 or restore(t, 0, lead) >= 0
++    # the last chunks too: a pool may write its last row at setup (DeepSeek V4's
++    # compress-state sentinel)
++    tail = max(0, size_b - c) // c * c
++    ok = ok and restore(t, tail, 2 * c) >= 0
++    if not ok:
++        raise torch.OutOfMemoryError(f"kv_vmm: mapping the used part of a {size_b}-byte pool on cuda:{index}")
++    torch.cuda.synchronize(index)
++    t = t[:size_b].view(dtype).view(shape)
++    LAZY_MADE.append(t)
++    return t
++
++
++def _direct(orig, zero: bool):
++    """torch.zeros / torch.empty for CUDA tensors in region(): a tensor LAZY claims
++    is made lazily; on old torch every other one is its own kv_vmm allocation
++    (DIRECT), else it goes to the original (inside the MemPool); anything
++    unusual goes to the original."""
++
++    def make(*size, dtype=None, device=None, **kw):
++        dev = torch.device(device) if device is not None else None
++        if (dev is None or dev.type != "cuda" or kw.get("out") is not None or kw.get("pin_memory")
++                or kw.get("layout", torch.strided) != torch.strided
++                or kw.get("memory_format", torch.contiguous_format) != torch.contiguous_format
++                or ("size" in kw) == bool(size)):
++            return orig(*size, dtype=dtype, device=device, **kw)
++        if "size" in kw:  # torch.zeros(size=(...)) as well as torch.zeros(a, b) and torch.zeros((a, b))
++            size = (kw.pop("size"),)
++        kw.pop("memory_format", None)
++        shape = tuple(size[0]) if len(size) == 1 and isinstance(size[0], (tuple, list, torch.Size)) else size
++        shape = tuple(int(d) for d in shape)
++        dtype = dtype or torch.get_default_dtype()
++        index = dev.index if dev.index is not None else torch.cuda.current_device()
++        n = 1
++        for d in shape:
++            n *= int(d)
++        size_b = n * dtype.itemsize
++        lead = LAZY(shape, size_b) if LAZY is not None and not kw.get("requires_grad") else None
++        if lead is not None:
++            return _lazy_tensor(shape, dtype, index, lead)
++        if not DIRECT:
++            return orig(*size, dtype=dtype, device=device, **kw)
++        with torch.cuda.device(index):
++            t = torch.as_tensor(_Block(max(1, size_b), index), device=f"cuda:{index}")
++        t = t[:size_b].view(dtype).view(shape)
++        if kw.get("requires_grad"):
++            t.requires_grad_(True)
++        return t.zero_() if zero else t
++
++    return make
++
++
++@contextlib.contextmanager
++def region():
++    """Tensors made inside sit on remappable memory."""
++    if not ENABLED:
++        yield
++        return
++    _load()
++    zeros, empty = torch.zeros, torch.empty
++    torch.zeros, torch.empty = _direct(zeros, True), _direct(empty, False)
++    try:
++        if DIRECT:
++            yield
++        else:
++            with torch.cuda.use_mem_pool(_pool):
++                yield
++    finally:
++        torch.zeros, torch.empty = zeros, empty
++
++def shadow_tensor(shape, dtype, device: int) -> torch.Tensor:
++    """A tensor on a shadow range (kv_vmm_malloc_shadow): every byte reads as zero
++    until restore maps real chunks under it, and again after release. Its
++    chunk is the device granularity (2 MiB)."""
++    lib = _load()
++    if not hasattr(lib, "kv_vmm_malloc_shadow"):
++        raise RuntimeError(f"{_LIB_PATH} has no kv_vmm_malloc_shadow: rebuild it from kv_vmm.c")
++    n = 1
++    for d in shape:
++        n *= int(d)
++    size_b = n * dtype.itemsize
++    with torch.cuda.device(device):
++        t = torch.as_tensor(_Block(max(1, size_b), device, shadow=True), device=f"cuda:{device}")
++    return t[:size_b].view(dtype).view(tuple(int(d) for d in shape))
++
++
++def chunk_bytes(device: int) -> int:
++    return int(_load().kv_vmm_chunk_bytes(device))
++
++
++def chunk_of(t: torch.Tensor) -> int:
++    """The chunk size of the kv_vmm allocation holding t (0: t is not on kv_vmm memory).
++    Large allocations (the K/V buffers, KV_VMM_BIG_MB and up) use KV_VMM_CHUNK_MB,
++    smaller ones the device granularity."""
++    return int(_load().kv_vmm_chunk_at(ctypes.c_void_p(t.data_ptr())))
++
++
++def released_bytes(device: int) -> int:
++    return int(_load().kv_vmm_released_bytes(device)) if _lib is not None else 0
++
++
++def release(t: torch.Tensor, off: int, length: int) -> int:
++    """Unmap the chunks wholly inside t's bytes [off, off + length). The caller has
++    synchronised the device: nothing may be reading them."""
++    return int(_load().kv_vmm_release(ctypes.c_void_p(t.data_ptr()), off, length))
++
++
++def restore(t: torch.Tensor, off: int, length: int) -> int:
++    """Map zeroed chunks wherever t's bytes [off, off + length) have none. -1: no memory."""
++    return int(_load().kv_vmm_restore(ctypes.c_void_p(t.data_ptr()), off, length))
+diff --git a/python/sglang/srt/utils/torch_memory_saver_adapter.py b/python/sglang/srt/utils/torch_memory_saver_adapter.py
+index ad98e592..b0a547ab 100644
+--- a/python/sglang/srt/utils/torch_memory_saver_adapter.py
++++ b/python/sglang/srt/utils/torch_memory_saver_adapter.py
+@@ -91,6 +91,14 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
+ 
+     @contextmanager
+     def region(self, tag: str, enable_cpu_backup: bool = False):
++        # KT_KV_VMM=1 (sglang-kt-kv-vmm.py): the KV pool on remappable memory
++        if tag == "kv_cache":
++            from sglang.srt.layers.moe import kt_kv_vmm
++
++            if kt_kv_vmm.ENABLED:
++                with kt_kv_vmm.region():
++                    yield
++                return
+         yield
+ 
+     @contextmanager

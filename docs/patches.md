@@ -6,7 +6,7 @@
 |---|---|---|
 | 0 | `patches/sglang-tier0-run.patch` | sgl-project/sglang `1aa0e962` (formerly the `dsv4.1` branch) |
 | 1 | `patches/sglang-tier1-long-prompts.patch` | the same, after tier 0 |
-| 2 | `patches/sglang-tier2-speed.patch` | the same, after tier 1 |
+| 2 | `patches/sglang-tier2/NN-*.patch` | the same, after tier 1: one patch per feature ([tier2.md](tier2.md)) |
 | 3 | `patches/sglang-tier3-no-p2p.patch` | the same, after tier 2 |
 | 2 | `patches/kt-kernel-tree.patch` | kvcache-ai/ktransformers `95009ea` (below tier 2 it is built as pinned) |
 | 2 | `patches/kt-kernel-llama-cpp.patch` | ktransformers' `third_party/llama.cpp` submodule |
@@ -200,11 +200,6 @@ The prompt format of the checkpoint's current `encoding/encoding.py`
 
 Tier 0: the load barrier's timeout. Tier 2: the rest.
 
-- `entrypoints/openai/serving_chat.py`, `configs/model_config.py`, `models/deepseek_v2.py`,
-  `multimodal/...`: DeepSeek-V4 checkpoints with a vision tower are detected by the tower,
-  keep their image in the chat encoding, and route image tokens with the vision bias.
-- `entrypoints/warmup.py`: the warmup also runs short extends with sampling
-  (`KT_WARMUP_EXTEND`), so the first real request does not pay kernel compiles.
 - `model_loader/weight_utils.py`: the GPU side's loader skips reading the experts that only
   the CPU runs (`KT_LOAD_SKIP_CPU_EXPERTS`, on), and reads the hot lend's experts too.
 - `model_executor/model_runner_components/load_model_utils.py`: the wait for the other

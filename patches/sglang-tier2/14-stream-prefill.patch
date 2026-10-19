@@ -1,0 +1,2042 @@
+diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+index ba0e35ed..5e5cdd9b 100644
+--- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
++++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Optional
+ import torch
+ 
+ from sglang.srt.arg_groups.overrides import model_config_of
++from sglang.srt.layers.moe.kt_stream_prefill import stream_prefill_for
+ from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+ from sglang.srt.runtime_context import (
+     get_exec,
+@@ -153,7 +154,12 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
+ 
+ _routing_dump_prefix = os.environ.get("KT_ROUTING_DUMP")
+ _gpu_mask_zero = os.environ.get("KT_GPU_MASK_ZERO") == "1"
++_hot_check = os.environ.get("KT_HOT_CHECK") == "1"
+ _routing_state = {}
++# layer_idx -> KTEPWrapperMethod on the rank that owns the kt-kernel wrapper
++# (rank 0); the streamed-prefill zero-copy path hands every layer's expert
++# arenas to the other ranks in one go.
++KT_LAYERS = {}
+ 
+ 
+ def _routing_count(device, layer_idx, topk_ids, rank):
+@@ -184,10 +190,12 @@ def _routing_count(device, layer_idx, topk_ids, rank):
+ 
+ 
+ def _kt_swiglu_kwargs(layer: torch.nn.Module) -> dict:
+-    """{"swiglu_limit": limit} for KTMoEWrapper when the layer clamps its SwiGLU, else {}.
+-    The value is what the resident GPU runner applies: moe_runner_config.swiglu_limit
+-    (DeepSeek V4: gate <= limit, |up| <= limit before silu(gate) * up). Without it the
+-    CPU experts run unclamped. KT_SWIGLU_CLAMP=0 leaves it out."""
++    """{"swiglu_limit": limit} for KTMoEWrapper when the layer clamps its
++    SwiGLU, else {} (older kt-kernel builds keep working for models without
++    a clamp). The value is what the resident GPU runner applies:
++    moe_runner_config.swiglu_limit (DeepSeek V4: gate <= limit, |up| <= limit
++    before silu(gate) * up). KT_SWIGLU_CLAMP=0 leaves it out, the behaviour
++    before 10-12."""
+     if os.environ.get("KT_SWIGLU_CLAMP", "1") == "0":
+         return {}
+     cfg = getattr(layer, "moe_runner_config", None)
+@@ -197,7 +205,7 @@ def _kt_swiglu_kwargs(layer: torch.nn.Module) -> dict:
+     if getattr(cfg, "gemm1_alpha", None) is not None or getattr(cfg, "gemm1_clamp_limit", None) is not None:
+         raise RuntimeError(
+             "KT_SWIGLU_CLAMP: this layer uses gemm1_alpha/gemm1_clamp_limit, which "
+-            "the KT CPU wrapper does not map; set KT_SWIGLU_CLAMP=0"
++            "the KT CPU wrapper in this tree does not map; set KT_SWIGLU_CLAMP=0"
+         )
+     return {"swiglu_limit": float(limit)}
+ 
+@@ -309,6 +317,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+             # GPU experts occupy ordinals 0..num_gpu_experts-1 (see above).
+             gpu_mask = torch.zeros(num_experts, dtype=torch.bool)
+             gpu_mask[: self.num_gpu_experts] = True
++            KT_LAYERS[self.kt_config.layer_idx] = self
+             self.wrapper = KTMoEWrapper(
+                 layer_idx=self.kt_config.layer_idx,
+                 num_experts=num_experts,
+@@ -364,6 +373,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+             )
+             _drop_checkpoint_cache(self.kt_config.layer_idx, getattr(self.kt_config, "num_layers", 0) or 0)
+             self.wrapper.load_weights(physical_to_logical_map_cpu)
++        # Last layer loaded on this rank: optionally build the streamer and
++        # pin every layer's arenas now (KT_GPU_STREAM_EARLY_INIT).
++        num_layers = getattr(self.kt_config, "num_layers", None)
++        if num_layers and self.kt_config.layer_idx == num_layers - 1:
++            from sglang.srt.layers.moe.kt_stream_prefill import stream_prefill_init_early
++
++            stream_prefill_init_early(self, layer)
+ 
+     def create_moe_runner(
+         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+@@ -476,9 +492,37 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         if _routing_dump_prefix and self.tp_rank == 0:
+             _routing_count(x.device, self.kt_config.layer_idx, topk_output.topk_ids, self.tp_rank)
+ 
++        # KT_GPU_STREAM_PREFILL=<tokens>: above that many tokens the CPU
++        # experts are streamed to the GPU in groups instead of computed here
++        # (kt_stream_prefill.py). The ids are taken before the mask below
++        # mutates them in place.
++        streamer = stream_prefill_for(self, layer, x.shape[0])
++        cpu_share = False
++        if streamer is not None:
++            physical_ids = topk_output.topk_ids.clone()
++            from sglang.srt.layers.moe.kt_stream_prefill import stream_cpu_cutoff
++
++            cutoff = stream_cpu_cutoff(self, streamer)
++            if cutoff < self.global_num_experts and self.tp_rank == 0:
++                if self.num_gpu_experts <= 0:
++                    raise RuntimeError("KT_STREAM_CPU_GROUPS needs --kt-num-gpu-experts > 0")
++                # Everything below the cutoff is streamed or resident: send it
++                # to GPU expert 0 at weight 0, which kt-kernel skips.
++                theirs = physical_ids < cutoff
++                cpu_do = dispatch_output._replace(
++                    topk_output=topk_output._replace(
++                        topk_ids=torch.where(theirs, torch.zeros_like(physical_ids), physical_ids),
++                        topk_weights=torch.where(
++                            theirs, torch.zeros_like(topk_output.topk_weights), topk_output.topk_weights
++                        ),
++                    )
++                )
++                self.submit(layer, cpu_do)
++                cpu_share = True
++
+ 
+         # Step 1: Submit CPU expert computation (non-blocking)
+-        if self.tp_rank == 0:
++        if streamer is None and self.tp_rank == 0:
+             self.submit(layer, dispatch_output)
+ 
+         # Step 2: Prepare GPU computation by masking CPU expert IDs
+@@ -490,10 +534,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         if _gpu_mask_zero:
+             # KT_GPU_MASK_ZERO=1: the Marlin MoE path cannot take -1 ids (its
+             # alignment kernels index weights with them: illegal address at
+-            # graph capture). Send the CPU-bound rows to GPU expert 0 with a
+-            # zero routing weight instead (the second GEMM multiplies by the
+-            # weight, so they add nothing) and hand the ids over as int64 so
+-            # fused_marlin_moe takes its generic alignment path.
++            # graph capture, 09-13). Send the CPU-bound rows to GPU expert 0
++            # with a zero routing weight instead — the second GEMM multiplies
++            # by the weight, so they add nothing — and hand the ids over as
++            # int64 so fused_marlin_moe takes its generic alignment path,
++            # which is fine with duplicate ids within a token.
+             m = masked_topk_ids < 0
+             masked_topk_output = topk_output._replace(
+                 topk_ids=torch.where(m, torch.zeros_like(masked_topk_ids), masked_topk_ids).to(torch.int64),
+@@ -507,15 +552,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+ 
+         # Step 3: Execute GPU expert computation (any quantization method)
+         # This runs in parallel with CPU computation. With no resident GPU
+-        # experts (--kt-num-gpu-experts 0) there is nothing to run, and the
+-        # FlashInfer MXFP4 runner refuses a zero-expert workspace.
++        # experts (--kt-num-gpu-experts 0, every slot given to the streamer
++        # and the KV pool) there is nothing to run and the FlashInfer MXFP4
++        # runner refuses a zero-expert workspace (09-16).
+         if self.num_gpu_experts > 0:
+-            output = self.gpu_method.apply(layer, masked_dispatch_output).hidden_states
++            gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
++            output = gpu_combine_input.hidden_states
++            if streamer is not None and _hot_check:
++                from sglang.srt.layers.moe.kt_stream_prefill import hot_reference_check
++
++                hot_reference_check(self, layer, x, physical_ids, topk_output.topk_weights, output, streamer)
+         else:
+             output = torch.zeros_like(x)
+ 
+         # Step 4: Synchronize CPU results and merge with GPU results
+-        if self.tp_rank == 0:
++        if streamer is not None:
++            output = output + streamer.run(self, layer, dispatch_output, physical_ids)
++            if cpu_share:
++                output = output + self.sync(x)
++        elif self.tp_rank == 0:
+             cpu_output = self.sync(x)
+             output = output + cpu_output
+ 
+diff --git a/python/sglang/srt/layers/moe/kt_stream_prefill.py b/python/sglang/srt/layers/moe/kt_stream_prefill.py
+new file mode 100644
+index 00000000..101e588b
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/kt_stream_prefill.py
+@@ -0,0 +1,1637 @@
++# SPDX-License-Identifier: Apache-2.0
++"""GPU-streamed prefill for the KT EP wrapper: expert groups over PCIe.
++
++Above ``KT_GPU_STREAM_PREFILL`` tokens the CPU-resident experts are not run on
++the CPU at all. kt-kernel copies them, ``KT_GPU_STREAM_GROUP`` at a time, into
++pinned shared-memory host buffers (rank 0's kt-kernel writes every rank's
++buffer, the fork's layerwise-pipeline arrangement), each rank DMAs its group
++into a device slot laid out for the FlashInfer SM120 CUTLASS MXFP4 MoE, and
++the group's routed rows go through the same runner the resident experts use.
++Three host buffers and two device slots: the host write of group g+2 and the
++DMA of group g+1 overlap the GEMM of group g.
++
++The ranks hand groups over through a small shared-memory flag block, never
++through torch.distributed: the scheduler's own request broadcast runs on the
++TP gloo group between forwards, and a second user of that group inside the
++forward deadlocked it on the first try (09-13).
++
++Only the SM120 CUTLASS backend (``--moe-runner-backend flashinfer_mxfp4`` on
++a Blackwell consumer card) is wired; the slot layout mirrors what
++``Mxfp4FlashinferCutlassMoEMethod`` holds for the resident experts (w13 as
++``[up; gate]`` packed bytes, e8m0 scales block-interleaved in place), with the
++``[gate; up]`` halves kt-kernel emits swapped during the DMA and its bf16
++scales turned back into exponent bytes on the device.
++"""
++
++import ctypes
++import logging
++import os
++import time
++import traceback
++
++# KT_STREAM_GRAPH_KEEP: CUDA graphs kept for row counts other than the
++# largest (a prompt's last chunk has its own; sglang-kt-stream-graph-keep.py)
++GRAPH_KEEP = int(os.environ.get("KT_STREAM_GRAPH_KEEP", "8"))
++from multiprocessing import shared_memory
++from typing import Dict, List, Optional
++
++import torch
++
++from sglang.srt.distributed import (
++    get_tensor_model_parallel_rank,
++    get_tensor_model_parallel_world_size,
++)
++
++logger = logging.getLogger(__name__)
++
++STREAM_THRESHOLD = int(os.environ.get("KT_GPU_STREAM_PREFILL", "0") or 0)
++GROUP_SIZE = int(os.environ.get("KT_GPU_STREAM_GROUP", "32") or 32)
++HOST_BUFFERS = int(os.environ.get("KT_GPU_STREAM_HOST_BUFS", "3") or 3)
++TIMING = os.environ.get("KT_GPU_STREAM_TIMING") == "1"
++# KT_GPU_STREAM_PROFILE=<n>: cProfile the n-th layer call and print it.
++PROFILE = int(os.environ.get("KT_GPU_STREAM_PROFILE", "0") or 0)
++NOMOE = os.environ.get("KT_GPU_STREAM_NOMOE") == "1"
++# KT_WRITE_UP_FIRST=1 (read by the patched kt-kernel writer too): w13 arrives
++# as [up; gate], the CUTLASS order, so a group is one contiguous copy and the
++# scales need no half swap.
++UP_FIRST = os.environ.get("KT_WRITE_UP_FIRST") == "1"
++SYNC_DMA = os.environ.get("KT_GPU_STREAM_SYNC_DMA") == "1"
++# KT_GPU_STREAM_GRAPH=1: capture each group's scale prep + MoE into a CUDA
++# graph. While our own DMA saturates the PCIe link every kernel launch costs
++# ~250 us of host time instead of 8 (measured 09-13 with a memhog and with a
++# DMA backlog), and a group is ~30 launches: 5-11 ms per group, the whole
++# non-overlap. One graph launch per group instead.
++USE_GRAPH = os.environ.get("KT_GPU_STREAM_GRAPH", "1") == "1"
++# KT_GPU_STREAM_W16=1: dequantize each streamed group to bf16 on the GPU and
++# run the bf16 CUTLASS MoE on bf16 activations, instead of the SM120
++# MXFP8 x MXFP4 kernel. The MXFP8 kernel quantizes the activations and the
++# swiglu intermediate to e4m3 per 32-block; on V4-Flash that left the
++# routed-expert output of outlier tokens 6-12% short of the CPU experts and
++# turned greedy answers into refusals (09-16). The dequantized weights are
++# exact, so the only remaining difference to the CPU path is bf16 rounding.
++# Costs one bf16 buffer of G experts (G x 25 MB on V4-Flash); the raw DMA
++# slots stay packed, so PCIe traffic is unchanged.
++W16 = os.environ.get("KT_GPU_STREAM_W16", "0") == "1"
++# sglang-kt-stream-row-block-dsv41.py: rows per CUTLASS MoE call (0 = the chunk);
++# the W16 group body and the resident experts' call during a streamed prefill
++ROW_BLOCK = int(os.environ.get("KT_GPU_STREAM_ROW_BLOCK", "0") or 0)
++
++
++def _block_rows(T: int) -> int:
++    return min(T, ROW_BLOCK) if ROW_BLOCK > 0 else T
++# KT_SWIGLU_CLAMP=0: the streamed experts' clamp lookup and W16 call as they
++# were before 10-12 (patches/sglang-kt-swiglu-clamp.py), for an A/B.
++SWIGLU_CLAMP = os.environ.get("KT_SWIGLU_CLAMP", "1") != "0"
++# KT_SWIGLU_COUNT=1: count gate/up values beyond the limit per layer (W16).
++SWIGLU_COUNT = os.environ.get("KT_SWIGLU_COUNT", "0") == "1"
++SWIGLU_COUNT_EVERY = int(os.environ.get("KT_SWIGLU_COUNT_EVERY", "1"))
++# KT_GPU_STREAM_SELFTEST=2: torch reference of the first groups of the layers
++# in KT_GPU_STREAM_REFCHECK_LAYERS (default "0"), from the raw arena bytes.
++REFCHECK = os.environ.get("KT_GPU_STREAM_SELFTEST") == "2"
++REFCHECK_LAYERS = {int(v) for v in os.environ.get("KT_GPU_STREAM_REFCHECK_LAYERS", "0").split(",") if v}
++REFCHECK_GROUPS = int(os.environ.get("KT_GPU_STREAM_REFCHECK_GROUPS", "2") or 2)
++CPUCHECK = os.environ.get("KT_GPU_STREAM_CPUCHECK", "1") == "1"
++# KT_GPU_STREAM_ZEROCOPY=1 (needs KT_EXPERT_SHM=1 in kt-kernel): no writer,
++# no host buffers, no rank handshake. Each rank maps the memfd arenas of the
++# CPU tp part that holds its half of every expert (rank 0 owns them, the
++# others receive the fds over a unix socket), cudaHostRegisters them once,
++# and DMAs a group straight from the resident copy through one captured
++# graph of memcpy nodes per (layer, group). The fp32 group scales land in a
++# small device pad and become e8m0 bytes inside the compute graph.
++ZEROCOPY = os.environ.get("KT_GPU_STREAM_ZEROCOPY") == "1"
++# KT_STREAM_SHARED_INPUTS=1 (default): the graph inputs of every chunk size
++# are views of one base per buffer (kt-stream-shared-graph-inputs, 09-30).
++SHARED_INPUTS = os.environ.get("KT_STREAM_SHARED_INPUTS", "1") == "1"
++# KT_STREAM_CPU_GROUPS=k: the last k expert groups of every layer are left
++# to kt-kernel on the CPU (kt_ep_wrapper submits them before the stream and
++# adds them after), so PCIe and the CPUs work at the same time.
++CPU_GROUPS = int(os.environ.get("KT_STREAM_CPU_GROUPS", "0"))
++# KT_GPU_STREAM_COLLAPSE=1: rank 0 rebuilds every arena on 2 MB pages
++# (MADV_COLLAPSE) before the ranks pin them; patches/sglang-kt-stream-collapse.py.
++COLLAPSE = os.environ.get("KT_GPU_STREAM_COLLAPSE", "0") == "1"
++COLLAPSE_THREADS = int(os.environ.get("KT_GPU_STREAM_COLLAPSE_THREADS", "16"))
++# KT_GPU_STREAM_DROP_CACHE=<model dir>: before collapsing, drop the page cache
++# of the checkpoint's files (already copied into the arenas and the GPUs).
++DROP_CACHE = os.environ.get("KT_GPU_STREAM_DROP_CACHE", "")
++# KT_GPU_STREAM_PIN_SERIAL=1: the ranks take turns at cudaHostRegister, one
++# layer at a time (patches/sglang-kt-stream-pin-serial.py for the numbers).
++PIN_SERIAL = os.environ.get("KT_GPU_STREAM_PIN_SERIAL", "0") == "1"
++
++# kt-kernel writer order per expert: [gate; up] rows for w13, both bf16 scales.
++_HOST_NAMES = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
++
++
++def _log(msg: str):
++    print(f"[kt-stream] {msg}", flush=True)
++
++
++def _collapse_arenas(arenas) -> None:
++    """MADV_COLLAPSE over each (fd, size) memfd arena, COLLAPSE_THREADS at a
++    time. Ranges already on huge pages cost nothing; a range the kernel cannot
++    collapse stays as it was and is only counted."""
++    import mmap
++    from concurrent.futures import ThreadPoolExecutor
++
++    libc = ctypes.CDLL("libc.so.6", use_errno=True)
++    libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
++    MADV_COLLAPSE = 25
++
++    def shmem_huge_gb():
++        with open("/proc/meminfo") as f:
++            for line in f:
++                if line.startswith("ShmemHugePages"):
++                    return int(line.split()[1]) / 2**20
++        return 0.0
++
++    def one(arena):
++        fd, size = arena
++        mm = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
++        try:
++            base = ctypes.addressof(ctypes.c_char.from_buffer(mm))
++            return 0 if libc.madvise(base, size, MADV_COLLAPSE) == 0 else ctypes.get_errno()
++        finally:
++            mm.close()
++
++    if DROP_CACHE:
++        # Right after the load the page cache holds the shards and there is
++        # no free 2 MB block anywhere; the collapse then fails at once with
++        # ENOMEM (09-24 10:14, all weight arenas). Clean file pages go back to
++        # the buddy allocator in long runs when the whole file is dropped.
++        t0, dropped = time.time(), 0
++        for root, _, files in os.walk(DROP_CACHE, followlinks=True):
++            for name in files:
++                try:
++                    fd = os.open(os.path.join(root, name), os.O_RDONLY)
++                except OSError:
++                    continue
++                try:
++                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
++                    dropped += 1
++                finally:
++                    os.close(fd)
++        _log(f"rank 0: dropped the page cache of {dropped} files under {DROP_CACHE} in {time.time() - t0:.1f} s")
++
++    # arenas under 2 MB (the fp32 scales) hold no huge page: EINVAL
++    arenas = [a for a in arenas if a[1] >= (2 << 20)]
++    t0, h0 = time.time(), shmem_huge_gb()
++    with ThreadPoolExecutor(COLLAPSE_THREADS) as ex:
++        errs = [e for e in ex.map(one, arenas) if e]
++    _log(f"rank 0: collapsed {len(arenas)} arenas onto 2 MB pages in {time.time() - t0:.1f} s, "
++         f"ShmemHugePages {h0:.0f} -> {shmem_huge_gb():.0f} GB"
++         + (f", {len(errs)} not collapsed (errno {sorted(set(errs))})" if errs else ""))
++
++
++def _bf16_to_ue8m0(t: torch.Tensor) -> torch.Tensor:
++    """kt-kernel writes scales as bf16 powers of two; the CUTLASS path wants the
++    biased exponent byte. Exact for every value the checkpoint can hold."""
++    if t.dtype == torch.float32:
++        return ((t.view(torch.int32) >> 23) & 0xFF).to(torch.uint8)
++    return ((t.view(torch.int16) >> 7) & 0xFF).to(torch.uint8)
++
++
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _mxfp4_dequant_kernel(
++    packed_ptr, scale_ptr, out_ptr,
++    n_elems, packed_stride, scale_stride, out_stride,
++    BLOCK: tl.constexpr,
++):
++    """One expert per program_id(1); BLOCK output elements per program_id(0).
++    packed: e2m1 pairs, low nibble first; scale: fp32 per 32 elements
++    (kt-kernel's storage); out: bf16."""
++    e = tl.program_id(1)
++    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    m = offs < n_elems
++    byte = tl.load(packed_ptr + e * packed_stride + offs // 2, mask=m, other=0).to(tl.int32)
++    nib = (byte >> ((offs % 2) * 4)) & 0xF
++    sign = tl.where((nib & 8) != 0, -1.0, 1.0)
++    ex = (nib >> 1) & 3
++    man = (nib & 1).to(tl.float32)
++    mag = tl.where(ex == 0, man * 0.5, (1.0 + man * 0.5) * tl.exp2((ex - 1).to(tl.float32)))
++    sc = tl.load(scale_ptr + e * scale_stride + offs // 32, mask=m, other=0.0)
++    tl.store(out_ptr + e * out_stride + offs, (sign * mag * sc).to(tl.bfloat16), mask=m)
++
++
++def _mxfp4_dequant(packed: torch.Tensor, packed_stride: int, scales_f32: torch.Tensor,
++                   scale_stride: int, out: torch.Tensor, n: int, rows: int, cols: int):
++    """packed/scales are the raw slot tensors (expert-major, given strides in
++    bytes / floats); out [n, rows, cols] bf16 contiguous."""
++    n_elems = rows * cols
++    assert out.stride(1) == cols and out.stride(2) == 1, "dequant target rows must be contiguous"
++    BLOCK = 4096
++    grid = (triton.cdiv(n_elems, BLOCK), n)
++    _mxfp4_dequant_kernel[grid](
++        packed, scales_f32, out, n_elems, packed_stride, scale_stride, out.stride(0), BLOCK=BLOCK
++    )
++
++
++def _open_shm(name: str, timeout_s: float = 600.0) -> shared_memory.SharedMemory:
++    t0 = time.time()
++    while True:
++        try:
++            return shared_memory.SharedMemory(name=name)
++        except FileNotFoundError:
++            if time.time() - t0 > timeout_s:
++                raise
++            time.sleep(0.01)
++
++
++class _Flags:
++    """Shared int64 block: [opened, write_seq, ready[world], consumed[world]].
++    Rank 0 creates it; the group handshake is plain stores and polls on it."""
++
++    def __init__(self, uid: str, rank: int, world: int):
++        self.world = world
++        n = 2 + 2 * world
++        nbytes = 8 * n
++        if rank == 0:
++            self.shm = shared_memory.SharedMemory(name=f"kt_stream_flags_{uid}", create=True, size=nbytes)
++            ctypes.memset(ctypes.addressof(ctypes.c_char.from_buffer(self.shm.buf)), 0, nbytes)
++        else:
++            self.shm = _open_shm(f"kt_stream_flags_{uid}")
++        self.arr = (ctypes.c_int64 * n).from_buffer(self.shm.buf)
++
++    def set(self, i: int, v: int):
++        self.arr[i] = v
++
++    def get(self, i: int) -> int:
++        return self.arr[i]
++
++    def wait_ge(self, i: int, v: int, what: str):
++        t0 = time.time()
++        while self.arr[i] < v:
++            time.sleep(0.0001)
++            if time.time() - t0 > 600:
++                raise RuntimeError(f"kt-stream: waited 600 s for {what} (flag {i} >= {v}, is {self.arr[i]})")
++
++    # layout helpers
++    OPENED = 0
++    WRITE_SEQ = 1
++
++    def ready_idx(self, r: int) -> int:
++        return 2 + r
++
++    def consumed_idx(self, r: int) -> int:
++        return 2 + self.world + r
++
++
++class _HostGroup:
++    """One pinned shared-memory buffer per weight name holding G experts, in
++    kt-kernel's writer layout. Created by every rank, opened by rank 0."""
++
++    def __init__(self, index: int, shapes: Dict[str, tuple], dtypes, uid: str, rank: int):
++        self.index = index
++        self.shm: Dict[str, shared_memory.SharedMemory] = {}
++        self.tensors: Dict[str, torch.Tensor] = {}
++        self.nbytes: Dict[str, int] = {}
++        for name in _HOST_NAMES:
++            shape = shapes[name]
++            numel = 1
++            for s in shape:
++                numel *= s
++            nbytes = numel * torch.empty((), dtype=dtypes[name]).element_size()
++            shm = shared_memory.SharedMemory(
++                name=f"kt_stream_{name}_h{index}_r{rank}_{uid}", create=True, size=nbytes
++            )
++            t = torch.frombuffer(shm.buf, dtype=dtypes[name]).reshape(shape)
++            rc = torch.cuda.cudart().cudaHostRegister(t.data_ptr(), nbytes, 0)
++            if int(rc) != 0:
++                raise RuntimeError(f"cudaHostRegister({name}) failed: {int(rc)}")
++            self.shm[name] = shm
++            self.tensors[name] = t
++            self.nbytes[name] = nbytes
++        # Fenced by the transfer stream after the last DMA out of this buffer.
++        self.free_event = torch.cuda.Event()
++        self.used = False
++        # Filled by rank 0: pointer of each rank's copy of this buffer.
++        self.rank_ptrs: Dict[str, List[int]] = {}
++        self.opened: List[shared_memory.SharedMemory] = []
++
++
++class _DeviceSlot:
++    """G experts in the SM120 CUTLASS layout plus raw scale landing pads
++    (bf16 from the kt-kernel writer, fp32 straight from its storage)."""
++
++    def __init__(self, G: int, N: int, K: int, device, raw_dtype=torch.bfloat16):
++        u8 = torch.uint8
++        if not W16:
++            self.w13_weight = torch.empty((G, 2 * N, K // 2), dtype=u8, device=device)
++            self.w2_weight = torch.empty((G, K, N // 2), dtype=u8, device=device)
++            if raw_dtype is not None:
++                self.w13_scale_raw = torch.empty((G, 2 * N, K // 32), dtype=raw_dtype, device=device)
++                self.w2_scale_raw = torch.empty((G, K, N // 32), dtype=raw_dtype, device=device)
++            self.w13_weight_scale = torch.empty((G, 2 * N, K // 32), dtype=u8, device=device)
++            self.w2_weight_scale = torch.empty((G, K, N // 32), dtype=u8, device=device)
++        self.dma_done = torch.cuda.Event()
++        self.compute_done = torch.cuda.Event()
++        self.compute_used = False
++        # Zero-copy: the group's gate/up/down blocks exactly as kt-kernel
++        # stores them (packed weights then fp32 scales, 64-aligned stride).
++        self.raw = None
++        self.raw_s = None
++
++
++class KTStreamPrefill:
++    """Process-wide (per rank) streaming state, shared by every MoE layer."""
++
++    def __init__(self, method, layer):
++        self.rank = get_tensor_model_parallel_rank()
++        self.world = get_tensor_model_parallel_world_size()
++        self.device = layer.w13_weight.device
++        self.N = layer.intermediate_size_per_partition
++        self.K = layer.hidden_size
++        self.G = GROUP_SIZE
++        E_res, twoN_pad, Khalf_pad = layer.w13_weight.shape
++        # The W16 mode has its own bf16 layout, so the resident method may be
++        # anything (e.g. Marlin W4A16 for the hot experts, whose packed shape
++        # differs); the packed modes reuse the resident CUTLASS layout.
++        if not W16 and (twoN_pad != 2 * self.N or Khalf_pad != self.K // 2):
++            raise RuntimeError(
++                "KT_GPU_STREAM_PREFILL: the SM120 layout pads this model "
++                f"(w13 {tuple(layer.w13_weight.shape)} vs N={self.N} K={self.K}); "
++                "padding is not implemented in the streamed slot"
++            )
++        if self.K % 32 or self.N % 32:
++            raise RuntimeError("KT_GPU_STREAM_PREFILL needs N and K multiples of 32")
++        # patches/sglang-dsv41-kt-prefill-lend.py: prefill-only buffers in
++        # the lend scratch (plain allocations when lending is off)
++        from sglang.srt.layers.moe import kt_lend
++
++        with kt_lend.scratch_region():
++            self.slots = [
++                _DeviceSlot(self.G, self.N, self.K, self.device,
++                            raw_dtype=None if ZEROCOPY else torch.bfloat16)
++                for _ in range(2)
++            ]
++        if W16:
++            if not (ZEROCOPY and USE_GRAPH):
++                raise RuntimeError("KT_GPU_STREAM_W16 needs the zero-copy graph mode")
++            # One bf16 landing for the group being computed; the groups run
++            # back to back on the compute stream, so a single buffer serves
++            # both DMA slots.
++            with kt_lend.scratch_region():
++                self.w13_bf16 = torch.empty((self.G, 2 * self.N, self.K), dtype=torch.bfloat16, device=self.device)
++                self.w2_bf16 = torch.empty((self.G, self.K, self.N), dtype=torch.bfloat16, device=self.device)
++            _log(f"rank {self.rank}: W16 mode, bf16 group buffer "
++                 f"{(self.w13_bf16.numel() + self.w2_bf16.numel()) * 2 / 1e6:.0f} MB")
++        # Per-expert constants the runner reads, sized G like the resident
++        # method sizes its own (Mxfp4FlashinferCutlassMoEMethod.create_moe_runner).
++        gm = method.gpu_method
++        lim_value = None
++        if SWIGLU_CLAMP:
++            # The layer's runner config is what every resident method reads;
++            # the CUTLASS method's private copies below do not exist under
++            # Marlin (Mxfp4MarlinMoEMethod), which left V4.1's streamed
++            # experts unclamped. Same rule as
++            # Mxfp4FlashinferCutlassMoEMethod.create_moe_runner.
++            cfg = getattr(layer, "moe_runner_config", None)
++            if cfg is None:
++                cfg = getattr(method, "moe_runner_config", None)
++            if cfg is not None and getattr(cfg, "gemm1_alpha", None) is None:
++                g1 = getattr(cfg, "gemm1_clamp_limit", None)
++                lim_value = g1 if g1 is not None else getattr(cfg, "swiglu_limit", None)
++                if lim_value is not None:
++                    lim_value = float(lim_value)
++        if lim_value is None:
++            lim_value = getattr(gm, "_swiglu_limit_value", None)
++        if lim_value is None:
++            lim = getattr(gm, "_swiglu_limit_tensor", None)
++            lim_value = None if lim is None or lim.numel() == 0 else float(lim[0])
++        self.swiglu_limit = (
++            None if lim_value is None
++            else torch.full((self.G,), lim_value, dtype=torch.float32, device=self.device)
++        )
++        self.use_swiglu_step = bool(getattr(gm, "_use_swiglu_step", False))
++        if SWIGLU_CLAMP:
++            cfg = getattr(layer, "moe_runner_config", None)
++            if cfg is not None and getattr(cfg, "gemm1_alpha", None) is None:
++                self.use_swiglu_step = getattr(cfg, "gemm1_clamp_limit", None) is not None
++        self.swiglu_limit_value = lim_value
++        _log(f"rank {self.rank}: streamed experts swiglu_limit="
++             f"{lim_value} (KT_SWIGLU_CLAMP={'1' if SWIGLU_CLAMP else '0'})")
++        # KT_SWIGLU_COUNT: [layers, 4] int64 = gate>lim, up>lim, up<-lim,
++        # routed elements. The group graphs are shared by every layer (key
++        # (T, gi)), so the layer index reaches them through a device scalar
++        # set before the replays. Allocated here, before any capture.
++        self._clamp_counts = None
++        self._clamp_runs = 0
++        if SWIGLU_COUNT and lim_value is not None:
++            n_layers = getattr(method.kt_config, "num_layers", None) or 128
++            self._clamp_counts = torch.zeros((n_layers, 4), dtype=torch.int64, device=self.device)
++            self._clamp_lid = torch.zeros((1,), dtype=torch.int64, device=self.device)
++        self.global_scale = torch.ones(self.G, dtype=torch.float32, device=self.device)
++        self.transfer_stream = torch.cuda.Stream(device=self.device)
++        self.seq = 0  # global group counter, shared meaning across ranks
++        # Zero-copy: per layer the three host arena tensors of this rank's
++        # part, and one DMA graph per (layer, group).
++        self._arenas = {}
++        # The SGLang runner wrapper around cutlass_fused_moe costs ~11 ms of
++        # host time per call in the server (symmetric-memory output
++        # allocation and the FusedOpPool dispatch); the kernel itself is
++        # 0.2 ms to enqueue. Call FlashInfer directly with a persistent
++        # output buffer and one MXFP8 quantization of x per layer.
++        from flashinfer.fused_moe import cutlass_fused_moe
++        from flashinfer.fused_moe.core import ActivationType
++        from sglang.srt.environ import envs
++
++        self._cutlass_fused_moe = cutlass_fused_moe
++        self._activation_type = (
++            ActivationType.SwigluStep if self.use_swiglu_step else ActivationType.Swiglu
++        )
++        self._use_fused_finalize = envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
++        self._out_full = None  # [tokens, K] bf16 scratch, grown on demand
++        self._out = None
++        # Without a caller-provided workspace the runner allocates ~244 MB per
++        # call through the caching allocator; beside the 1M pool that meant a
++        # cudaFree-class device sync per group (11 ms, the DMA in flight),
++        # which serialised the pipeline (cProfile 09-13 evening).
++        self._workspace = None
++        self._workspace_tokens = 0
++        # Graph mode: persistent inputs per token count and one graph per
++        # (token count, group index).
++        self._graphs = {}
++        self._graph_use = {}  # row count -> None, least recently used first
++        self._gin = {}
++        self._gin_base = {}  # buffer name -> flat uint8 base (SHARED_INPUTS)
++        self._capture_stream = torch.cuda.Stream(device=self.device)
++        # The groups never run concurrently: one mempool for every graph so
++        # their temporaries (scale conversions, local ids) share storage.
++        self._graph_pool = torch.cuda.graph_pool_handle()
++        if ZEROCOPY:
++            self._map_expert_arenas(method)
++        else:
++            self._make_host_buffers()
++        self.calls = 0
++        _log(
++            f"rank {self.rank}: streamed prefill on above {STREAM_THRESHOLD} tokens, G={self.G}, "
++            + ("zero-copy from kt-kernel's expert arenas, " if ZEROCOPY else
++               f"{HOST_BUFFERS} host buffers x {sum(self.hosts[0].nbytes.values())/1e6:.0f} MB, ")
++            + (f"2 packed DMA slots x {self.G * (3 * self.N * self.K // 2) / 1e6:.0f} MB, bf16 group buffer"
++               if W16 else
++               f"2 device slots x {(self.slots[0].w13_weight.numel() + self.slots[0].w2_weight.numel())/1e6:.0f} MB of weights")
++        )
++
++    # -- zero-copy: map kt-kernel's expert arenas -----------------------------
++
++    def _map_expert_arenas(self, method):
++        """Rank 0 reads every KT layer's (fd, size, stride) for the part that
++        feeds each rank and passes the other ranks their fds over a unix
++        socket; every rank mmaps its part and registers it as pinned."""
++        import mmap
++        import socket
++
++        from sglang.srt.layers.moe.kt_ep_wrapper import KT_LAYERS
++
++        sock_path = f"/tmp/kt_stream_{os.getppid()}_r{self.rank}.sock"
++        infos = {}  # layer_idx -> [(fd, size, stride) x 3]
++        fd_objs = []
++        if self.rank == 0:
++            per_rank = {r: {} for r in range(self.world)}
++            for layer_idx, m in sorted(KT_LAYERS.items()):
++                parts = m.wrapper.moe.expert_arena_infos()
++                if not parts or len(parts[0]) != 6:
++                    raise RuntimeError(
++                        "KT_GPU_STREAM_ZEROCOPY needs kt-kernel built and run with KT_EXPERT_SHM=1 "
++                        f"(got {0 if not parts else len(parts[0])} arenas per part, want 6)")
++                cpu_tp = len(parts)
++                for r in range(self.world):
++                    # Same part -> rank mapping as write_weights_to_buffer.
++                    part = r * cpu_tp // self.world if cpu_tp >= self.world else r // (self.world // cpu_tp)
++                    per_rank[r][layer_idx] = parts[part]
++            infos = per_rank[0]
++            if COLLAPSE:
++                _collapse_arenas([(fd, sz) for r in per_rank for l in per_rank[r]
++                                  for (fd, sz, _) in per_rank[r][l]])
++            for r in range(1, self.world):
++                path = f"/tmp/kt_stream_{os.getppid()}_r{r}.sock"
++                t0 = time.time()
++                while True:
++                    try:
++                        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++                        c.connect(path)
++                        break
++                    except (FileNotFoundError, ConnectionRefusedError):
++                        c.close()
++                        if time.time() - t0 > 600:
++                            raise
++                        time.sleep(0.05)
++                layers = sorted(per_rank[r])
++                fds = [fd for l in layers for (fd, _, _) in per_rank[r][l]]
++                meta = repr([(l, [(sz, st) for (_, sz, st) in per_rank[r][l]]) for l in layers]).encode()
++                assert all(len(per_rank[r][l]) == 6 for l in layers)
++                c.sendall(len(meta).to_bytes(8, "little"))
++                c.sendall(meta)
++                # SCM_RIGHTS in chunks (kernel limit ~253 fds per message).
++                for i in range(0, len(fds), 200):
++                    socket.send_fds(c, [b"x"], fds[i:i + 200])
++                c.recv(1)
++                c.close()
++        else:
++            try:
++                os.unlink(sock_path)
++            except FileNotFoundError:
++                pass
++            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++            srv.bind(sock_path)
++            srv.listen(1)
++            c, _ = srv.accept()
++            n = int.from_bytes(c.recv(8), "little")
++            buf = b""
++            while len(buf) < n:
++                buf += c.recv(n - len(buf))
++            meta = eval(buf.decode())  # our own repr of ints
++            nfds = sum(len(v) for _, v in meta)
++            fds = []
++            while len(fds) < nfds:
++                _, got, _, _ = socket.recv_fds(c, 1, 200)
++                fds.extend(got)
++            c.sendall(b"k")
++            c.close()
++            srv.close()
++            os.unlink(sock_path)
++            i = 0
++            for layer_idx, sizes in meta:
++                infos[layer_idx] = [(fds[i + j], sizes[j][0], sizes[j][1]) for j in range(6)]
++                i += 6
++        # mmap every arena now (cheap); cudaHostRegister (~4-5 GB/s, 4.2 GB
++        # per layer per rank) happens on a layer's first streamed group, so
++        # only the layers that actually stream get pinned.
++        for layer_idx, arenas in sorted(infos.items()):
++            tensors = []
++            for (fd, size, stride) in arenas:
++                mm = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
++                t = torch.frombuffer(mm, dtype=torch.uint8)
++                tensors.append((t, stride, mm))
++            self._arenas[layer_idx] = tensors
++        self._registered = set()
++        _log(f"rank {self.rank}: mapped {len(infos)} layers of expert arenas")
++        if self.rank == 0 and os.environ.get("KT_GPU_STREAM_SELFTEST") == "1":
++            self._selftest_arenas()
++
++    def _selftest_arenas(self):
++        """Rank 0: have kt-kernel's writer emit a few experts of layer 0 into
++        scratch host buffers and compare with the arena bytes this rank would
++        DMA. Prints mismatch counts for weights and scales per projection."""
++        from sglang.srt.layers.moe.kt_ep_wrapper import KT_LAYERS
++
++        layer_idx = min(KT_LAYERS)
++        m = KT_LAYERS[layer_idx]
++        N, K = self.N, self.K
++        w13_bytes = N * K // 2
++        w13_s = N * (K // 32)
++        w2_bytes = K * N // 2
++        w2_s = K * (N // 32)
++        bufs = []
++        for r in range(self.world):
++            bufs.append({
++                "w13": torch.empty(2 * w13_bytes, dtype=torch.uint8).pin_memory(),
++                "w13s": torch.empty(2 * w13_s, dtype=torch.bfloat16).pin_memory(),
++                "w2": torch.empty(w2_bytes, dtype=torch.uint8).pin_memory(),
++                "w2s": torch.empty(w2_s, dtype=torch.bfloat16).pin_memory(),
++            })
++        arenas = self._arenas[layer_idx]
++        up_first = os.environ.get("KT_WRITE_UP_FIRST") == "1"
++        for e in (m.num_gpu_experts, m.num_gpu_experts + 93, m.global_num_experts - 1):
++            m.wrapper.submit_write_weight_scale_to_buffer(
++                self.world, e,
++                [b["w13"].data_ptr() for b in bufs], [b["w13s"].data_ptr() for b in bufs],
++                [b["w2"].data_ptr() for b in bufs], [b["w2s"].data_ptr() for b in bufs])
++            m.wrapper.sync_write_weight_scale_to_buffer()
++            b = bufs[0]  # part 0 == this rank
++            gate_w_writer = b["w13"][w13_bytes:] if up_first else b["w13"][:w13_bytes]
++            up_w_writer = b["w13"][:w13_bytes] if up_first else b["w13"][w13_bytes:]
++            gate_s_writer = (b["w13s"][w13_s:] if up_first else b["w13s"][:w13_s]).float()
++            up_s_writer = (b["w13s"][:w13_s] if up_first else b["w13s"][w13_s:]).float()
++            wst = arenas[0][1]
++            sst = arenas[3][1]
++            gate_w = arenas[0][0][e * wst:e * wst + w13_bytes]
++            up_w = arenas[1][0][e * wst:e * wst + w13_bytes]
++            down_w = arenas[2][0][e * wst:e * wst + w2_bytes]
++            gate_s = arenas[3][0][e * sst:e * sst + 4 * w13_s].view(torch.float32)
++            up_s = arenas[4][0][e * sst:e * sst + 4 * w13_s].view(torch.float32)
++            down_s = arenas[5][0][e * sst:e * sst + 4 * w2_s].view(torch.float32)
++            def mism(a, c):
++                return int((a != c).sum())
++            # And through the DMA engine, from the registered mapping.
++            self._register_arenas(layer_idx)
++            d = torch.empty(w13_bytes, dtype=torch.uint8, device=self.device)
++            d.copy_(gate_w, non_blocking=True)
++            ds = torch.empty(4 * w13_s, dtype=torch.uint8, device=self.device)
++            ds.copy_(arenas[3][0][e * sst:e * sst + 4 * w13_s], non_blocking=True)
++            torch.cuda.synchronize()
++            back = d.cpu()
++            back_s = ds.cpu().view(torch.float32)
++            _log(f"selftest DMA expert {e}: gate_w via GPU mismatches {mism(back, gate_w_writer)}/{w13_bytes} "
++                 f"(pinned={gate_w.is_pinned()}), gate_s via GPU mismatches {mism(back_s, gate_s_writer)}/{w13_s}; "
++                 f"back[:8]={back[:8].tolist()}")
++            _log(f"selftest layer {layer_idx} expert {e}: mismatches gate_w={mism(gate_w, gate_w_writer)}/{w13_bytes} "
++                 f"up_w={mism(up_w, up_w_writer)} down_w={mism(down_w, b['w2'])}/{w2_bytes} "
++                 f"gate_s={mism(gate_s, gate_s_writer)}/{w13_s} up_s={mism(up_s, up_s_writer)} "
++                 f"down_s={mism(down_s, b['w2s'].float())}/{w2_s}; "
++                 f"arena gate_w[:8]={gate_w[:8].tolist()} writer[:8]={gate_w_writer[:8].tolist()} "
++                 f"gate_s[:4]={gate_s[:4].tolist()} writer_s[:4]={gate_s_writer[:4].tolist()}")
++
++    def _register_arenas(self, layer_idx: int):
++        if layer_idx in self._registered:
++            return
++        t0 = time.time()
++        total = 0
++        lock = None
++        if PIN_SERIAL:
++            import fcntl
++
++            # both ranks are children of the same launch_server (the fd
++            # socket is keyed the same way)
++            lock = open(f"/tmp/kt_stream_{os.getppid()}_pin.lock", "w")
++            fcntl.flock(lock, fcntl.LOCK_EX)
++        t1 = time.time()
++        try:
++            for (t, _, _) in self._arenas[layer_idx]:
++                rc = torch.cuda.cudart().cudaHostRegister(t.data_ptr(), t.numel(), 0)
++                if int(rc) != 0:
++                    raise RuntimeError(f"cudaHostRegister(expert arena, layer {layer_idx}) failed: {int(rc)}")
++                total += t.numel()
++        finally:
++            if lock is not None:
++                lock.close()
++        self._registered.add(layer_idx)
++        if TIMING:
++            _log(f"rank {self.rank}: registered layer {layer_idx} arenas, {total/1e9:.1f} GB in {time.time()-t0:.1f} s"
++                 + (f" ({time.time()-t1:.1f} s pinning)" if lock is not None else ""))
++
++    def _stage_zc(self, layer_idx: int, gi: int, experts, stats):
++        """Three contiguous H2D copies: the group's consecutive expert blocks
++        of the gate, up and down arenas, into the slot's raw landing."""
++        self._register_arenas(layer_idx)
++        slot = self.slots[gi % 2]
++        n = len(experts)
++        base = experts[0]
++        arenas = self._arenas[layer_idx]  # gate_w, up_w, down_w, gate_s, up_s, down_s
++        if slot.raw is None:
++            wstride = arenas[0][1]
++            sstride = arenas[3][1]
++            assert all(a[1] == wstride for a in arenas[:3]) and all(a[1] == sstride for a in arenas[3:]), \
++                "arena strides differ between projections"
++            from sglang.srt.layers.moe import kt_lend
++
++            with kt_lend.scratch_region():
++                slot.raw = torch.empty((3, self.G, wstride), dtype=torch.uint8, device=self.device)
++                slot.raw_s = torch.empty((3, self.G, sstride), dtype=torch.uint8, device=self.device)
++        wstride = slot.raw.shape[2]
++        sstride = slot.raw_s.shape[2]
++        t0 = time.perf_counter()
++        with torch.cuda.stream(self.transfer_stream):
++            if slot.compute_used:
++                self.transfer_stream.wait_event(slot.compute_done)
++            for pi in range(3):
++                slot.raw[pi, :n].view(-1).copy_(arenas[pi][0][base * wstride:(base + n) * wstride], non_blocking=True)
++                slot.raw_s[pi, :n].view(-1).copy_(
++                    arenas[3 + pi][0][base * sstride:(base + n) * sstride], non_blocking=True)
++            slot.dma_done.record(self.transfer_stream)
++        stats["dma_enq"] += time.perf_counter() - t0
++
++    # -- host buffers -------------------------------------------------------
++
++    def _make_host_buffers(self):
++        G, N, K = self.G, self.N, self.K
++        shapes = {
++            "w13_weight": (G, 2 * N, K // 2),
++            "w13_weight_scale": (G, 2 * N, K // 32),
++            "w2_weight": (G, K, N // 2),
++            "w2_weight_scale": (G, K, N // 32),
++        }
++        dtypes = {
++            "w13_weight": torch.uint8,
++            "w13_weight_scale": torch.bfloat16,
++            "w2_weight": torch.uint8,
++            "w2_weight_scale": torch.bfloat16,
++        }
++        # The TP schedulers are children of one launcher: its pid names the
++        # segments without a collective.
++        uid = f"{os.getppid()}"
++        self.flags = _Flags(uid, self.rank, self.world)
++        self.hosts = [
++            _HostGroup(i, shapes, dtypes, uid, self.rank) for i in range(HOST_BUFFERS)
++        ]
++        self.flags.set(self.flags.ready_idx(self.rank), 1)
++        if self.rank == 0:
++            for r in range(self.world):
++                self.flags.wait_ge(self.flags.ready_idx(r), 1, f"rank {r} host buffers")
++            for h in self.hosts:
++                for name in _HOST_NAMES:
++                    ptrs = []
++                    for r in range(self.world):
++                        if r == self.rank:
++                            ptrs.append(h.tensors[name].data_ptr())
++                        else:
++                            shm = _open_shm(f"kt_stream_{name}_h{h.index}_r{r}_{uid}")
++                            h.opened.append(shm)
++                            ptrs.append(ctypes.addressof(ctypes.c_char.from_buffer(shm.buf)))
++                    h.rank_ptrs[name] = ptrs
++            self.flags.set(self.flags.OPENED, 1)
++            try:
++                self.flags.shm.unlink()
++            except FileNotFoundError:
++                pass
++        else:
++            self.flags.wait_ge(self.flags.OPENED, 1, "rank 0 to open the host buffers")
++        for h in self.hosts:
++            for shm in h.shm.values():
++                try:
++                    shm.unlink()
++                except FileNotFoundError:
++                    pass
++
++    # -- one group ----------------------------------------------------------
++
++    def _write_group(self, method, host: _HostGroup, experts: List[int]):
++        """Rank 0: kt-kernel copies each expert of the group into every rank's
++        copy of ``host`` (CPU tp part i feeds GPU rank i)."""
++        w = method.wrapper
++        per = {name: host.nbytes[name] // self.G for name in _HOST_NAMES}
++        for j, e in enumerate(experts):
++            w.submit_write_weight_scale_to_buffer(
++                self.world,
++                e,
++                [p + j * per["w13_weight"] for p in host.rank_ptrs["w13_weight"]],
++                [p + j * per["w13_weight_scale"] for p in host.rank_ptrs["w13_weight_scale"]],
++                [p + j * per["w2_weight"] for p in host.rank_ptrs["w2_weight"]],
++                [p + j * per["w2_weight_scale"] for p in host.rank_ptrs["w2_weight_scale"]],
++            )
++        w.sync_write_weight_scale_to_buffer()
++
++    def _stage(self, method, gi: int, experts: List[int], stats):
++        """Group ``gi`` of this layer, global sequence ``self.seq`` (1-based)."""
++        self.seq += 1
++        seq = self.seq
++        host = self.hosts[seq % HOST_BUFFERS]
++        slot = self.slots[gi % 2]
++        n = len(experts)
++        N = self.N
++        f = self.flags
++        # This host buffer last carried seq - HOST_BUFFERS; our DMA out of it
++        # must be done before anyone overwrites it. Publish that.
++        t0 = time.perf_counter()
++        if host.used:
++            host.free_event.synchronize()
++        f.set(f.consumed_idx(self.rank), seq - HOST_BUFFERS)
++        if self.rank == 0:
++            for r in range(self.world):
++                f.wait_ge(f.consumed_idx(r), seq - HOST_BUFFERS, f"rank {r} to release host buffer")
++        t1 = time.perf_counter()
++        stats["hostwait"] += t1 - t0
++        if self.rank == 0:
++            self._write_group(method, host, experts)
++            f.set(f.WRITE_SEQ, seq)
++        else:
++            f.wait_ge(f.WRITE_SEQ, seq, f"rank 0 to write group seq {seq}")
++        t2 = time.perf_counter()
++        stats["write"] += t2 - t1
++        with torch.cuda.stream(self.transfer_stream):
++            if slot.compute_used:
++                self.transfer_stream.wait_event(slot.compute_done)
++            hw13 = host.tensors["w13_weight"]
++            if UP_FIRST:
++                slot.w13_weight[:n].copy_(hw13[:n], non_blocking=True)
++            else:
++                # [gate; up] on the host -> [up; gate] in the slot.
++                for j in range(n):
++                    slot.w13_weight[j, N:].copy_(hw13[j, :N], non_blocking=True)
++                    slot.w13_weight[j, :N].copy_(hw13[j, N:], non_blocking=True)
++            slot.w2_weight[:n].copy_(host.tensors["w2_weight"][:n], non_blocking=True)
++            slot.w13_scale_raw[:n].copy_(host.tensors["w13_weight_scale"][:n], non_blocking=True)
++            slot.w2_scale_raw[:n].copy_(host.tensors["w2_weight_scale"][:n], non_blocking=True)
++            host.free_event.record(self.transfer_stream)
++            host.used = True
++            slot.dma_done.record(self.transfer_stream)
++        stats["dma_enq"] += time.perf_counter() - t2
++
++    def _compute(self, layer, gi: int, base: int, n: int, xq, sf, topk_weights, ids, acc, stats):
++        from flashinfer import block_scale_interleave
++
++        slot = self.slots[gi % 2]
++        N = self.N
++        t0 = time.perf_counter()
++        cur = torch.cuda.current_stream(self.device)
++        if SYNC_DMA:
++            # Diagnostic: host-wait for this group's DMA before launching.
++            slot.dma_done.synchronize()
++            stats["hostwait"] += time.perf_counter() - t0
++            t0 = time.perf_counter()
++        cur.wait_event(slot.dma_done)
++        # Scales: swap halves, bf16 -> ue8m0, interleave as the resident prepare does.
++        raw13 = slot.w13_scale_raw[:n]
++        if UP_FIRST:
++            s13 = _bf16_to_ue8m0(raw13)
++        else:
++            s13 = torch.empty_like(slot.w13_weight_scale[:n])
++            s13[:, :N] = _bf16_to_ue8m0(raw13[:, N:])
++            s13[:, N:] = _bf16_to_ue8m0(raw13[:, :N])
++        slot.w13_weight_scale[:n].copy_(block_scale_interleave(s13).reshape_as(s13))
++        s2 = _bf16_to_ue8m0(slot.w2_scale_raw[:n])
++        slot.w2_weight_scale[:n].copy_(block_scale_interleave(s2).reshape_as(s2))
++        local = torch.where((ids >= base) & (ids < base + n), ids - base, torch.full_like(ids, -1)).to(torch.int32)
++        t1 = time.perf_counter()
++        # The same call fused_experts_none_to_flashinfer_mxfp4 makes for the
++        # resident experts (SM120 MXFP8 x MXFP4), on the slot's n experts.
++        out = self._out
++        gscale = self.global_scale[:n]
++        if NOMOE:
++            # Diagnostic: skip FlashInfer, touch the slot with a trivial kernel
++            # on the compute stream instead (output is wrong on purpose).
++            acc.add_(slot.w13_weight[0, 0, :1].to(torch.bfloat16).sum())
++            slot.compute_done.record(cur)
++            slot.compute_used = True
++            stats["prep_enq"] += time.perf_counter() - t0
++            return
++        self._cutlass_fused_moe(
++            input=xq,
++            token_selected_experts=local,
++            token_final_scales=topk_weights,
++            fc1_expert_weights=slot.w13_weight[:n].view(torch.int64),
++            fc2_expert_weights=slot.w2_weight[:n].view(torch.int64),
++            output_dtype=torch.bfloat16,
++            quant_scales=[
++                slot.w13_weight_scale[:n].view(torch.int32),
++                gscale,
++                slot.w2_weight_scale[:n].view(torch.int32),
++                gscale,
++            ],
++            input_sf=sf,
++            fc1_expert_biases=None,
++            fc2_expert_biases=None,
++            swiglu_alpha=None,
++            swiglu_beta=None,
++            swiglu_limit=None if self.swiglu_limit is None else self.swiglu_limit[:n],
++            tp_size=layer.moe_tp_size,
++            tp_rank=layer.moe_tp_rank,
++            ep_size=layer.moe_ep_size,
++            ep_rank=layer.moe_ep_rank,
++            use_w4_group_scaling=False,
++            use_mxfp8_act_scaling=True,
++            activation_type=self._activation_type,
++            tune_max_num_tokens=self._tune_tokens,
++            output=out,
++            use_fused_finalize=self._use_fused_finalize,
++            workspace_buffer=self._workspace,
++        )
++        acc.add_(out)
++        slot.compute_done.record(cur)
++        slot.compute_used = True
++        t2 = time.perf_counter()
++        stats["prep_enq"] += t1 - t0
++        stats["moe_enq"] += t2 - t1
++
++    def _cutlass_rows(self, **kw):
++        """sglang-kt-stream-row-block-dsv41.py: the CUTLASS MoE over blocks of
++        KT_GPU_STREAM_ROW_BLOCK rows (input, ids, weights and output cut alike)."""
++        rows = kw["input"].shape[0]
++        step = _block_rows(rows)
++        if step >= rows:
++            return self._cutlass_fused_moe(**kw)
++        for r0 in range(0, rows, step):
++            r1 = min(rows, r0 + step)
++            part = dict(kw)
++            for k in ("input", "token_selected_experts", "token_final_scales", "output"):
++                part[k] = kw[k][r0:r1]
++            self._cutlass_fused_moe(**part)
++        return kw["output"]
++
++    def _group_body(self, layer, gi: int, base: int, n: int, xq, sf, topk_weights, ids32, acc, out):
++        """Scale prep + MoE + accumulate for one group, on the current stream.
++        Captured into a graph in graph mode; run eagerly otherwise."""
++        from flashinfer import block_scale_interleave
++
++        slot = self.slots[gi % 2]
++        N, K = self.N, self.K
++        if ZEROCOPY and W16:
++            w13_bytes = N * K // 2
++            w13_s = N * (K // 32)
++            w2_bytes = K * N // 2
++            w2_s = K * (N // 32)
++            wstride = slot.raw.shape[2]
++            sstride_f = slot.raw_s.shape[2] // 4
++            raw_s_f = slot.raw_s.view(torch.float32)
++            # CUTLASS fc1 rows are [up; gate]: up into rows :N, gate into N:.
++            _mxfp4_dequant(slot.raw[1], wstride, raw_s_f[1], sstride_f,
++                           self.w13_bf16[:n, :N], n, N, K)
++            _mxfp4_dequant(slot.raw[0], wstride, raw_s_f[0], sstride_f,
++                           self.w13_bf16[:n, N:], n, N, K)
++            _mxfp4_dequant(slot.raw[2], wstride, raw_s_f[2], sstride_f,
++                           self.w2_bf16[:n], n, K, N)
++            local = torch.where((ids32 >= base) & (ids32 < base + n), ids32 - base, torch.full_like(ids32, -1))
++            out.zero_()
++            self._cutlass_rows(
++                input=xq,  # bf16 activations in this mode
++                token_selected_experts=local,
++                token_final_scales=topk_weights,
++                fc1_expert_weights=self.w13_bf16[:n],
++                fc2_expert_weights=self.w2_bf16[:n],
++                output_dtype=torch.bfloat16,
++                quant_scales=None,
++                input_sf=None,
++                swiglu_limit=(
++                    self.swiglu_limit[:n]
++                    if SWIGLU_CLAMP and self.swiglu_limit is not None else None
++                ),
++                tp_size=layer.moe_tp_size,
++                tp_rank=layer.moe_tp_rank,
++                ep_size=layer.moe_ep_size,
++                ep_rank=layer.moe_ep_rank,
++                activation_type=self._activation_type,
++                tune_max_num_tokens=self._tune_tokens,
++                output=out,
++                use_fused_finalize=self._use_fused_finalize,
++                workspace_buffer=self._workspace,
++            )
++            acc.add_(out)
++            if self._clamp_counts is not None:
++                self._count_clamp(xq, local, n)
++            return
++        if ZEROCOPY:
++            # raw[0]=gate, raw[1]=up, raw[2]=down packed weights; raw_s the
++            # fp32 group scales in the same order. Weights go to the CUTLASS
++            # [up; gate] rows, scales become e8m0 bytes and get interleaved.
++            w13_bytes = N * K // 2
++            w13_s = N * (K // 32)
++            w2_bytes = K * N // 2
++            w2_s = K * (N // 32)
++            raw = slot.raw[:, :n]
++            raw_s = slot.raw_s[:, :n]
++            slot.w13_weight[:n, :N].copy_(raw[1, :, :w13_bytes].view(n, N, K // 2))
++            slot.w13_weight[:n, N:].copy_(raw[0, :, :w13_bytes].view(n, N, K // 2))
++            s13 = torch.empty_like(slot.w13_weight_scale[:n])
++            s13[:, :N] = _bf16_to_ue8m0(raw_s[1, :, :4 * w13_s].view(torch.float32).view(n, N, K // 32))
++            s13[:, N:] = _bf16_to_ue8m0(raw_s[0, :, :4 * w13_s].view(torch.float32).view(n, N, K // 32))
++            slot.w13_weight_scale[:n].copy_(block_scale_interleave(s13).reshape_as(s13))
++            slot.w2_weight[:n].copy_(raw[2, :, :w2_bytes].view(n, K, N // 2))
++            s2 = _bf16_to_ue8m0(raw_s[2, :, :4 * w2_s].view(torch.float32).view(n, K, N // 32))
++            slot.w2_weight_scale[:n].copy_(block_scale_interleave(s2).reshape_as(s2))
++        else:
++            raw13 = slot.w13_scale_raw[:n]
++            if UP_FIRST:
++                s13 = _bf16_to_ue8m0(raw13)
++            else:
++                s13 = torch.empty_like(slot.w13_weight_scale[:n])
++                s13[:, :N] = _bf16_to_ue8m0(raw13[:, N:])
++                s13[:, N:] = _bf16_to_ue8m0(raw13[:, :N])
++            slot.w13_weight_scale[:n].copy_(block_scale_interleave(s13).reshape_as(s13))
++            s2 = _bf16_to_ue8m0(slot.w2_scale_raw[:n])
++            slot.w2_weight_scale[:n].copy_(block_scale_interleave(s2).reshape_as(s2))
++        local = torch.where((ids32 >= base) & (ids32 < base + n), ids32 - base, torch.full_like(ids32, -1))
++        gscale = self.global_scale[:n]
++        self._cutlass_fused_moe(
++            input=xq,
++            token_selected_experts=local,
++            token_final_scales=topk_weights,
++            fc1_expert_weights=slot.w13_weight[:n].view(torch.int64),
++            fc2_expert_weights=slot.w2_weight[:n].view(torch.int64),
++            output_dtype=torch.bfloat16,
++            quant_scales=[
++                slot.w13_weight_scale[:n].view(torch.int32),
++                gscale,
++                slot.w2_weight_scale[:n].view(torch.int32),
++                gscale,
++            ],
++            input_sf=sf,
++            fc1_expert_biases=None,
++            fc2_expert_biases=None,
++            swiglu_alpha=None,
++            swiglu_beta=None,
++            swiglu_limit=None if self.swiglu_limit is None else self.swiglu_limit[:n],
++            tp_size=layer.moe_tp_size,
++            tp_rank=layer.moe_tp_rank,
++            ep_size=layer.moe_ep_size,
++            ep_rank=layer.moe_ep_rank,
++            use_w4_group_scaling=False,
++            use_mxfp8_act_scaling=True,
++            activation_type=self._activation_type,
++            tune_max_num_tokens=self._tune_tokens,
++            output=out,
++            use_fused_finalize=self._use_fused_finalize,
++            workspace_buffer=self._workspace,
++        )
++        acc.add_(out)
++
++    def _count_clamp(self, x, local, n: int):
++        """KT_SWIGLU_COUNT=1: device-side counts of the gate/up values the
++        clamp changes, for the (token, expert) pairs this group serves.
++        x: bf16 [T, K]; local: [T, topk] group-local ids or -1. w13_bf16 rows
++        are [up; gate] (CUTLASS order). Pure device ops on persistent
++        tensors, so it is captured with the group graph."""
++        N, lim = self.N, self.swiglu_limit_value
++        T = x.shape[0]
++        h = torch.matmul(x, self.w13_bf16[:n].reshape(n * 2 * N, -1).t()).view(T, n, 2 * N)
++        routed = torch.zeros((T, n + 1), dtype=torch.bool, device=x.device)
++        routed.scatter_(1, torch.where(local >= 0, local, torch.full_like(local, n)).to(torch.int64), True)
++        m = routed[:, :n].unsqueeze(-1)  # [T, n, 1]
++        up, gate = h[..., :N], h[..., N:]
++        row = torch.stack([
++            ((gate > lim) & m).sum(),
++            ((up > lim) & m).sum(),
++            ((up < -lim) & m).sum(),
++            m.sum() * N,
++        ])
++        self._clamp_counts.index_add_(0, self._clamp_lid, row.view(1, 4))
++
++    def _report_clamp(self):
++        if self._clamp_counts is None:
++            return
++        self._clamp_runs += 1
++        if self._clamp_runs % max(1, SWIGLU_COUNT_EVERY):
++            return
++        c = self._clamp_counts.cpu().tolist()
++        for lid, (g, up_hi, up_lo, tot) in enumerate(c):
++            if tot:
++                _log(f"rank{self.rank} swiglu-count layer{lid}: gate>lim {g} up>lim {up_hi} "
++                     f"up<-lim {up_lo} of {tot} elements ({(g + up_hi + up_lo) / tot * 1e6:.1f} ppm)")
++        self._clamp_counts.zero_()
++
++    _FP4_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
++                -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
++
++    def _dequant_raw(self, packed: torch.Tensor, scales: torch.Tensor, rows: int, cols: int):
++        """MXFP4 packed bytes [rows, cols/2] (low nibble first) and fp32 group
++        scales [rows, cols/32] -> fp32 [rows, cols] on the GPU."""
++        lut = torch.tensor(self._FP4_LUT, dtype=torch.float32, device=packed.device)
++        b = packed.view(rows, cols // 2).to(torch.int32)
++        lo = lut[b & 0xF]
++        hi = lut[(b >> 4) & 0xF]
++        vals = torch.stack([lo, hi], dim=-1).view(rows, cols)
++        return vals * scales.view(rows, cols // 32).repeat_interleave(32, dim=1)
++
++    def _reference_check(self, layer_idx: int, gi: int, base: int, n: int, x, ids, topk_weights, out):
++        """KT_GPU_STREAM_SELFTEST=2: recompute this group's contribution for a
++        few tokens in torch from the slot's raw arena bytes (as the DMA left
++        them) and compare with the CUTLASS output. Reports both fc1 orders so
++        a swapped gate/up shows up as the other order matching."""
++        slot = self.slots[gi % 2]
++        N, K = self.N, self.K
++        w13_bytes = N * K // 2
++        w13_s = N * (K // 32)
++        w2_bytes = K * N // 2
++        w2_s = K * (N // 32)
++        raw = slot.raw[:, :n]
++        raw_s = slot.raw_s[:, :n]
++        ids64 = ids.to(torch.int64)
++        hit = ((ids64 >= base) & (ids64 < base + n)).any(dim=1).nonzero().flatten()[:4]
++        if hit.numel() == 0:
++            return
++        xf = x.float()
++        # The same reference from the MXFP8-quantized activations (linear
++        # scale layout, dequantized here), to tell input-quantization loss
++        # from anything downstream in the kernel.
++        from flashinfer import mxfp8_quantize as _mxq
++        xq_lin, sf_lin = _mxq(x, is_sf_swizzled_layout=False, alignment=32)
++        sf_f = torch.ldexp(torch.ones_like(sf_lin, dtype=torch.float32), sf_lin.to(torch.int32) - 127)
++        xdq = xq_lin.float().view(x.shape[0], K // 32, 32) * sf_f.view(x.shape[0], K // 32, 1)
++        xdq = xdq.view(x.shape[0], K)
++        xq_rel = ((xdq - xf).norm(dim=1) / xf.norm(dim=1).clamp(min=1e-6))
++        ref = torch.zeros((hit.numel(), K), dtype=torch.float32, device=x.device)
++        ref_swapped = torch.zeros_like(ref)
++        ref_q = torch.zeros_like(ref)
++        ref_clip = torch.zeros_like(ref)  # intermediate clipped to the e4m3 range
++        ref_hq = torch.zeros_like(ref)  # intermediate through MXFP8 (e4m3, e8m0 per 32)
++        hmax = 0.0
++
++        def mxfp8(v):
++            blk = v.view(-1, 32)
++            amax = blk.abs().amax(dim=1, keepdim=True).clamp(min=1e-30)
++            sc = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
++            return ((blk / sc).to(torch.float8_e4m3fn).float() * sc).view_as(v)
++        cache = {}
++        for ti, t in enumerate(hit.tolist()):
++            for k in range(ids64.shape[1]):
++                e = int(ids64[t, k])
++                if not (base <= e < base + n):
++                    continue
++                le = e - base
++                if le not in cache:
++                    g_w = self._dequant_raw(raw[0, le, :w13_bytes], raw_s[0, le, :4 * w13_s].view(torch.float32), N, K)
++                    u_w = self._dequant_raw(raw[1, le, :w13_bytes], raw_s[1, le, :4 * w13_s].view(torch.float32), N, K)
++                    d_w = self._dequant_raw(raw[2, le, :w2_bytes], raw_s[2, le, :4 * w2_s].view(torch.float32), K, N)
++                    cache[le] = (g_w, u_w, d_w)
++                g_w, u_w, d_w = cache[le]
++                wgt = float(topk_weights[t, k])
++                gx = xf[t] @ g_w.t()
++                ux = xf[t] @ u_w.t()
++                if SWIGLU_CLAMP and self.swiglu_limit_value is not None:
++                    gx = gx.clamp(max=self.swiglu_limit_value)
++                    ux = ux.clamp(-self.swiglu_limit_value, self.swiglu_limit_value)
++                ref[ti] += wgt * ((torch.nn.functional.silu(gx) * ux) @ d_w.t())
++                ref_swapped[ti] += wgt * ((torch.nn.functional.silu(ux) * gx) @ d_w.t())
++                gq = xdq[t] @ g_w.t()
++                uq = xdq[t] @ u_w.t()
++                if SWIGLU_CLAMP and self.swiglu_limit_value is not None:
++                    gq = gq.clamp(max=self.swiglu_limit_value)
++                    uq = uq.clamp(-self.swiglu_limit_value, self.swiglu_limit_value)
++                hq = torch.nn.functional.silu(gq) * uq
++                ref_q[ti] += wgt * (hq @ d_w.t())
++                hmax = max(hmax, float(hq.abs().max()))
++                ref_clip[ti] += wgt * (hq.clamp(-448.0, 448.0) @ d_w.t())
++                ref_hq[ti] += wgt * (mxfp8(hq) @ d_w.t())
++        got = out[hit].float()
++        def cmp(r):
++            cos = torch.nn.functional.cosine_similarity(got.flatten(), r.flatten(), dim=0).item()
++            rel = ((got - r).norm() / r.norm().clamp(min=1e-6)).item()
++            return cos, rel
++        c1, r1 = cmp(ref)
++        c2, r2 = cmp(ref_swapped)
++        c3, r3 = cmp(ref_q)
++        c4, r4 = cmp(ref_clip)
++        c5, r5 = cmp(ref_hq)
++        ratio5 = (got.norm() / ref_hq.norm().clamp(min=1e-6)).item()
++        per_tok = [(f"{float(xq_rel[t]):.3f}", f"{float(xf[t].norm()):.0f}") for t in hit.tolist()]
++        _log(f"rank{self.rank} refcheck layer{layer_idx} gi={gi} base={base} n={n} tokens={hit.tolist()}: "
++             f"cos={c1:.5f} rel={r1:.4f} | swapped-fc1 cos={c2:.5f} rel={r2:.4f} | "
++             f"from mxfp8(x): cos={c3:.5f} rel={r3:.4f} | +mxfp8(h): cos={c5:.5f} rel={r5:.4f} |got|/|ref_hq|={ratio5:.4f} hmax={hmax:.0f} | "
++             f"|got|={got.norm().item():.3f} |ref|={ref.norm().item():.3f} |ref_q|={ref_q.norm().item():.3f}")
++
++    def _graph_inputs(self, T: int, x, physical_ids, topk_weights):
++        """Persistent input/output buffers for this token count."""
++        from flashinfer import mxfp8_quantize
++
++        g = self._gin.get(T)
++        if W16:
++            xq, sf = x, None
++        else:
++            xq, sf = mxfp8_quantize(x, is_sf_swizzled_layout=True, alignment=32)
++        if g is None and SHARED_INPUTS:
++            k = physical_ids.shape[1]
++            g = {
++                "xq": self._gin_view("xq", T, xq.shape, xq.dtype, x.device),
++                "sf": None if sf is None else self._gin_view("sf", T, sf.shape, sf.dtype, x.device),
++                "ids": self._gin_view("ids", T, (T, k), torch.int32, x.device),
++                "w": self._gin_view("w", T, (T, k), torch.float32, x.device),
++                "acc": self._gin_view("acc", T, (T, self.K), torch.bfloat16, x.device),
++                "out": self._gin_view("out", T, (T, self.K), torch.bfloat16, x.device),
++            }
++            self._gin[T] = g
++            g["xq"].copy_(xq)
++            if sf is not None:
++                g["sf"].copy_(sf)
++        elif g is None:
++            g = {
++                "xq": xq.clone(),
++                "sf": None if sf is None else sf.clone(),
++                "ids": torch.empty((T, physical_ids.shape[1]), dtype=torch.int32, device=x.device),
++                "w": torch.empty((T, physical_ids.shape[1]), dtype=torch.float32, device=x.device),
++                "acc": torch.zeros((T, self.K), dtype=torch.bfloat16, device=x.device),
++                "out": torch.empty((T, self.K), dtype=torch.bfloat16, device=x.device),
++            }
++            self._gin[T] = g
++        else:
++            g["xq"].copy_(xq)
++            if sf is not None:
++                g["sf"].copy_(sf)
++        g["ids"].copy_(physical_ids)
++        g["w"].copy_(topk_weights)
++        g["acc"].zero_()
++        return g
++
++    def _gin_view(self, name, T, shape, dtype, device):
++        """A view of the head of the shared base for `name`, grown to
++        max(T, 2048) rows' worth of bytes when this T does not fit."""
++        numel = 1
++        for d in shape:
++            numel *= int(d)
++        esize = torch.empty((), dtype=dtype).element_size()
++        need = numel * esize
++        base = self._gin_base.get(name)
++        if base is None or base.numel() < need:
++            rows = max(T, 2048)
++            from sglang.srt.layers.moe import kt_lend
++
++            if kt_lend.ENABLED:  # kt_lend: the whole chunk
++                rows = max(rows, kt_lend._chunk())
++            nbytes = max(need, -(-need * rows // T))
++            nbytes = -(-nbytes // 256) * 256
++            # Views made from an older base keep it (and their graphs) alive.
++            from sglang.srt.layers.moe import kt_lend
++
++            with kt_lend.scratch_region():
++                base = torch.zeros(nbytes, dtype=torch.uint8, device=device)
++            self._gin_base[name] = base
++        return base[:need].view(dtype).view(shape)
++
++    def _trim_graphs(self):
++        """Drop the graphs of the least recently used row counts beyond
++        GRAPH_KEEP, never those of the largest (the full chunk)."""
++        top = max(self._graph_use)
++        old = [t for t in self._graph_use if t != top]
++        if len(old) <= GRAPH_KEEP:
++            return
++        drop = set(old[: len(old) - GRAPH_KEEP])
++        torch.cuda.synchronize(self.device)
++        for k in [k for k in self._graphs if k[0] in drop]:
++            del self._graphs[k]
++        for t in drop:
++            del self._graph_use[t]
++
++    def _graph_for(self, layer, T: int, gi: int, base: int, n: int, g):
++        key = (T, gi)
++        graph = self._graphs.get(key)
++        self._graph_use.pop(T, None)
++        self._graph_use[T] = None
++        if graph is None:
++            t0 = time.perf_counter()
++            # Warm up once eagerly on the capture stream (lazy inits, autotuner
++            # cache), then capture. The slot may hold anything at this point;
++            # only the launch structure matters.
++            cs = self._capture_stream
++            cs.wait_stream(torch.cuda.current_stream(self.device))
++            # The eager warm-up must not touch the real accumulator: it ran
++            # acc.add_ once more than the replay, so the first request per
++            # chunk size carried the streamed experts twice (09-14, found on
++            # the Qwen3.5-35B bf16 edition with a torch reference check).
++            scratch = torch.zeros_like(g["acc"])
++            with torch.cuda.stream(cs):
++                self._group_body(layer, gi, base, n, g["xq"], g["sf"], g["w"], g["ids"], scratch, g["out"])
++            cs.synchronize()
++            del scratch
++            graph = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(graph, pool=self._graph_pool, stream=cs):
++                self._group_body(layer, gi, base, n, g["xq"], g["sf"], g["w"], g["ids"], g["acc"], g["out"])
++            torch.cuda.current_stream(self.device).wait_stream(cs)
++            self._graphs[key] = graph
++            self._trim_graphs()
++            if TIMING:
++                _log(f"rank{self.rank} captured group graph T={T} gi={gi} n={n} in {(time.perf_counter()-t0)*1e3:.0f} ms")
++        return graph
++
++    # -- one layer ----------------------------------------------------------
++
++    def run(self, method, layer, dispatch_output, physical_ids: torch.Tensor) -> torch.Tensor:
++        """Sum of the streamed experts' outputs for this layer, [tokens, hidden]."""
++        from flashinfer import mxfp8_quantize
++        from sglang.srt.utils.common import next_power_of_2
++
++        x = dispatch_output.hidden_states
++        T = x.shape[0]
++        acc = torch.zeros((T, self.K), dtype=torch.bfloat16, device=x.device)
++        if self._out_full is None or self._out_full.shape[0] < T:
++            from sglang.srt.layers.moe import kt_lend
++
++            with kt_lend.scratch_region():
++                self._out_full = torch.empty((T, self.K), dtype=torch.bfloat16, device=x.device)
++        self._out = self._out_full[:T]
++        # W16: the group body calls the MoE over blocks of rows
++        T_call = _block_rows(T) if W16 else T
++        self._tune_tokens = next_power_of_2(T_call)
++        # One MXFP8 quantization of the activations serves every group
++        # (W16 mode feeds the bf16 activations as they are).
++        if W16:
++            xq, sf = x, None
++        else:
++            xq, sf = mxfp8_quantize(x, is_sf_swizzled_layout=True, alignment=32)
++        if self._workspace is None or self._workspace_tokens < T_call:
++            from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
++            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import _workspace_max_tokens
++
++            # Size for the prefill chunk on the first call: a second, larger
++            # allocation on a later chunk size cannot free the first (captured
++            # graphs hold it) and OOMed V4.1 at 15.7 GB (09-16).
++            T_ws = _workspace_max_tokens(T_call)
++            if W16:
++                T_ws = _block_rows(T_ws)
++            nbytes = cutlass_fused_moe_workspace_size(
++                T_ws,
++                self.K,
++                self.N,
++                self.G,
++                physical_ids.shape[1],
++                x_dtype=xq.dtype,
++                weight_dtype=torch.bfloat16 if W16 else torch.int64,
++                output_dtype=torch.bfloat16,
++                activation_type=self._activation_type,
++                tp_size=layer.moe_tp_size,
++                tp_rank=layer.moe_tp_rank,
++                ep_size=layer.moe_ep_size,
++                ep_rank=layer.moe_ep_rank,
++                use_mxfp8_act_scaling=not W16,
++                use_fused_finalize=self._use_fused_finalize,
++                device=x.device,
++            )
++            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
++                get_shared_cutlass_workspace,
++            )
++
++            self._workspace = get_shared_cutlass_workspace(nbytes, x.device)
++            if self._workspace is None:
++                # Not preallocated by the resident method (a non-CUTLASS
++                # resident backend such as Marlin): allocate it here, before
++                # any graph is captured against it.
++                from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
++                    preallocate_shared_cutlass_workspace,
++                )
++
++                from sglang.srt.layers.moe import kt_lend
++
++                with kt_lend.scratch_region():
++                    self._workspace = preallocate_shared_cutlass_workspace(nbytes, x.device)
++            self._workspace_tokens = T_ws
++            _log(f"rank{self.rank} cutlass workspace {nbytes/1e6:.0f} MB for {T_ws} tokens x {self.G} experts")
++        topk_weights = dispatch_output.topk_output.topk_weights
++        first = method.num_gpu_experts
++        last = method.global_num_experts
++        groups = [
++            list(range(b, min(b + self.G, last))) for b in range(first, last, self.G)
++        ]
++        if CPU_GROUPS:
++            groups = groups[: max(1, len(groups) - CPU_GROUPS)]
++        ids = physical_ids.to(torch.int64)
++        stats = {"write": 0.0, "hostwait": 0.0, "dma_enq": 0.0, "prep_enq": 0.0, "moe_enq": 0.0}
++        t0 = time.perf_counter()
++        if USE_GRAPH and not NOMOE:
++            g = self._graph_inputs(T, x, physical_ids, topk_weights)
++            cur = torch.cuda.current_stream(self.device)
++            layer_idx = method.kt_config.layer_idx
++            if ZEROCOPY:
++                self._stage_zc(layer_idx, 0, groups[0], stats)
++            else:
++                self._stage(method, 0, groups[0], stats)
++            if self._clamp_counts is not None:
++                self._clamp_lid.fill_(layer_idx)
++            for gi, experts in enumerate(groups):
++                slot = self.slots[gi % 2]
++                graph = self._graph_for(layer, T, gi, experts[0], len(experts), g)
++                t1 = time.perf_counter()
++                cur.wait_event(slot.dma_done)
++                graph.replay()
++                slot.compute_done.record(cur)
++                slot.compute_used = True
++                stats["moe_enq"] += time.perf_counter() - t1
++                if REFCHECK and layer_idx in REFCHECK_LAYERS and gi < REFCHECK_GROUPS:
++                    cur.synchronize()
++                    try:
++                        self._reference_check(layer_idx, gi, experts[0], len(experts), x, g["ids"], g["w"], g["out"])
++                    except Exception as exc:  # diagnostics must not take the server down
++                        _log(f"rank{self.rank} refcheck failed: {exc!r}")
++                if gi + 1 < len(groups):
++                    if ZEROCOPY:
++                        self._stage_zc(layer_idx, gi + 1, groups[gi + 1], stats)
++                    else:
++                        self._stage(method, gi + 1, groups[gi + 1], stats)
++            if REFCHECK and CPUCHECK and layer_idx in REFCHECK_LAYERS:
++                # Whole-layer check against kt-kernel's CPU experts on the same
++                # input: all-reduce the streamed partial sums (both ranks take
++                # part), then rank 0 runs the CPU path and compares. Only
++                # meaningful with --kt-max-deferred-experts-per-token 0, since
++                # deferral moves 4 of 6 experts into the next layer's output.
++                from sglang.srt.distributed import tensor_model_parallel_all_reduce
++
++                cur.synchronize()
++                full = tensor_model_parallel_all_reduce(g["acc"].clone())
++                cur.synchronize()
++                if self.rank == 0 and method.wrapper is not None:
++                    # the wrapper masked dispatch_output's ids to -1 in place
++                    # (no resident experts); hand the CPU path the real ids.
++                    do = dispatch_output._replace(
++                        topk_output=dispatch_output.topk_output._replace(topk_ids=physical_ids)
++                    )
++                    method.submit(layer, do)
++                    cpu = method.sync(x)
++                    cur.synchronize()
++                    a_ = full.float()
++                    c_ = cpu.float()
++                    cos = torch.nn.functional.cosine_similarity(a_.flatten(), c_.flatten(), dim=0).item()
++                    rel = ((a_ - c_).norm() / c_.norm().clamp(min=1e-6)).item()
++                    ratio = (a_.norm() / c_.norm().clamp(min=1e-6)).item()
++                    # per-token worst
++                    tok_rel = ((a_ - c_).norm(dim=1) / c_.norm(dim=1).clamp(min=1e-6))
++                    _log(f"rank0 cpucheck layer{layer_idx} T={T}: cos={cos:.5f} rel={rel:.4f} "
++                         f"|stream|/|cpu|={ratio:.4f} worst-token rel={tok_rel.max().item():.3f} "
++                         f"at {int(tok_rel.argmax())} median rel={tok_rel.median().item():.4f}")
++            self.calls += 1
++            if TIMING:
++                cur.synchronize()
++                _log(
++                    f"rank{self.rank} layer{method.kt_config.layer_idx} "
++                    f"tokens={T} groups={len(groups)} write={stats['write']*1e3:.0f}ms "
++                    f"hostwait={stats['hostwait']*1e3:.0f}ms dma_enq={stats['dma_enq']*1e3:.0f}ms "
++                    f"graph_enq={stats['moe_enq']*1e3:.0f}ms "
++                    f"total={(time.perf_counter()-t0)*1e3:.0f}ms"
++                )
++            if self._clamp_counts is not None and layer_idx == (getattr(method.kt_config, "num_layers", None) or 0) - 1:
++                self._report_clamp()
++            # The caller adds this before the next layer zeroes it (same stream).
++            return g["acc"]
++        prof = None
++        if PROFILE and self.calls == PROFILE:
++            from torch.profiler import ProfilerActivity, profile
++
++            prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
++            prof.__enter__()
++        self._stage(method, 0, groups[0], stats)
++        for gi, experts in enumerate(groups):
++            self._compute(layer, gi, experts[0], len(experts), xq, sf, topk_weights, ids, acc, stats)
++            if gi + 1 < len(groups):
++                self._stage(method, gi + 1, groups[gi + 1], stats)
++        if prof is not None:
++            prof.__exit__(None, None, None)
++            table = prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=30, max_name_column_width=60)
++            _log(f"rank{self.rank} torch.profiler of layer call {self.calls} (CPU self time):" + chr(10) + table)
++            table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=15, max_name_column_width=60)
++            _log(f"rank{self.rank} torch.profiler of layer call {self.calls} (CUDA time):" + chr(10) + table)
++        self.calls += 1
++        if TIMING:
++            torch.cuda.current_stream(self.device).synchronize()
++            _log(
++                f"rank{self.rank} layer{method.kt_config.layer_idx} "
++                f"tokens={x.shape[0]} groups={len(groups)} write={stats['write']*1e3:.0f}ms "
++                f"hostwait={stats['hostwait']*1e3:.0f}ms dma_enq={stats['dma_enq']*1e3:.0f}ms "
++                f"prep_enq={stats['prep_enq']*1e3:.0f}ms moe_enq={stats['moe_enq']*1e3:.0f}ms "
++                f"total={(time.perf_counter()-t0)*1e3:.0f}ms"
++            )
++        return acc
++
++
++_instance: Optional[KTStreamPrefill] = None
++_failed = False
++
++
++def _start_stack_dumper():
++    """KT_GPU_STREAM_DEBUG=<seconds>: print the main thread's stack every
++    <seconds> (ptrace is off on this host, so py-spy cannot)."""
++    period = float(os.environ.get("KT_GPU_STREAM_DEBUG", "0") or 0)
++    if period <= 0:
++        return
++    import sys
++    import threading
++
++    main_id = threading.main_thread().ident
++    rank = get_tensor_model_parallel_rank()
++
++    def loop():
++        while True:
++            time.sleep(period)
++            fr = sys._current_frames().get(main_id)
++            if fr is None:
++                continue
++            _log(f"rank{rank} main thread stack:" + chr(10) + "".join(traceback.format_stack(fr)[-12:]))
++
++    threading.Thread(target=loop, daemon=True, name="kt-stream-stackdump").start()
++
++
++_ckpt_cache = {}
++
++
++def _ckpt_expert(layer_idx: int, logical: int, rank: int, world: int, N: int, K: int, device):
++    """This rank's TP slice of one routed expert straight from the checkpoint
++    (I8 packed weights + E8M0 scales), dequantized to fp32: (gate, up, down)
++    with gate/up [N, K] and down [K, N]."""
++    import json
++    from safetensors import safe_open
++
++    from sglang.srt.server_args import get_global_server_args
++
++    model = get_global_server_args().model_path
++    idx = _ckpt_cache.get("index")
++    if idx is None:
++        idx = json.load(open(os.path.join(model, "model.safetensors.index.json")))["weight_map"]
++        _ckpt_cache["index"] = idx
++
++    def load(name):
++        f = idx[name]
++        h = _ckpt_cache.get(f)
++        if h is None:
++            h = safe_open(os.path.join(model, f), "pt", device="cpu")
++            _ckpt_cache[f] = h
++        return h.get_tensor(name)
++
++    def deq(w_u8, sc, rows, cols):
++        e = sc.contiguous().view(torch.uint8).to(torch.int32) - 127
++        scf = torch.ldexp(torch.ones(e.shape, dtype=torch.float32), e).to(device)
++        lut = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
++                            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], device=device)
++        b = w_u8.contiguous().view(torch.uint8).to(device).to(torch.int32)
++        v = torch.stack([lut[b & 0xF], lut[(b >> 4) & 0xF]], dim=-1).view(rows, cols)
++        return v * scf.view(rows, cols // 32).repeat_interleave(32, dim=1)
++
++    base = f"layers.{layer_idx}.ffn.experts.{logical}."
++    r0, r1 = rank * N, (rank + 1) * N
++    g = deq(load(base + "w1.weight")[r0:r1], load(base + "w1.scale")[r0:r1], N, K)
++    u = deq(load(base + "w3.weight")[r0:r1], load(base + "w3.scale")[r0:r1], N, K)
++    d = deq(load(base + "w2.weight")[:, r0 // 2:r1 // 2], load(base + "w2.scale")[:, r0 // 32:r1 // 32], K, N)
++    return g, u, d
++
++
++def hot_reference_check(method, layer, x, physical_ids, topk_weights, gpu_out, streamer):
++    """KT_HOT_CHECK=1: torch reference of the resident (hot) experts' output
++    for a few tokens, from the checkpoint tensors of the logical experts the
++    placement put in the GPU slots, against what the resident GPU method
++    returned for this rank's TP slice."""
++    try:
++        layer_idx = method.kt_config.layer_idx
++        if layer_idx not in REFCHECK_LAYERS:
++            return
++        from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
++
++        meta = get_global_expert_location_metadata()
++        p2l = meta.physical_to_logical_map_cpu[layer_idx].tolist() if meta is not None else list(range(4096))
++        n_hot = method.num_gpu_experts
++        N, K = streamer.N, streamer.K
++        ids64 = physical_ids.to(torch.int64)
++        hit = (ids64 < n_hot).any(dim=1).nonzero().flatten()[:4]
++        if hit.numel() == 0:
++            _log(f"rank{streamer.rank} hotcheck layer{layer_idx}: no token uses a hot expert")
++            return
++        torch.cuda.synchronize()
++        xf = x.float()
++        ref = torch.zeros((hit.numel(), K), dtype=torch.float32, device=x.device)
++        cache = {}
++        for ti, t in enumerate(hit.tolist()):
++            for k in range(ids64.shape[1]):
++                e = int(ids64[t, k])
++                if e >= n_hot:
++                    continue
++                if e not in cache:
++                    cache[e] = _ckpt_expert(layer_idx, p2l[e], streamer.rank, streamer.world, N, K, x.device)
++                g_w, u_w, d_w = cache[e]
++                wgt = float(topk_weights[t, k])
++                gx, ux = xf[t] @ g_w.t(), xf[t] @ u_w.t()
++                lim = getattr(streamer, "swiglu_limit_value", None)
++                if SWIGLU_CLAMP and lim is not None:
++                    gx, ux = gx.clamp(max=lim), ux.clamp(-lim, lim)
++                h = torch.nn.functional.silu(gx) * ux
++                ref[ti] += wgt * (h @ d_w.t())
++        got = gpu_out[hit].float()
++        cos = torch.nn.functional.cosine_similarity(got.flatten(), ref.flatten(), dim=0).item()
++        rel = ((got - ref).norm() / ref.norm().clamp(min=1e-6)).item()
++        ratio = (got.norm() / ref.norm().clamp(min=1e-6)).item()
++        _log(f"rank{streamer.rank} hotcheck layer{layer_idx} tokens={hit.tolist()} "
++             f"physical={sorted(cache)} logical={[p2l[e] for e in sorted(cache)]}: "
++             f"cos={cos:.5f} rel={rel:.4f} |got|/|ref|={ratio:.4f} |ref|={ref.norm().item():.3f}")
++    except Exception as exc:
++        _log(f"hotcheck failed: {exc!r}")
++
++
++# KT_GPU_STREAM_EARLY_INIT=1: build the streamer and cudaHostRegister every
++# layer's arenas right after the weights load, instead of on the first
++# qualifying request. On V4.1 (336 GB of arenas, a third of them on 4K pages
++# after the load fragmented memory) the lazy registration cost the first
++# request 500 s (layer 38 alone 96 s); at startup it is the same total but
++# nobody is waiting on a reply. Takes device memory for the slots before the
++# KV pool is sized, so only for models whose pool is far below the cap.
++EARLY_INIT = os.environ.get("KT_GPU_STREAM_EARLY_INIT", "0") == "1"
++
++
++def stream_prefill_init_early(method, layer) -> None:
++    global _instance, _failed
++    if not EARLY_INIT or STREAM_THRESHOLD <= 0 or _failed or _instance is not None:
++        return
++    rank = get_tensor_model_parallel_rank()
++    t0 = time.time()
++    try:
++        _instance = KTStreamPrefill(method, layer)
++        _start_stack_dumper()
++        if ZEROCOPY:
++            for layer_idx in sorted(_instance._arenas):
++                _instance._register_arenas(layer_idx)
++    except Exception:
++        _failed = True
++        _log("early init failed:\n" + traceback.format_exc())
++        raise
++    _log(f"rank {rank}: streamer built and {len(_instance._arenas)} layers of arenas registered "
++         f"at load time in {time.time() - t0:.0f} s")
++
++
++def stream_prefill_for(method, layer, num_tokens: int) -> Optional[KTStreamPrefill]:
++    """The per-rank streamer when this call qualifies, else None."""
++    global _instance, _failed
++    if STREAM_THRESHOLD <= 0 or _failed:
++        return None
++    if num_tokens < STREAM_THRESHOLD:
++        if TIMING and _instance is not None and num_tokens > 1:
++            _log(f"rank{get_tensor_model_parallel_rank()} layer{method.kt_config.layer_idx} tokens={num_tokens} below threshold, CPU path")
++        return None
++    if torch.cuda.is_current_stream_capturing():
++        return None
++    if _instance is None:
++        _log(
++            f"rank {get_tensor_model_parallel_rank()}: first qualifying call, "
++            f"layer {method.kt_config.layer_idx}, tokens={num_tokens}"
++        )
++        try:
++            _instance = KTStreamPrefill(method, layer)
++            _start_stack_dumper()
++        except Exception:
++            _failed = True
++            _log("init failed:\n" + traceback.format_exc())
++            raise
++    return _instance
++
++
++def stream_cpu_cutoff(method, streamer) -> int:
++    """First physical expert id the CPU takes under KT_STREAM_CPU_GROUPS
++    (== global_num_experts when the share is off)."""
++    first = method.num_gpu_experts
++    last = method.global_num_experts
++    if not CPU_GROUPS:
++        return last
++    n_groups = -(-(last - first) // streamer.G)
++    kept = max(1, n_groups - CPU_GROUPS)
++    return min(last, first + kept * streamer.G)
+diff --git a/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py b/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
+index 950591ca..8115cb70 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
++++ b/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
+@@ -11,6 +11,8 @@ from __future__ import annotations
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Optional
+ 
++import logging
++
+ import torch
+ 
+ from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
+@@ -112,6 +114,111 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
+     padded_hidden: Optional[int] = None
+ 
+ 
++# One persistent CUTLASS MoE workspace per device, shared by every caller
++# in the process (the resident-expert path here and the KT streamed-prefill
++# groups). Without it the runner allocates ~244 MB per call through the
++# caching allocator; beside a 1M-token KV pool on a 16 GB card that is an
++# OOM waiting for a fragmented moment (09-13), and the allocation is one more
++# host-side stall while a DMA holds the PCIe link.
++logger = logging.getLogger(__name__)
++_shared_cutlass_workspace = {}
++# The buffer is baked into the decode CUDA graphs by address, so it is
++# allocated once, before any capture (preallocate_shared_cutlass_workspace
++# from Mxfp4FlashinferCutlassMoEMethod.create_moe_runner), sized for the
++# prefill chunk and the largest expert group any caller uses, and never
++# replaced. Replacing it (09-13: allocate small during capture, grow at the
++# first prefill, drop the old one) left the decode graphs scribbling into
++# freed memory; whether that hit live tensors depended on allocation
++# history, and it did after a three-chunk prefill. Allocating inside a
++# capture put the buffer in the graph's private pool, which was no better.
++
++
++def _kt_streamed_prefill() -> bool:
++    """Inside a KT prefill window (the lend's prefill phase)."""
++    try:
++        from sglang.srt.layers.moe import kt_lend
++    except ImportError:
++        return False
++    return kt_lend.ENABLED and kt_lend.phase() == "prefill"
++
++
++def get_shared_cutlass_workspace(nbytes: int, device: torch.device) -> Optional[torch.Tensor]:
++    """The preallocated buffer if it is large enough, else None (the caller
++    lets FlashInfer allocate for that call) with a loud warning."""
++    key = device.index if device.index is not None else torch.cuda.current_device()
++    ws = _shared_cutlass_workspace.get(key)
++    if ws is None or ws.numel() < nbytes:
++        logger.warning(
++            "shared CUTLASS MoE workspace too small or missing (%d MB needed, %s); "
++            "falling back to a per-call allocation",
++            nbytes >> 20,
++            "none" if ws is None else f"{ws.numel() >> 20} MB",
++        )
++        return None
++    return ws
++
++
++def preallocate_shared_cutlass_workspace(nbytes: int, device: torch.device) -> torch.Tensor:
++    assert not torch.cuda.is_current_stream_capturing()
++    key = device.index if device.index is not None else torch.cuda.current_device()
++    ws = _shared_cutlass_workspace.get(key)
++    if ws is None or ws.numel() < nbytes:
++        ws = torch.empty(nbytes, dtype=torch.uint8, device=device)
++        _shared_cutlass_workspace[key] = ws
++        logger.info("shared CUTLASS MoE workspace: %d MB on %s", nbytes >> 20, device)
++    return ws
++
++
++def _workspace_max_tokens(num_tokens: int) -> int:
++    """Size the shared workspace for the prefill chunk on the first call so it
++    is not re-allocated (and the old one retired) on the first real prefill."""
++    try:
++        from sglang.srt.server_args import get_global_server_args
++
++        chunk = get_global_server_args().chunked_prefill_size or 0
++    except Exception:
++        chunk = 0
++    # sglang-kt-stream-row-block-dsv41.py: a streamed prefill's calls see a block at most
++    from sglang.srt.layers.moe.kt_stream_prefill import _block_rows
++
++    return max(num_tokens, _block_rows(chunk))
++
++
++def mxfp4_workspace_nbytes(num_tokens, hidden, inter, num_experts_total, topk, x_dtype,
++                           activation_type, tp_size, tp_rank, ep_size, ep_rank,
++                           use_mxfp8_act_scaling, device, weight_dtype=torch.int64):
++    from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
++
++    return cutlass_fused_moe_workspace_size(
++        _workspace_max_tokens(num_tokens),
++        hidden,
++        inter,
++        num_experts_total,
++        topk,
++        x_dtype=x_dtype,
++        weight_dtype=weight_dtype,
++        output_dtype=torch.bfloat16,
++        activation_type=activation_type,
++        tp_size=tp_size,
++        tp_rank=tp_rank,
++        ep_size=ep_size,
++        ep_rank=ep_rank,
++        use_w4_group_scaling=not use_mxfp8_act_scaling,
++        use_mxfp8_act_scaling=use_mxfp8_act_scaling,
++        use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
++        device=device,
++    )
++
++
++def _mxfp4_workspace(x, quant_info, topk, activation_type, use_mxfp8_act_scaling):
++    w2 = quant_info.w2_weight
++    nbytes = mxfp4_workspace_nbytes(
++        x.shape[0], w2.shape[1], w2.shape[2] * 2, w2.shape[0] * quant_info.moe_ep_size, topk,
++        x.dtype, activation_type, quant_info.moe_tp_size, quant_info.moe_tp_rank,
++        quant_info.moe_ep_size, quant_info.moe_ep_rank, use_mxfp8_act_scaling, x.device)
++    return get_shared_cutlass_workspace(nbytes, x.device)
++
++
+ def _flashinfer_cutlass_fused_moe():
+     if not is_flashinfer_available():
+         raise RuntimeError(
+@@ -320,6 +427,33 @@ def fused_experts_none_to_flashinfer_mxfp4(
+         f"Unexpected quant_info type for flashinfer_mxfp4: {type(quant_info)}"
+     )
+ 
++    # sglang-kt-stream-row-block-dsv41.py: during a KT streamed prefill the
++    # resident experts run over blocks of rows (KT_GPU_STREAM_ROW_BLOCK), each
++    # quantizing its own activations, so the workspace is a block's
++    from sglang.srt.layers.moe.kt_stream_prefill import _block_rows
++
++    rows = dispatch_output.hidden_states.shape[0]
++    step = _block_rows(rows)
++    if (step < rows and dispatch_output.hidden_states_scale is None
++            and getattr(dispatch_output, "hidden_states_pre_quant", None) is None
++            and _kt_streamed_prefill()):
++        topk = dispatch_output.topk_output
++        if TopKOutputChecker.format_is_bypassed(topk):
++            topk = topk.to_standard()
++        out = None
++        for r0 in range(0, rows, step):
++            r1 = min(rows, r0 + step)
++            part_topk = type(topk)(*[
++                f[r0:r1] if isinstance(f, torch.Tensor) and f.dim() > 0 and f.shape[0] == rows else f
++                for f in topk])
++            part = dispatch_output._replace(
++                hidden_states=dispatch_output.hidden_states[r0:r1], topk_output=part_topk)
++            y = fused_experts_none_to_flashinfer_mxfp4(part, quant_info, runner_config).hidden_states
++            if out is None:
++                out = torch.empty((rows,) + tuple(y.shape[1:]), dtype=y.dtype, device=y.device)
++            out[r0:r1].copy_(y)
++        return StandardCombineInput(hidden_states=out)
++
+     flashinfer_cutlass_fused_moe, ActivationType = _flashinfer_cutlass_fused_moe()
+ 
+     x = dispatch_output.hidden_states
+@@ -408,6 +542,14 @@ def fused_experts_none_to_flashinfer_mxfp4(
+     humming_kwargs = {"use_wfp4afp8_humming": True} if use_wfp4afp8_humming else {}
+     with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+         out = torch.empty(x.shape[0], out_hidden, dtype=output_dtype, device=x.device)
++    activation_type = (
++        ActivationType.SwigluStep if quant_info.use_swiglu_step else ActivationType.Swiglu
++    )
++    workspace_kwargs = {}
++    if use_mxfp8_act_scaling and not use_wfp4afp8_humming:
++        ws = _mxfp4_workspace(x, quant_info, topk_ids.shape[1], activation_type, use_mxfp8_act_scaling)
++        if ws is not None:
++            workspace_kwargs = {"workspace_buffer": ws}
+ 
+     flashinfer_cutlass_fused_moe(
+         input=x,
+@@ -438,6 +580,7 @@ def fused_experts_none_to_flashinfer_mxfp4(
+         output=out,
+         use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+         **humming_kwargs,
++        **workspace_kwargs,
+     )
+ 
+     if do_pad:
+diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
+index a453d4aa..f17d3b2b 100644
+--- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
++++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
+@@ -113,6 +113,9 @@ class Mxfp4FlashinferCutlassMoEMethod:
+         clamp_limit = (
+             gemm1_clamp_limit if gemm1_clamp_limit is not None else swiglu_limit
+         )
++        # The scalar as well: with zero resident experts the tensor is empty
++        # and the streamed prefill (kt_stream_prefill.py) needs the value.
++        self._swiglu_limit_value = None if clamp_limit is None else float(clamp_limit)
+         if clamp_limit is not None:
+             self._swiglu_limit_tensor = torch.full(
+                 (E,), float(clamp_limit), dtype=torch.float32, device=device
+@@ -126,6 +129,44 @@ class Mxfp4FlashinferCutlassMoEMethod:
+ 
+         self.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, moe_runner_config)
+ 
++        # Preallocate the process-wide CUTLASS workspace here, before the
++        # decode CUDA graphs are captured: FlashInfer otherwise allocates it
++        # inside the capture, and with expandable_segments that scratch ended
++        # up aliasing live memory after long prefills (garbage from the SWA
++        # window onward, 09-13). Sized for the prefill chunk on this rank's
++        # expert count; a caller needing more (the KT streamed prefill's
++        # larger groups) grows it outside capture and the old one is retired,
++        # never freed.
++        if self._use_mxfp8_act_scaling:
++            from flashinfer.fused_moe.core import ActivationType
++            import os
++
++            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
++                mxfp4_workspace_nbytes,
++                preallocate_shared_cutlass_workspace,
++            )
++
++            w2 = layer.w2_weight
++            # The KT streamed prefill runs groups of KT_GPU_STREAM_GROUP experts
++            # through the same workspace.
++            experts = max(w2.shape[0], int(os.environ.get("KT_GPU_STREAM_GROUP", "0") or 0))
++            nbytes = mxfp4_workspace_nbytes(
++                1, w2.shape[1], w2.shape[2] * 2, experts * layer.moe_ep_size, layer.top_k,
++                torch.float8_e4m3fn,
++                ActivationType.SwigluStep if self._use_swiglu_step else ActivationType.Swiglu,
++                layer.moe_tp_size, layer.moe_tp_rank, layer.moe_ep_size, layer.moe_ep_rank,
++                True, device)
++            if os.environ.get("KT_GPU_STREAM_W16") == "1":
++                # The streamer's bf16 mode runs the same groups through the
++                # bf16 CUTLASS MoE, whose workspace is sized differently.
++                nbytes = max(nbytes, mxfp4_workspace_nbytes(
++                    1, w2.shape[1], w2.shape[2] * 2, experts * layer.moe_ep_size, layer.top_k,
++                    torch.bfloat16,
++                    ActivationType.SwigluStep if self._use_swiglu_step else ActivationType.Swiglu,
++                    layer.moe_tp_size, layer.moe_tp_rank, layer.moe_ep_size, layer.moe_ep_rank,
++                    False, device, weight_dtype=torch.bfloat16))
++            preallocate_shared_cutlass_workspace(nbytes, device)
++
+     def process_weights_after_loading(self, layer: Module) -> None:
+         # Preserve the base FP4 post-load handling.
+         self._fp8.process_weights_after_loading(layer)

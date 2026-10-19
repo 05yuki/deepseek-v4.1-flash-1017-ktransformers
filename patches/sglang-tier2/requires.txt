@@ -1,0 +1,5 @@
+# feature: the features it needs (applied before it)
+vision-on-demand: wo-a-fp8
+stream-prefill: loading placement prefill-lend
+kv-lend-plan: kv-vmm prefill-lend
+hot-lend: kv-vmm prefill-lend stream-prefill kv-lend-plan

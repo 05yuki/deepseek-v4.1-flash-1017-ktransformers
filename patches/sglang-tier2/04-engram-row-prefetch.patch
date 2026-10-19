@@ -1,0 +1,72 @@
+diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+index 8d4f076d..276ed35d 100644
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -3414,6 +3414,20 @@ class DeepseekV4Model(nn.Module):
+         ):
+             self.engram_prefetch_stream = torch.cuda.Stream()
+             logger.info("Engram layer 14 KV prefetch enabled for BS=1 decode")
++        # sglang-dsv41-engram-prefetch-rows.py: decode's engram row lookups at the token's start
++        self.engram_rows_stream = None
++        if (
++            _is_cuda
++            and __import__("os").environ.get("SGLANG_DSV41_ENGRAM_PREFETCH_ROWS", "1") == "1"
++            and self.pp_group.world_size == 1
++            and not is_dp_attention_enabled()
++            and any(
++                self.layers[i].engram is not None and not self.layers[i].engram.embed._shared
++                for i in range(self.start_layer, self.end_layer)
++            )
++        ):
++            self.engram_rows_stream = torch.cuda.Stream()
++            logger.info("Engram row lookups start with the token in decode")
+ 
+         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+         self.use_fused_mhc_post_pre = (
+@@ -3552,6 +3566,27 @@ class DeepseekV4Model(nn.Module):
+                     hash_ids[:, engram.layer_hash_index]
+                 )
+             hash_ids.record_stream(prefetch_stream)
++        # sglang-dsv41-engram-prefetch-rows.py: {layer: (rows, event)}, the rank-local lookups
++        prefetched_rows = {}
++        if (
++            self.engram_rows_stream is not None
++            and hash_ids is not None
++            and forward_batch.forward_mode.is_decode()
++        ):
++            rows_stream = self.engram_rows_stream
++            rows_stream.wait_stream(torch.cuda.current_stream())
++            with torch.cuda.stream(rows_stream):
++                for j in range(self.start_layer, self.end_layer):
++                    eng = self.layers[j].engram
++                    if eng is None or (j == 14 and prefetched_engram_kv is not None):
++                        continue
++                    if eng.embed._shared or hash_ids.shape[0] == 0:
++                        continue
++                    rows = eng.embed._owned_rows(hash_ids[:, eng.layer_hash_index])
++                    ev = torch.cuda.Event()
++                    ev.record(rows_stream)
++                    prefetched_rows[j] = (rows, ev)
++            hash_ids.record_stream(rows_stream)
+         tail = None
+         if (
+             self.late_layer_start is not None
+@@ -3587,6 +3622,18 @@ class DeepseekV4Model(nn.Module):
+                         hidden_states, prefetched_engram_kv
+                     )
+                     prefetched_engram_kv = None
++                elif i in prefetched_rows:
++                    rows, ev = prefetched_rows.pop(i)
++                    main_stream = torch.cuda.current_stream()
++                    main_stream.wait_event(ev)
++                    rows.record_stream(main_stream)
++                    # what EngramEmbedding._lookup does after _owned_rows, then Engram.forward
++                    if engram.embed.tp_size > 1:
++                        from sglang.srt.distributed import tensor_model_parallel_all_reduce
++
++                        rows = tensor_model_parallel_all_reduce(rows)
++                    kv, _ = engram.wkv(rows.flatten(-2))
++                    hidden_states = engram.apply_gate(hidden_states, kv)
+                 else:
+                     hidden_states = engram(
+                         hidden_states,

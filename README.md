@@ -63,7 +63,7 @@ DeepSeek-V4.1-Flash release: point `MODEL` at it.
    |---|---|---|
    | 0 | `sglang-tier0-run.patch` | what 1017 needs to run correctly on the KTransformers hybrid MoE: the FP8 step below, the SwiGLU clamp passed to the CPU experts, the expert mask kt-kernel takes, `-1` ids kept out of the Marlin MoE, a configurable load barrier, the chat encoding of the current reference (tool namespaces, the `drop_thinking` turn boundary, the reasoning-effort budgets), and the SM12x sparse attention fixes (RTX 50, RTX PRO Blackwell, DGX Spark; the code runs on nothing else) |
    | 1 | `sglang-tier1-long-prompts.patch` | the indexer's memory on long prompts |
-   | 2 | `sglang-tier2-speed.patch` | streamed prefill, the lends, hot experts and placement, the KV pool on remappable memory, the GPU MoE and FP8 kernels (the streamed prefill needs SM89 or newer) |
+   | 2 | `sglang-tier2/` (one patch per feature, [docs/tier2.md](docs/tier2.md); `SGLANG_FEATURES` picks some) | streamed prefill, the lends, hot experts and placement, the KV pool on remappable memory, the GPU MoE and FP8 kernels (the streamed prefill needs SM89 or newer) |
    | 3 | `sglang-tier3-no-p2p.patch` | all-reduce through pinned host memory, for two GPUs without peer access |
 
    Below tier 2 a long prompt's experts run on the CPU (about 40 tok/s of prefill here, decode

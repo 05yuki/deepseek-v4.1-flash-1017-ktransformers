@@ -29,7 +29,7 @@ kt_kv_hot_default() {
   elif [[ ! -f "$lib" ]]; then
     why="$lib missing (./setup.sh builds it from kv-vmm/kv_vmm.c)"
   elif [[ ! -f "$tree/sglang/srt/layers/moe/kt_kv_hot_lend.py" ]]; then
-    why="the tree has no kt_kv_hot_lend.py (patches/sglang-tier2-speed.patch not applied?)"
+    why="the tree has no kt_kv_hot_lend.py (tier 2 hot-lend feature not applied?)"
   elif [[ "${KT_KV_VMM:-1}" == 0 ]]; then
     why="KT_KV_VMM=0"
   fi

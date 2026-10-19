@@ -30,10 +30,18 @@ jobs:
                  git fetch -q --depth 1 https://github.com/05yuki/sglang-upstream.git "refs/tags/$SGLANG_TAG"; }
           git checkout -q FETCH_HEAD
           test "$(git rev-parse HEAD)" = "$SGLANG_COMMIT"
-          # the tiers stack: each is checked on top of the ones below it
-          for t in ../patches/sglang-tier0-run.patch ../patches/sglang-tier1-long-prompts.patch ../patches/sglang-tier2-speed.patch ../patches/sglang-tier3-no-p2p.patch; do
-            git apply --check --whitespace=nowarn "$t"
+          # tiers 0 and 1, then each tier-2 feature without prerequisites alone on them
+          for t in ../patches/sglang-tier0-run.patch ../patches/sglang-tier1-long-prompts.patch; do
             git apply --whitespace=nowarn "$t"
+          done
+          for f in ../patches/sglang-tier2/[0-9][0-9]-*.patch; do
+            slug=$(basename "$f" .patch); slug=${slug#[0-9][0-9]-}
+            grep -q "^$slug:" ../patches/sglang-tier2/requires.txt && continue
+            git apply --check --whitespace=nowarn "$f"
+          done
+          # all of tier 2 in order, then tier 3
+          for f in ../patches/sglang-tier2/[0-9][0-9]-*.patch ../patches/sglang-tier3-no-p2p.patch; do
+            git apply --whitespace=nowarn "$f"
           done
 
       - name: ktransformers and its llama.cpp
