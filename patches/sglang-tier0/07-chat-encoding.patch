@@ -1,0 +1,369 @@
+From dd9bd3b4fa801fafdf4fbfe80c3f4957ce3a83e7 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:33 +0900
+Subject: [PATCH] [tier 0] deepseek-v4.1: tool namespaces and the reference's
+ turn boundary in the chat encoding
+
+Two changes DeepSeek made to the checkpoint's reference
+encoding/encoding.py after SGLang's port was written. Tool namespaces
+(reference dba1be0a40aa): a tool may carry a namespace; the prompt shows
+namespace::name and a parsed call returns the bare name plus a namespace
+field on the tool call (absent when there is none). Current-turn
+thinking and tool-result image order (reference 314113f8a7da, same as
+sgl-project/sglang#44751): without a tools declaration, reasoning is
+dropped only before the latest real user request, and tool-result images
+keep prompt order.
+
+tools/dsv41-encoding-check.py in the public repo compares the prompts
+and parses with the reference byte for byte.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ .../srt/entrypoints/openai/encoding_dsv41.py  | 100 ++++++++++++++----
+ .../sglang/srt/entrypoints/openai/protocol.py |  32 ++++++
+ .../srt/entrypoints/openai/serving_chat.py    |   4 +
+ python/sglang/srt/function_call/core_types.py |   2 +
+ .../srt/function_call/deepseekv41_detector.py |  51 ++++++++-
+ 5 files changed, 167 insertions(+), 22 deletions(-)
+
+diff --git a/python/sglang/srt/entrypoints/openai/encoding_dsv41.py b/python/sglang/srt/entrypoints/openai/encoding_dsv41.py
+index 83d1bce4..45f24f31 100644
+--- a/python/sglang/srt/entrypoints/openai/encoding_dsv41.py
++++ b/python/sglang/srt/entrypoints/openai/encoding_dsv41.py
+@@ -116,19 +116,63 @@ def to_json(value: Any) -> str:
+ 
+ 
+ def tools_from_openai_format(tools):
+-    """Extract function definitions from OpenAI-format tool list."""
+-    return [tool["function"] for tool in tools]
++    """Extract function definitions with namespace-qualified names."""
++    # sglang-dsv41-encoding-namespace-turns.py: reference dba1be0a40aa
++    functions = []
++    for tool in tools:
++        function = dict(tool["function"])
++        if tool.get("namespace") is not None:
++            function["namespace"] = tool["namespace"]
++        function["name"] = _tool_name_for_encoding(function)
++        namespace = function.pop("namespace", None)
++        if isinstance(namespace, dict) and namespace.get("description"):
++            function["description"] = (
++                namespace["description"] + "\n" + (function.get("description") or "")
++            )
++        functions.append(function)
++    return functions
++
++
++def _split_tool_name(
++    name: str, namespace: Optional[str] = None
++) -> Tuple[Optional[str], str]:
++    """Split a qualified name and validate any explicit namespace."""
++    prefix, separator, bare_name = name.partition("::")
++    if separator:
++        if namespace not in (None, prefix):
++            raise ValueError(f"Conflicting tool namespaces: {namespace} != {prefix}")
++        namespace, name = prefix, bare_name
++    if "::" in name:
++        raise ValueError(f"Tool name must not contain '::': {name}")
++    if namespace is not None and "::" in namespace:
++        raise ValueError(f"Tool namespace must not contain '::': {namespace}")
++    return namespace, name
++
++
++def _tool_name_for_encoding(tool: Dict[str, Any]) -> str:
++    """`namespace::name` for a function or call dict, the bare name without one."""
++    namespace = tool.get("namespace")
++    if isinstance(namespace, dict):
++        if not namespace.get("name"):
++            raise ValueError(f"Tool namespace object has no name: {namespace}")
++        namespace = namespace["name"]
++    namespace, name = _split_tool_name(tool["name"], namespace)
++    return name if namespace is None else f"{namespace}::{name}"
+ 
+ 
+ def tool_calls_from_openai_format(tool_calls):
+     """Convert OpenAI-format tool calls to internal format."""
+-    return [
+-        {
+-            "name": tool_call["function"]["name"],
+-            "arguments": tool_call["function"]["arguments"],
+-        }
+-        for tool_call in tool_calls
+-    ]
++    calls = []
++    for tool_call in tool_calls:
++        function = tool_call["function"]
++        namespace, name = _split_tool_name(
++            function["name"], tool_call.get("namespace") or function.get("namespace")
++        )
++        call = {"name": name, "arguments": function["arguments"]}
++        if namespace is not None:
++            call["namespace"] = namespace
++        calls.append(call)
++    return calls
+ 
+ 
+ def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
+@@ -203,11 +247,18 @@ def render_reasoning_effort(
+ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
+     """Mid-conversation system messages also count as user messages here;
+     they trigger the assistant generation header.
++    User messages containing only tool results do not start a new turn.
+     """
+     last_user_index = -1
+     for idx in range(len(messages) - 1, -1, -1):
+         role = messages[idx].get("role")
+         if role in ["user", "developer"] or (role == "system" and idx > 0):
++            content_blocks = messages[idx].get("content_blocks")
++            if content_blocks and not any(
++                block.get("type") in ("text", "image", "image_url")
++                for block in content_blocks
++            ):
++                continue
+             last_user_index = idx
+             break
+     return last_user_index
+@@ -343,7 +394,7 @@ def render_message(
+                 tool_call_template.format(
+                     dsml_token=dsml_token,
+                     tool_call_tag_name=tool_call_tag_name,
+-                    name=tc.get("name"),
++                    name=_tool_name_for_encoding(tc),
+                     arguments=encode_arguments_to_dsml(tc),
+                 )
+                 for tc in tool_calls
+@@ -443,10 +494,13 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+ 
+         if role == "tool":
+             # Convert tool message to a user message with tool_result block
++            content = msg.get("content", "")
++            if msg.get("content_blocks") and not isinstance(msg.get("content"), str):
++                content = msg["content_blocks"]
+             tool_block = {
+                 "type": "tool_result",
+                 "tool_use_id": msg.get("tool_call_id", ""),
+-                "content": msg.get("content", ""),
++                "content": content,
+             }
+             # Merge into previous message if it's already a user (merged tool)
+             if (
+@@ -465,7 +519,12 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+         elif role == "user":
+             content_blocks = msg.get("content_blocks")
+             if content_blocks is None:
+-                content_blocks = [{"type": "text", "text": msg.get("content", "")}]
++                content = msg.get("content", "")
++                content_blocks = (
++                    content
++                    if isinstance(content, list)
++                    else [{"type": "text", "text": content}]
++                )
+             if (
+                 merged
+                 and merged[-1].get("role") == "user"
+@@ -664,14 +723,6 @@ def _encode_messages_text(
+ ) -> str:
+     """Encode preprocessed (text-only) messages into the V4.1 prompt format."""
+     context = context if context else []
+-
+-    # Preprocess: merge tool messages and sort tool results
+-    messages = merge_tool_messages(messages)
+-    messages = sort_tool_results_by_call_order(context + messages)[len(context) :]
+-    if context:
+-        context = merge_tool_messages(context)
+-        context = sort_tool_results_by_call_order(context)
+-
+     full_messages = context + messages
+ 
+     prompt = bos_token if add_default_bos_token and len(context) == 0 else ""
+@@ -718,7 +769,14 @@ def encode_messages(
+     prompt string, or ``(prompt, {"images": [...]})`` when
+     ``return_multi_modal_data`` is set; the image records are in prompt order.
+     """
+-    context = context or []
++    # Validate before merging can discard message-level textual fields.
++    for msg in (context or []) + messages:
++        _validate_no_image_sp_tokens(msg)
++
++    # Collect images only after tool results are in their final prompt order.
++    context = merge_tool_messages(context or [])
++    messages = merge_tool_messages(messages)
++    messages = sort_tool_results_by_call_order(context + messages)[len(context) :]
+     processed_context, _ = process_image_messages(context) if context else ([], [])
+     processed_messages, images = process_image_messages(messages)
+     prompt = _encode_messages_text(
+diff --git a/python/sglang/srt/entrypoints/openai/protocol.py b/python/sglang/srt/entrypoints/openai/protocol.py
+index c9b4f73b..3d25d33b 100644
+--- a/python/sglang/srt/entrypoints/openai/protocol.py
++++ b/python/sglang/srt/entrypoints/openai/protocol.py
+@@ -673,6 +673,15 @@ class FunctionResponse(BaseModel):
+ 
+     name: Optional[str] = None
+     arguments: Optional[str | Dict[str, Any]] = None
++    # sglang-dsv41-encoding-namespace-turns.py: accepted in history (DeepSeek-V4.1)
++    namespace: Optional[str] = None
++
++    @model_serializer(mode="wrap")
++    def _serialize(self, handler):
++        data = handler(self)
++        if self.namespace is None:
++            data.pop("namespace", None)
++        return data
+ 
+ 
+ class ToolCall(BaseModel):
+@@ -682,6 +691,16 @@ class ToolCall(BaseModel):
+     index: Optional[int] = None
+     type: Literal["function"] = "function"
+     function: FunctionResponse
++    # sglang-dsv41-encoding-namespace-turns.py: the call's tool namespace, an
++    # extension to the OpenAI shape; serialized only when set.
++    namespace: Optional[str] = None
++
++    @model_serializer(mode="wrap")
++    def _serialize(self, handler):
++        data = handler(self)
++        if self.namespace is None:
++            data.pop("namespace", None)
++        return data
+ 
+ 
+ _GenericMessageRole = Literal[
+@@ -751,12 +770,16 @@ class Function(BaseModel):
+     parameters: Optional[object] = None
+     strict: bool = False
+     defer_loading: Optional[bool] = None
++    # sglang-dsv41-encoding-namespace-turns.py: a string or {"name", "description"}
++    namespace: Optional[Union[str, Dict[str, Any]]] = None
+ 
+     @model_serializer(mode="wrap")
+     def _serialize(self, handler):
+         data = handler(self)
+         if self.defer_loading is None:
+             data.pop("defer_loading", None)
++        if self.namespace is None:
++            data.pop("namespace", None)
+         return data
+ 
+ 
+@@ -766,6 +789,15 @@ class Tool(BaseModel):
+     type: str = Field(default="function", examples=["function"])
+     function: Function
+     defer_loading: Optional[bool] = None
++    # sglang-dsv41-encoding-namespace-turns.py: a string or {"name", "description"}
++    namespace: Optional[Union[str, Dict[str, Any]]] = None
++
++    @model_serializer(mode="wrap")
++    def _serialize(self, handler):
++        data = handler(self)
++        if self.namespace is None:
++            data.pop("namespace", None)
++        return data
+ 
+     @model_validator(mode="after")
+     def _propagate_defer_loading(self) -> Tool:
+diff --git a/python/sglang/srt/entrypoints/openai/serving_chat.py b/python/sglang/srt/entrypoints/openai/serving_chat.py
+index 232f0c59..9901f1cb 100644
+--- a/python/sglang/srt/entrypoints/openai/serving_chat.py
++++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
+@@ -2306,6 +2306,8 @@ class OpenAIServingChat(OpenAIServingBase):
+                                     name=call_info.name,
+                                     arguments=call_info.parameters,
+                                 ),
++                                # sglang-dsv41-encoding-namespace-turns.py
++                                namespace=getattr(call_info, "namespace", None),
+                             )
+                         )
+                     if finish_reason["type"] == "stop":
+@@ -2790,6 +2792,8 @@ class OpenAIServingChat(OpenAIServingBase):
+                     name=function_name,
+                     arguments=call_item.parameters,
+                 ),
++                # sglang-dsv41-encoding-namespace-turns.py: with the name chunk only
++                namespace=call_item.namespace if call_item.name else None,
+             )
+ 
+             choice_data = ChatCompletionResponseStreamChoice(
+diff --git a/python/sglang/srt/function_call/core_types.py b/python/sglang/srt/function_call/core_types.py
+index 1ea87df7..b9920800 100644
+--- a/python/sglang/srt/function_call/core_types.py
++++ b/python/sglang/srt/function_call/core_types.py
+@@ -10,6 +10,8 @@ class ToolCallItem(BaseModel):
+     tool_index: int
+     name: Optional[str] = None
+     parameters: str  # JSON string
++    # sglang-dsv41-encoding-namespace-turns.py: set by detectors whose format qualifies names
++    namespace: Optional[str] = None
+ 
+ 
+ class StreamingParseResult(BaseModel):
+diff --git a/python/sglang/srt/function_call/deepseekv41_detector.py b/python/sglang/srt/function_call/deepseekv41_detector.py
+index 48a76a19..f24847e3 100644
+--- a/python/sglang/srt/function_call/deepseekv41_detector.py
++++ b/python/sglang/srt/function_call/deepseekv41_detector.py
+@@ -1,8 +1,41 @@
+-from typing import Optional
++from typing import Any, Dict, List, Optional
+ 
++from sglang.srt.entrypoints.openai.encoding_dsv41 import (
++    _split_tool_name,
++    _tool_name_for_encoding,
++)
++from sglang.srt.entrypoints.openai.protocol import Tool
++from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
+ from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+ 
+ 
++def _qualified_tool_name(tool: Tool) -> Optional[str]:
++    """The name the V4.1 prompt shows for `tool`: `namespace::name` when namespaced.
++
++    sglang-dsv41-encoding-namespace-turns.py: the tool-level namespace wins over
++    the function's, as in the reference encoder.
++    """
++    function = tool.function
++    namespace = getattr(tool, "namespace", None)
++    if namespace is None:
++        namespace = getattr(function, "namespace", None)
++    try:
++        return _tool_name_for_encoding({"name": function.name, "namespace": namespace})
++    except (ValueError, TypeError):
++        return function.name
++
++
++def _split_namespaces(calls: List[ToolCallItem]) -> List[ToolCallItem]:
++    """`ns::name` -> name="name", namespace="ns" on each call that carries a name."""
++    for call in calls:
++        if call.name and "::" in call.name:
++            try:
++                call.namespace, call.name = _split_tool_name(call.name)
++            except ValueError:
++                pass
++    return calls
++
++
+ class DeepSeekV41Detector(DeepSeekV32Detector):
+     """DeepSeek V4.1 DSML detector.
+ 
+@@ -13,6 +46,22 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
+     invoke_tag_name = " invoke"
+     parameter_tag_name = " parameter"
+ 
++    def _get_tool_indices(self, tools: List[Tool]) -> Dict[str, int]:
++        # The model calls a namespaced tool by its qualified name.
++        return {
++            name: i for i, tool in enumerate(tools) if (name := _qualified_tool_name(tool))
++        }
++
++    def parse_base_json(self, action: Any, tools: List[Tool]) -> List[ToolCallItem]:
++        return _split_namespaces(super().parse_base_json(action, tools))
++
++    def parse_streaming_increment(
++        self, new_text: str, tools: List[Tool]
++    ) -> StreamingParseResult:
++        result = super().parse_streaming_increment(new_text, tools)
++        _split_namespaces(result.calls)
++        return result
++
+     def get_structural_tag_name(self) -> Optional[str]:
+         # xgrammar's builtin "deepseek_v4" tag is the unspaced grammar; fall
+         # back to structure_info so constrained decoding uses the spaced tags.

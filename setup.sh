@@ -36,7 +36,8 @@ TIER="${TIER:-3}"
 [[ "$TIER" =~ ^[0123]$ ]] || { echo "TIER must be 0, 1, 2 or 3" >&2; exit 2; }
 SGLANG_FEATURES="${SGLANG_FEATURES:-all}"
 # the SGLang patches up to TIER, in order (paths under patches/)
-sglang_patches=(sglang-tier0-run.patch)
+sglang_patches=()
+for f in "$here"/patches/sglang-tier0/[0-9][0-9]-*.patch; do sglang_patches+=("sglang-tier0/$(basename "$f")"); done
 (( TIER >= 1 )) && sglang_patches+=(sglang-tier1-long-prompts.patch)
 features=()
 if (( TIER >= 2 )); then

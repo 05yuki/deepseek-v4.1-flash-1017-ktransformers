@@ -1,3 +1,26 @@
+From 6175243c400b924bc3bebecb9c7cf8440f070b6a Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:36 +0900
+Subject: [PATCH] [tier 2] kv-vmm: the KV pool on remappable memory (CUDA VMM)
+
+`KT_KV_VMM=1` puts the KV pool on memory whose physical pages can be
+unmapped and mapped again while the addresses, and the CUDA graphs that
+read them, stay the same (`kt_kv_vmm.py`, hooked into the
+torch_memory_saver adapter). Needs `libkv_vmm.so` from the repo's
+`kv-vmm/kv_vmm.c` (`KT_KV_VMM_LIB`).
+
+Numerics: Bit-identical.
+
+Prerequisites: none; applies alone on tier 1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ python/sglang/srt/layers/moe/kt_kv_vmm.py     | 235 ++++++++++++++++++
+ .../srt/utils/torch_memory_saver_adapter.py   |   8 +
+ 2 files changed, 243 insertions(+)
+ create mode 100644 python/sglang/srt/layers/moe/kt_kv_vmm.py
+
 diff --git a/python/sglang/srt/layers/moe/kt_kv_vmm.py b/python/sglang/srt/layers/moe/kt_kv_vmm.py
 new file mode 100644
 index 00000000..cf208235

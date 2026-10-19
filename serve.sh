@@ -80,6 +80,7 @@ mem_fraction="${SGLANG_MEM_FRACTION:-0.81}"
 kv_cache_dtype="${SGLANG_KV_CACHE_DTYPE:-fp8_e4m3}"
 chunked_prefill="${SGLANG_CHUNKED_PREFILL_SIZE:-2048}"
 swa_prefix_tails="${SGLANG_SWA_PREFIX_TAILS:-6}"
+# split on whitespace on purpose: SGLANG_EXTRA_ARGS="--a 1 --b 2" gives four words (no quoting inside)
 extra_args=(${SGLANG_EXTRA_ARGS:-})
 radix_args=(--disable-radix-cache)
 [[ "${DSV41_RADIX:-0}" == "1" ]] && radix_args=()

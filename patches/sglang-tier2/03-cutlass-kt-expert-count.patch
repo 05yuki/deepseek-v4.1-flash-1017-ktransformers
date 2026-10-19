@@ -1,3 +1,25 @@
+From 57d3820bc76d4a89c25c3deeb960cd27b8ac22a7 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:34 +0900
+Subject: [PATCH] [tier 2] cutlass-kt-expert-count: CUTLASS MXFP4 MoE takes its
+ expert count from the weights under kt
+
+A fix in the FlashInfer CUTLASS MXFP4 MoE method: the expert count is
+taken from the weight tensor (`layer.w13_weight.shape[0]`) instead of
+`layer.num_local_experts`, because under the kt-kernel wrapper the
+method holds only the GPU-resident experts.
+
+Numerics: No switch. Identical without KTransformers (both counts
+agree); under KTransformers the CUTLASS MXFP4 path used to fail.
+
+Prerequisites: none; applies alone on tier 1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ .../layers/quantization/mxfp4_flashinfer_cutlass_moe.py    | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
 diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 index 62c9aa9e..a453d4aa 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py

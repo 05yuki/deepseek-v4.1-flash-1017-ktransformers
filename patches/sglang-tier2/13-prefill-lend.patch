@@ -1,3 +1,41 @@
+From 97b8ee3168534fa58e626d849b8706ac554a2755 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:36 +0900
+Subject: [PATCH] [tier 2] prefill-lend: lend the GPU-resident weights' memory
+ to a streamed prefill
+
+`KT_PREFILL_LEND=1`: during a streamed prefill the GPU-resident weights
+give their memory to the prefill's scratch and come back layer by layer,
+at the same addresses, just before each layer runs (`kt_lend.py`, hooked
+into the loader and the model runner's forward). `KT_PREFILL_LEND_PROBE`
+measures how large a chunk fits before serving (`kt_lend_probe.py`, used
+by `lib/kt-lend-auto.sh`). `KT_FAST_PINNED=1` pins the lend's host
+buffers as huge-page memory registered with `cudaHostRegister` instead
+of `cudaHostAlloc` (`kt_pinned.py`). DeepSeek V4's padded query buffer
+is allocated in the prefill's scratch. The lend calls into the streamed
+prefill, the KV lend and the hot lend only when those patches are
+applied and on.
+
+Numerics: Bit-identical at a given chunk size. It lets the launcher pick
+a larger chunk, and the chunk size moves NLL.
+
+Prerequisites: none; applies alone on tier 1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ python/sglang/srt/layers/moe/kt_lend.py       | 1092 +++++++++++++++++
+ python/sglang/srt/layers/moe/kt_lend_probe.py |  141 +++
+ python/sglang/srt/layers/moe/kt_pinned.py     |  119 ++
+ python/sglang/srt/managers/scheduler.py       |    5 +
+ .../sglang/srt/model_executor/model_runner.py |    5 +
+ python/sglang/srt/model_loader/loader.py      |   15 +-
+ python/sglang/srt/models/deepseek_v4.py       |    6 +-
+ 7 files changed, 1381 insertions(+), 2 deletions(-)
+ create mode 100644 python/sglang/srt/layers/moe/kt_lend.py
+ create mode 100644 python/sglang/srt/layers/moe/kt_lend_probe.py
+ create mode 100644 python/sglang/srt/layers/moe/kt_pinned.py
+
 diff --git a/python/sglang/srt/layers/moe/kt_lend.py b/python/sglang/srt/layers/moe/kt_lend.py
 new file mode 100644
 index 00000000..b6091b1d

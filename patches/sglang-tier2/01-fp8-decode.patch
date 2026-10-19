@@ -1,3 +1,31 @@
+From c73241fe357ef350b3da7be242d44bb4a17a0aba Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:34 +0900
+Subject: [PATCH] [tier 2] fp8-decode: block-FP8 GEMV and split-K for
+ decode-sized dense GEMMs
+
+Faster block-FP8 dense GEMMs for decode-sized inputs. With up to four
+rows, `w8a8_block_fp8_matmul` runs a Triton GEMV (`fp8_block_gemv.py`)
+that steps K over several scale groups at a time. With up to 16 rows and
+no tuned config for the shape, the Triton matmul uses a split-K tiling.
+`SGLANG_FP8_DECODE_SPLITK=1` also sends the decode rows (up to 16) of
+the CUTLASS block-FP8 linear through that Triton matmul, with the
+operands CUTLASS would have been given; prefill stays on CUTLASS.
+
+Numerics: Not bit-identical when on: the same FP8 operands summed in a
+different fp32 order (GEMV, split-K). Prefill shapes are unchanged.
+
+Prerequisites: none; applies alone on tier 1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ .../ops/quantization/fp8_block_gemv.py        | 127 ++++++++++++++++++
+ .../kernels/ops/quantization/fp8_kernel.py    |  54 +++++++-
+ .../srt/layers/quantization/fp8_utils.py      |  61 +++++++++
+ 3 files changed, 241 insertions(+), 1 deletion(-)
+ create mode 100644 python/sglang/kernels/ops/quantization/fp8_block_gemv.py
+
 diff --git a/python/sglang/kernels/ops/quantization/fp8_block_gemv.py b/python/sglang/kernels/ops/quantization/fp8_block_gemv.py
 new file mode 100644
 index 00000000..29b39b30

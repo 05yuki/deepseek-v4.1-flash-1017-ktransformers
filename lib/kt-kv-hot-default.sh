@@ -1,5 +1,5 @@
 # Sourced by a launcher: the hot lend on by default (sglang/srt/layers/moe/kt_kv_hot_lend.py
-# in the SGLang tree patch). Outside prefill, the KV pool's free pages
+# in the tier-2 hot-lend patches). Outside prefill, the KV pool's free pages
 # hold X more hot experts; the pool never shrinks (they leave when KV needs the
 # pages). Needs the KV pool on kv-vmm, so the prefill plan's set (KT_KV_VMM,
 # KT_PREFILL_KV_LEND, KT_PREFILL_PLAN, KT_PREFILL_SWA_LEND on SWA models) comes on

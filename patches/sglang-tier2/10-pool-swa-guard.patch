@@ -1,3 +1,26 @@
+From b2e79aa1ed178685b192eab413a56c178feb8922 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:35 +0900
+Subject: [PATCH] [tier 2] pool-swa-guard: fail at startup when the SWA pool
+ cannot hold a prefill chunk
+
+A startup check in the pool configurator for DeepSeek V4: an SWA pool
+smaller than one prefill chunk plus a page raises a ValueError that
+names the flags to change (`--swa-full-tokens-ratio`,
+`--max-total-tokens`, `--chunked-prefill-size`), instead of a scheduler
+that re-queues the request forever with the GPU idle.
+
+Numerics: No switch. No effect on outputs; a setup that used to hang now
+fails at startup.
+
+Prerequisites: none; applies alone on tier 1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ .../srt/model_executor/pool_configurator.py     | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
 diff --git a/python/sglang/srt/model_executor/pool_configurator.py b/python/sglang/srt/model_executor/pool_configurator.py
 index 95803724..c6684a37 100644
 --- a/python/sglang/srt/model_executor/pool_configurator.py

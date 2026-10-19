@@ -1,3 +1,20 @@
+From 75c50fb842f2c633793658d0ddea64be282209d1 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:34 +0900
+Subject: [PATCH] [tier 1] deepseek-v4: score a long prefill's indexer rows in
+ slices
+
+The dense low-ratio indexer scores a long prefill chunk's rows in
+slices, so its logits never hold the whole chunk at once; at 48K tokens
+the unsliced logits ran out of GPU memory.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ .../layers/attention/deepseek_v4_backend.py   | 180 ++++++++++++++++--
+ .../srt/layers/attention/dsv4/indexer.py      |  11 +-
+ 2 files changed, 170 insertions(+), 21 deletions(-)
+
 diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 index 6e66a8e0..b12fe031 100644
 --- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py

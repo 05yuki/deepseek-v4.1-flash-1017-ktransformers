@@ -1,3 +1,39 @@
+From b8fb035750c0f3dfcc6f9e53ef8b38b88b720249 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:36 +0900
+Subject: [PATCH] [tier 2] kv-lend-plan: lend the KV pool's free pages to
+ prefill, plan the chunk per request
+
+The KV pool's free pages during prefill. `KT_PREFILL_KV_LEND=1` lends
+the pool's free pages to the prefill (pages in use are never lent; the
+pool never shrinks). `KT_PREFILL_PLAN=1` plans each request's chunk size
+from the memory free at that moment, so a long prompt takes fewer,
+larger chunks (scheduler and schedule_batch hooks).
+`KT_PREFILL_SWA_LEND=1` sizes the sliding-window pool for the largest
+planned chunk and releases its free pages outside prefill. The file
+`kt_kv_hot_lend.py` ships here because the plan imports it; it does
+nothing until `hot-lend` wires it in.
+
+Numerics: The lend is bit-identical. The plan picks per-request chunk
+sizes, so the prefill chunking (and NLL) moves against a fixed chunk.
+The SWA lend changes memory only.
+
+Prerequisites: `kv-vmm`, `prefill-lend`.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ .../sglang/srt/layers/moe/kt_kv_hot_lend.py   | 550 +++++++++++
+ .../srt/layers/moe/kt_kv_prefill_lend.py      | 914 ++++++++++++++++++
+ .../sglang/srt/layers/moe/kt_prefill_plan.py  | 238 +++++
+ python/sglang/srt/managers/schedule_batch.py  |  11 +-
+ python/sglang/srt/managers/scheduler.py       |   9 +
+ .../srt/mem_cache/kv_cache_configurator.py    |  19 +-
+ 6 files changed, 1736 insertions(+), 5 deletions(-)
+ create mode 100644 python/sglang/srt/layers/moe/kt_kv_hot_lend.py
+ create mode 100644 python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
+ create mode 100644 python/sglang/srt/layers/moe/kt_prefill_plan.py
+
 diff --git a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
 new file mode 100644
 index 00000000..8a7aa149

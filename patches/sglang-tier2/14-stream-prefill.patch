@@ -1,3 +1,40 @@
+From 57f821511f127e32e761ab76bae4461e4ee0ebb2 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:36 +0900
+Subject: [PATCH] [tier 2] stream-prefill: stream the CPU experts to the GPU
+ for long prefills
+
+`KT_GPU_STREAM_PREFILL=<tokens>`: above that many tokens the CPU experts
+are not computed by kt-kernel; their weights are copied to the GPU in
+groups and computed there, the copy of the next group overlapping the
+compute of the current one (`kt_stream_prefill.py`).
+`KT_GPU_STREAM_W16=1` dequantizes each group to bf16 and runs
+FlashInfer's bf16 CUTLASS MoE (SM89+); otherwise the SM120 MXFP8 x MXFP4
+kernel. `KT_GPU_STREAM_ZEROCOPY` reads kt-kernel's shared expert memory
+directly and `KT_GPU_STREAM_GRAPH` launches each group as one CUDA
+graph. One CUTLASS MoE workspace per GPU is preallocated before the
+decode graphs are captured, for the resident experts as well (this part
+is always on), and `KT_GPU_STREAM_ROW_BLOCK` splits long chunks into row
+blocks. Also: early streamer init, CPU groups (`KT_STREAM_CPU_GROUPS`),
+a reference check (`KT_HOT_CHECK`), and comment updates in the wrapper.
+
+Numerics: Not bit-identical when on: the streamed CPU experts run on the
+GPU (W16: bf16 rounding instead of kt-kernel's; the MXFP8 mode has a
+larger error). The shared workspace changes memory only. ZEROCOPY needs
+the kt-kernel tree patch (`KT_EXPERT_SHM`).
+
+Prerequisites: `prefill-lend`, `loading`, `placement`.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ python/sglang/srt/layers/moe/kt_ep_wrapper.py |   83 +-
+ .../srt/layers/moe/kt_stream_prefill.py       | 1637 +++++++++++++++++
+ .../moe/moe_runner/flashinfer_cutlass.py      |  143 ++
+ .../mxfp4_flashinfer_cutlass_moe.py           |   41 +
+ 4 files changed, 1890 insertions(+), 14 deletions(-)
+ create mode 100644 python/sglang/srt/layers/moe/kt_stream_prefill.py
+
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 index ba0e35ed..5e5cdd9b 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py

@@ -1,0 +1,32 @@
+From 7f9fb3f2597b8ab830abdc813cc90037ba565995 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:33 +0900
+Subject: [PATCH] [tier 0] model-loader: make the unbalanced load barrier
+ timeout configurable
+
+With KTransformers the ranks load very different amounts (rank 0 also
+loads the CPU experts), and the fixed 480 s barrier fails a TP2 launch
+from disk. SGLANG_UNBALANCED_LOAD_TIMEOUT_S sets it (default 480 as
+before).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ .../model_runner_components/load_model_utils.py               | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py b/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
+index e3c22d6f..24f9b5e4 100644
+--- a/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
++++ b/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
+@@ -48,7 +48,9 @@ logger = logging.getLogger(__name__)
+ _is_npu = is_npu()
+ 
+ 
+-UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
++UNBALANCED_MODEL_LOADING_TIMEOUT_S = int(
++    os.environ.get("SGLANG_UNBALANCED_LOAD_TIMEOUT_S", "480")
++)  # leave more time for post data processing
+ 
+ 
+ def maybe_precompile_model_kernels_after_loading(model, device: str) -> None:

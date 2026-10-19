@@ -1,3 +1,25 @@
+From c793bb0429223f985fcfe09191c38c08102133f2 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:37 +0900
+Subject: [PATCH] [tier 3] distributed: all-reduce through pinned host memory
+ for GPUs without peer access
+
+Two GPUs without peer access (consumer cards on a board without P2P):
+small all-reduces (decode) go through pinned host memory in NCCL's LL
+form (SGLANG_LL_ALLREDUCE), large ones (prefill) are staged through
+pinned host memory with the copy engines (SGLANG_HOST_STAGED_ALLREDUCE).
+Off unless set; the public repo's launcher sets both for two GPUs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ .../host_staged_allreduce.py                  | 151 ++++++++++++++++++
+ .../device_communicators/ll_allreduce.py      | 135 ++++++++++++++++
+ .../sglang/srt/distributed/parallel_state.py  |  40 +++++
+ 3 files changed, 326 insertions(+)
+ create mode 100644 python/sglang/srt/distributed/device_communicators/host_staged_allreduce.py
+ create mode 100644 python/sglang/srt/distributed/device_communicators/ll_allreduce.py
+
 diff --git a/python/sglang/srt/distributed/device_communicators/host_staged_allreduce.py b/python/sglang/srt/distributed/device_communicators/host_staged_allreduce.py
 new file mode 100644
 index 00000000..e4901c84

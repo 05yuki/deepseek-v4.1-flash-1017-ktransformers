@@ -1,3 +1,34 @@
+From 52aecfa0c211da05b72befd244f78f9a8b3562c8 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:35 +0900
+Subject: [PATCH] [tier 2] loading: skip the CPU-only experts in the GPU
+ loader, read dense shards ahead
+
+Weight loading for the hybrid MoE. The GPU side's safetensors loader
+skips the experts that only the CPU runs, by name, and DeepSeek V4's
+`load_weights` skips them too (`KT_LOAD_SKIP_CPU_EXPERTS`); it still
+reads the hot lend's experts when `hot-lend` is applied.
+`KT_LOAD_PREFETCH=<threads>` reads the dense tensors of each shard ahead
+in 16 MiB pieces on a thread pool, so the loaders' mmap faults hit the
+page cache. In the kt-kernel wrapper: `KT_GPU_STREAM_DROP_CACHE=<dir>`
+drops the page cache of the checkpoint per layer so kt-kernel's arenas
+find 2 MB pages; `KT_NUMA_NODES` passes kt-kernel the NUMA nodes to use;
+with `--kt-num-gpu-experts 0` the empty GPU weights are not repacked
+(dsv41-flash-dual-epyc#2).
+
+Numerics: Bit-identical: the skipped tensors are ones the loader dropped
+anyway; the rest is I/O and placement.
+
+Prerequisites: none; applies alone on tier 1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ python/sglang/srt/layers/moe/kt_ep_wrapper.py |  52 ++++++-
+ .../sglang/srt/model_loader/weight_utils.py   | 140 +++++++++++++++++-
+ python/sglang/srt/models/deepseek_v4.py       |  47 ++++++
+ 3 files changed, 236 insertions(+), 3 deletions(-)
+
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 index 97982532..9f0cc8ee 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
@@ -84,10 +115,10 @@ index 97982532..9f0cc8ee 100644
  
      def create_moe_runner(
 diff --git a/python/sglang/srt/model_loader/weight_utils.py b/python/sglang/srt/model_loader/weight_utils.py
-index fd659e7c..4e03dbe6 100644
+index fd659e7c..d250f1aa 100644
 --- a/python/sglang/srt/model_loader/weight_utils.py
 +++ b/python/sglang/srt/model_loader/weight_utils.py
-@@ -1079,6 +1079,69 @@ def _drop_file_cache_after_load(path: str) -> None:
+@@ -1079,6 +1079,71 @@ def _drop_file_cache_after_load(path: str) -> None:
              os.close(fd)
  
  
@@ -110,31 +141,33 @@ index fd659e7c..4e03dbe6 100644
 +        return False
 +    st = _kt_skip_state
 +    if "n" not in st:
++        # The loader's threads ask at once. Work in locals and publish "n" last:
++        # a thread that finds "n" finds the final count and "meta" with it.
 +        try:
 +            from sglang.srt.runtime_context import get_exec
 +
 +            moe = get_exec().moe
-+            st["n"] = (
-+                int(moe.kt_num_gpu_experts) if moe.kt_weight_path is not None else -1
-+            )
++            n = int(moe.kt_num_gpu_experts) if moe.kt_weight_path is not None else -1
 +            # kt_kv_hot_lend: the experts the hot lend's shadows hold are read too
 +            try:
 +                from sglang.srt.layers.moe import kt_kv_hot_lend
 +
-+                st["n"] = kt_kv_hot_lend.load_count(st["n"])
++                n = kt_kv_hot_lend.load_count(n)
 +            except ImportError:
 +                pass
 +        except Exception:
-+            st["n"] = -1
++            n = -1
 +        try:
 +            from sglang.srt.eplb.expert_location import (
 +                get_global_expert_location_metadata,
 +            )
 +
-+            st["meta"] = get_global_expert_location_metadata()
++            meta = get_global_expert_location_metadata()
 +        except Exception:
-+            st["meta"] = None
-+        st["skipped"] = 0
++            meta = None
++        st.setdefault("skipped", 0)
++        st["meta"] = meta
++        st["n"] = n
 +    n = st["n"]
 +    if n < 0:
 +        return False
@@ -157,7 +190,7 @@ index fd659e7c..4e03dbe6 100644
  def safetensors_weights_iterator(
      hf_weights_files: List[str],
      disable_mmap: bool = False,
-@@ -1193,7 +1256,7 @@ def multi_thread_safetensors_weights_iterator(
+@@ -1193,7 +1258,7 @@ def multi_thread_safetensors_weights_iterator(
                  result = safetensors.torch.load(f.read())
          else:
              with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
@@ -166,7 +199,7 @@ index fd659e7c..4e03dbe6 100644
  
          return st_file, result
  
-@@ -1220,6 +1283,76 @@ def multi_thread_safetensors_weights_iterator(
+@@ -1220,6 +1285,76 @@ def multi_thread_safetensors_weights_iterator(
                  _drop_file_cache_after_load(st_file)
  
  
@@ -243,7 +276,7 @@ index fd659e7c..4e03dbe6 100644
  def buffered_multi_thread_safetensors_weights_iterator(
      hf_weights_files: List[str],
      max_workers: int,
-@@ -1247,8 +1380,9 @@ def buffered_multi_thread_safetensors_weights_iterator(
+@@ -1247,8 +1382,9 @@ def buffered_multi_thread_safetensors_weights_iterator(
              with open(st_file, "rb") as f:
                  result = safetensors.torch.load(f.read())
          else:

@@ -1,3 +1,31 @@
+From 7a4893f0c5a74435ebb2ed5b93329a534ac89eb7 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:36 +0900
+Subject: [PATCH] [tier 2] hot-lend: more hot experts in the KV pool's free
+ pages outside prefill
+
+`KT_KV_HOT_LEND=1`: outside prefill the KV pool's free pages hold up to
+`KT_KV_HOT_EXTRA` more experts a layer on the GPU (the next-hottest
+after the resident ones, with a placement), on a shadow layer; their
+routes go to the GPU and to the CPU at weight 0. The experts leave
+whenever the pool needs the pages or a prefill starts.
+`KT_KV_HOT_SPARE_FLOOR_MB` lets the slots also use idle driver memory
+above the floor.
+
+Numerics: Not bit-identical: the lent experts run in the GPU MoE kernel
+instead of kt-kernel, and how many are lent depends on the free KV pages
+at the time, so decode output depends on load.
+
+Prerequisites: `kv-vmm`, `prefill-lend`, `stream-prefill`,
+`kv-lend-plan`.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ .../srt/layers/moe/fused_moe_triton/layer.py  |  7 +++++++
+ python/sglang/srt/layers/moe/kt_ep_wrapper.py | 20 ++++++++++++++++++-
+ 2 files changed, 26 insertions(+), 1 deletion(-)
+
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 index a1f0e7f0..bcd700b7 100644
 --- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py

@@ -1,3 +1,24 @@
+From 933aed4af5924ac05befb1c83cd3d047f380bcc0 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:35 +0900
+Subject: [PATCH] [tier 2] engram-row-prefetch: start decode's engram row
+ lookups with the token, on a side stream
+
+In decode, each engram layer's rank-local row lookup starts at the
+beginning of the token on a side stream instead of when its layer comes.
+The all-reduce, `wkv` and the gate stay where they were. Only with one
+pipeline stage, no DP attention and engram tables that are not shared.
+
+Numerics: Bit-identical: only the lookup moves.
+
+Prerequisites: none; applies alone on tier 1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ python/sglang/srt/models/deepseek_v4.py | 47 +++++++++++++++++++++++++
+ 1 file changed, 47 insertions(+)
+
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
 index 8d4f076d..276ed35d 100644
 --- a/python/sglang/srt/models/deepseek_v4.py

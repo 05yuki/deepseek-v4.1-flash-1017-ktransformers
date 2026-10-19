@@ -1,0 +1,41 @@
+From 36d9336eb333455b032514e8de4a5df171927492 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:32 +0900
+Subject: [PATCH] [tier 0] kt: pass the GPU expert mask kt-kernel's inference
+ API takes
+
+kt-kernel 0.7's KTMoEWrapper takes gpu_experts_mask, a boolean mask of
+the GPU-resident experts, and keeps num_gpu_experts for its SFT path
+only; called with num_gpu_experts it raises a TypeError at load. The
+resident experts are physical 0..num_gpu_experts-1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ python/sglang/srt/layers/moe/kt_ep_wrapper.py | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+index 36c15cf1..acca3ad9 100644
+--- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
++++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+@@ -216,13 +216,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         # 2. Initialize KT wrapper for CPU experts
+         # CPU experts: num_gpu_experts to num_experts-1
+         if self.tp_rank == 0:
++            # kt-kernel 0.7.0 inference API takes an explicit boolean mask of
++            # GPU-resident experts instead of num_gpu_experts (SFT-only).
++            # GPU experts occupy ordinals 0..num_gpu_experts-1 (see above).
++            gpu_mask = torch.zeros(num_experts, dtype=torch.bool)
++            gpu_mask[: self.num_gpu_experts] = True
+             self.wrapper = KTMoEWrapper(
+                 layer_idx=self.kt_config.layer_idx,
+                 num_experts=num_experts,
+                 num_experts_per_tok=num_experts_per_tok,
+                 hidden_size=hidden_size,
+                 moe_intermediate_size=intermediate_size_full,
+-                num_gpu_experts=self.num_gpu_experts,
++                gpu_experts_mask=gpu_mask,
+                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
+                 threadpool_count=self.kt_config.threadpool_count,
+                 weight_path=self.kt_config.weight_path,

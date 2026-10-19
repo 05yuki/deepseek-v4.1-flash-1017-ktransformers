@@ -10,12 +10,18 @@ to 1M tokens.
 
 This repository is everything needed: patches against two public upstream commits, a
 setup script that builds them, a launcher that reads the machine it runs on, and tests.
+It is a snapshot against those commits as of October 2026 (SGLang `1aa0e962`,
+KTransformers `95009ea`, torch 2.13 with CUDA 13 wheels, CUDA toolkit 13.1); later upstream
+versions are not tracked.
 
 ```
 hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir /models/dsv41-1017
 MODEL=/models/dsv41-1017 ./setup.sh
 MODEL=/models/dsv41-1017 ./serve.sh
 ```
+
+`MODEL=/models/dsv41-1017 tools/check.sh` starts the server once, sends one short request,
+checks that an answer comes back, and stops the server: the one command that says a setup works.
 
 The server speaks SGLang's OpenAI-compatible API on `127.0.0.1:8080`, one request at a
 time. To serve other machines, set `SGLANG_HOST=0.0.0.0` and `SGLANG_API_KEY=<key>`
@@ -43,8 +49,8 @@ DeepSeek-V4.1-Flash release: point `MODEL` at it.
   - `.venv` is 8.6 GB and the upstream clones about 1 GB.
   - The load runs at the drive's speed, and the engram rows are read from it during
     inference, so a 1 TB NVMe drive is the practical choice.
-- **Software.** Linux, the CUDA toolkit (built and run with 13.1), git, gcc/g++, the
-  libnuma and hwloc headers (`libnuma-dev libhwloc-dev`), and `uv` or Python 3.12.
+- **Software.** Linux, bash 4.4 or newer, the CUDA toolkit (built and run with 13.1), git,
+  gcc/g++, the libnuma and hwloc headers (`libnuma-dev libhwloc-dev`), and `uv` or Python 3.12.
   The Python packages are pinned in `requirements.txt` (torch 2.13 + cu130).
 - **Host settings.** Set these as root, persistently:
   - `echo advise > /sys/kernel/mm/transparent_hugepage/shmem_enabled`. The expert
@@ -61,7 +67,7 @@ DeepSeek-V4.1-Flash release: point `MODEL` at it.
 
    | `TIER` | patch | what it adds |
    |---|---|---|
-   | 0 | `sglang-tier0-run.patch` | what 1017 needs to run correctly on the KTransformers hybrid MoE: the FP8 step below, the SwiGLU clamp passed to the CPU experts, the expert mask kt-kernel takes, `-1` ids kept out of the Marlin MoE, a configurable load barrier, the chat encoding of the current reference (tool namespaces, the `drop_thinking` turn boundary, the reasoning-effort budgets), and the SM12x sparse attention fixes (RTX 50, RTX PRO Blackwell, DGX Spark; the code runs on nothing else) |
+   | 0 | `sglang-tier0/` (nine patches, one concern each) | what 1017 needs to run correctly on the KTransformers hybrid MoE: the FP8 step below, the SwiGLU clamp passed to the CPU experts, the expert mask kt-kernel takes, `-1` ids kept out of the Marlin MoE, a configurable load barrier, the chat encoding of the current reference (tool namespaces, the `drop_thinking` turn boundary, the reasoning-effort budgets), and the SM12x sparse attention fixes (RTX 50, RTX PRO Blackwell, DGX Spark; the code runs on nothing else) |
    | 1 | `sglang-tier1-long-prompts.patch` | the indexer's memory on long prompts |
    | 2 | `sglang-tier2/` (one patch per feature, [docs/tier2.md](docs/tier2.md); `SGLANG_FEATURES` picks some) | streamed prefill, the lends, hot experts and placement, the KV pool on remappable memory, the GPU MoE and FP8 kernels (the streamed prefill needs SM89 or newer) |
    | 3 | `sglang-tier3-no-p2p.patch` | all-reduce through pinned host memory, for two GPUs without peer access |
@@ -134,7 +140,7 @@ The earlier release did not have this step; 1017's weights were made with it.
   checkpoint's own tilelang `act_quant` (`tools/dsv4-o-fp8-qdq-test.py`). GPUs older
   than sm89 get an fp32 emulation of the e4m3 rounding, also bit-exact
   (`tools/e4m3-emulation-test.py`).
-- The tree patch includes it, behind `SGLANG_DSV4_O_FP8_QDQ_BLOCK`.
+- Tier 0 (`patches/sglang-tier0/01-o-fp8-qdq.patch`) includes it, behind `SGLANG_DSV4_O_FP8_QDQ_BLOCK`.
   `tools/o-fp8-qdq-block.sh` (sourced by `serve.sh`) reads the block size from the
   checkpoint's own `inference/model.py`. The step therefore turns on for 1017 (block
   32) and stays off for the earlier release.
@@ -174,9 +180,10 @@ experts than real text, so these figures are lower than with text.
 
 ## Fixes from dsv41-flash-dual-epyc
 
-Two fixes by f-wunderlich, from the earlier release's repo, are in the tree patch:
-SM120 attention no longer reads an uninitialized padding page (#3), and
-`--kt-num-gpu-experts 0` starts with Marlin (#2).
+Two fixes by f-wunderlich, from the earlier release's repo, are in the patches: SM120
+attention no longer reads an uninitialized padding page (#3, tier 0), and
+`--kt-num-gpu-experts 0` starts with Marlin (#2, tier 0 for the MoE call and tier 2's `loading`
+for the loader).
 
 ## Not done
 

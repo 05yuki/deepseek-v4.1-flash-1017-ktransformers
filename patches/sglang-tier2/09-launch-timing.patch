@@ -1,3 +1,28 @@
+From ef959105338dd81fce3d102750b0576618490312 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:35 +0900
+Subject: [PATCH] [tier 2] launch-timing: KT_LAUNCH_TIMING, a timeline of the
+ weight load
+
+`KT_LAUNCH_TIMING=1` prints a per-step timeline of the weight load on
+each rank, with the disk bytes each step read, and sums the steps that
+repeat (tensor fetches, a layer's CPU experts) in a table at the end.
+`KT_LAUNCH_TIMING_STACKS=<seconds>` also samples the loading thread's
+stack. It wraps the load's functions in place; the ones from patches
+that are not applied are skipped.
+
+Numerics: No effect on outputs.
+
+Prerequisites: none; applies alone on tier 1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ .../sglang/srt/layers/moe/kt_launch_timing.py | 397 ++++++++++++++++++
+ .../sglang/srt/model_executor/model_runner.py |   5 +
+ 2 files changed, 402 insertions(+)
+ create mode 100644 python/sglang/srt/layers/moe/kt_launch_timing.py
+
 diff --git a/python/sglang/srt/layers/moe/kt_launch_timing.py b/python/sglang/srt/layers/moe/kt_launch_timing.py
 new file mode 100644
 index 00000000..ca4bce4b

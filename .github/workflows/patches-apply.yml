@@ -31,7 +31,7 @@ jobs:
           git checkout -q FETCH_HEAD
           test "$(git rev-parse HEAD)" = "$SGLANG_COMMIT"
           # tiers 0 and 1, then each tier-2 feature without prerequisites alone on them
-          for t in ../patches/sglang-tier0-run.patch ../patches/sglang-tier1-long-prompts.patch; do
+          for t in ../patches/sglang-tier0/[0-9][0-9]-*.patch ../patches/sglang-tier1-long-prompts.patch; do
             git apply --whitespace=nowarn "$t"
           done
           for f in ../patches/sglang-tier2/[0-9][0-9]-*.patch; do

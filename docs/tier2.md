@@ -8,8 +8,8 @@ was applied.
 A patch with no prerequisites applies alone on tier 1. A patch with prerequisites applies on tier 1
 plus those patches (`patches/sglang-tier2/requires.txt`, checked by `setup.sh`). Combinations that
 apply: each patch alone, all of them, and all of them but any one (with what needs it); other
-combinations may need `git apply -3`. Served and checked end to end so far: all of them, and none.
-The effect of each patch on its own is being measured; the numbers will follow here.
+combinations may need `git apply -3`. Served and checked end to end: all of them, none, and each
+set measured in [Effect of each patch](#effect-of-each-patch).
 
 Defaults are given as *code / serve.sh*: what the Python does with the variable unset, and what
 `serve.sh` (with `lib/kt-kv-hot-default.sh` and `lib/kt-lend-auto.sh`) sets. Switches marked "on in
@@ -33,6 +33,50 @@ the code" are on as soon as the patch is applied.
 | 14 | [`14-stream-prefill.patch`](#14-stream-prefill) | +1890 / -14 | `loading`, `placement`, `prefill-lend` |
 | 15 | [`15-kv-lend-plan.patch`](#15-kv-lend-plan) | +1736 / -5 | `kv-vmm`, `prefill-lend` |
 | 16 | [`16-hot-lend.patch`](#16-hot-lend) | +26 / -1 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan` |
+
+## Effect of each patch
+
+Each patch added to a base, one launch each, on the machine in the README (2 × EPYC 7452, 2 × RTX
+5070 Ti), `TIER=3` with the kt-kernel patch and `SGLANG_FEATURES` set to the base plus the patch.
+Decode is the median of the server's generation throughput over four 1,024-token Japanese prose
+answers; free VRAM is what the server reports after loading (`available_gpu_mem`, GPU 0).
+
+Decode and memory, on tiers 0, 1 and 3 with no tier-2 patch (`SGLANG_FEATURES=none`):
+
+| added | decode (tok/s) | free VRAM (GB) |
+|---|---|---|
+| nothing (base) | 15.9 | 3.23 |
+| `fp8-decode` | 27.7 | 3.23 |
+| `placement` | 18.2 | 3.23 |
+| `engram-row-prefetch` | 16.3 | 3.22 |
+| `wo-a-fp8` | 16.1 | 3.81 |
+| `wo-a-fp8`, `vision-on-demand` | 16.1 | 4.76 |
+| `gpu-moe-fp32` | 15.9 | 3.27 |
+| `cutlass-kt-expert-count`, `thinking-default-parser`, `loading`, `launch-timing`, `pool-swa-guard`, `kv-vmm`, `prefill-lend` (each alone) | 15.8 to 15.9 | 3.16 to 3.23 |
+
+The patches in the last row do not aim at decode: `loading` and `launch-timing` are about startup,
+`kv-vmm` and `prefill-lend` about prefill (below), the others fixes and guards. The gains do not
+add up: a token waits for the slower of the CPU and GPU experts in each layer, so a cut on one
+side shows only where that side was the slower.
+
+A 35,000-token prompt, on the streamed-prefill set (`loading`, `placement`, `prefill-lend`,
+`stream-prefill`; without it the prompt's experts run on the CPU). The first prompt after launch
+pays a one-time warm-up; the second is a new 35,000-token prompt on the warm server:
+
+| added | 35K, first (s) | 35K, second (s) | decode (tok/s) | free VRAM (GB) |
+|---|---|---|---|---|
+| no tier-2 patch (the experts on the CPU) | 846.5 | | | |
+| the streamed-prefill set (base) | 83.1 | 65.4 | 17.9 | 2.65 |
+| `gpu-moe-fp32` | 80.6 | 62.7 | 17.8 | 2.67 |
+| `wo-a-fp8` | 83.0 | 65.4 | 18.2 | 3.24 |
+| `kv-vmm`, `kv-lend-plan` | 65.3 | 47.5 | 17.9 | 2.75 |
+| `kv-vmm`, `kv-lend-plan`, `hot-lend` | 60.6 | 42.2 | 18.7 | 2.72 |
+| all sixteen | 54.3 | 35.3 | 46.0 | 4.23 |
+
+Numerics: the 2-token NLL check gives the base's value for every patch above but four.
+`fp8-decode` and `gpu-moe-fp32` change the GPU arithmetic (see their Numerics lines; `gpu-moe-fp32`
+gives the same value again on a second launch), and `placement` and `hot-lend` change which experts
+run on the GPU.
 
 ## 01 fp8-decode
 

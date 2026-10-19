@@ -1,0 +1,63 @@
+From bd5ef371e31617131e9f35fe8466a7d5d02cccba Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:32 +0900
+Subject: [PATCH] [tier 0] kt: pass the model's SwiGLU clamp to the CPU experts
+
+DeepSeek V4 / V4.1 clamp every expert's SwiGLU (swiglu_limit 10.0: gate
+<= limit, |up| <= limit before silu(gate) * up). The resident GPU runner
+applies it from moe_runner_config; KTMoEWrapper was built without it, so
+the CPU experts ran unclamped. KT_SWIGLU_CLAMP=0 leaves it out. Same
+change as sgl-project/sglang#43500.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ python/sglang/srt/layers/moe/kt_ep_wrapper.py | 21 +++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+index acca3ad9..79aa89b8 100644
+--- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
++++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+@@ -7,6 +7,7 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
+ (using any quantization method) and CPU experts (using AMX/AVX instructions).
+ """
+ 
++import os
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Optional
+ 
+@@ -114,6 +115,25 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
+     return topk_ids
+ 
+ 
++def _kt_swiglu_kwargs(layer: torch.nn.Module) -> dict:
++    """{"swiglu_limit": limit} for KTMoEWrapper when the layer clamps its SwiGLU, else {}.
++    The value is what the resident GPU runner applies: moe_runner_config.swiglu_limit
++    (DeepSeek V4: gate <= limit, |up| <= limit before silu(gate) * up). Without it the
++    CPU experts run unclamped. KT_SWIGLU_CLAMP=0 leaves it out."""
++    if os.environ.get("KT_SWIGLU_CLAMP", "1") == "0":
++        return {}
++    cfg = getattr(layer, "moe_runner_config", None)
++    limit = getattr(cfg, "swiglu_limit", None)
++    if not limit:
++        return {}
++    if getattr(cfg, "gemm1_alpha", None) is not None or getattr(cfg, "gemm1_clamp_limit", None) is not None:
++        raise RuntimeError(
++            "KT_SWIGLU_CLAMP: this layer uses gemm1_alpha/gemm1_clamp_limit, which "
++            "the KT CPU wrapper does not map; set KT_SWIGLU_CLAMP=0"
++        )
++    return {"swiglu_limit": float(limit)}
++
++
+ class KTEPWrapperMethod(FusedMoEMethodBase):
+     """Wrapper for any MoE quantization method to enable CPU-GPU expert parallelism.
+ 
+@@ -234,6 +254,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
+                 method=self.kt_config.method,
+                 max_deferred_experts_per_token=layer_max_deferred,
++                **_kt_swiglu_kwargs(layer),
+             )
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

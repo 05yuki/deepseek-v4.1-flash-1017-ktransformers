@@ -4,7 +4,7 @@
 
 | tier | file | applies to |
 |---|---|---|
-| 0 | `patches/sglang-tier0-run.patch` | sgl-project/sglang `1aa0e962` (formerly the `dsv4.1` branch) |
+| 0 | `patches/sglang-tier0/NN-*.patch` | sgl-project/sglang `1aa0e962` (formerly the `dsv4.1` branch), one concern each |
 | 1 | `patches/sglang-tier1-long-prompts.patch` | the same, after tier 0 |
 | 2 | `patches/sglang-tier2/NN-*.patch` | the same, after tier 1: one patch per feature ([tier2.md](tier2.md)) |
 | 3 | `patches/sglang-tier3-no-p2p.patch` | the same, after tier 2 |
@@ -21,6 +21,11 @@
   prefill computes through FlashInfer's bf16 CUTLASS MoE (SM89 or newer). It needs the
   kt-kernel patch (shared expert memory). `serve.sh` turns its features on from tier 2.
 - **Tier 3** is what depends on the machine: two GPUs without peer access.
+
+The SGLang patches are the commits of branch `dsv41-1017` of
+[05yuki/sglang-upstream](https://github.com/05yuki/sglang-upstream/tree/dsv41-1017) on `1aa0e962`, one
+concern a commit, in `git format-patch` form: each file carries its commit message (what the change
+is for, its switch, how it was checked). `git log` on the branch reads as the list below.
 
 Each section below says its tier.
 

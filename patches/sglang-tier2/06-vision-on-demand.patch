@@ -1,3 +1,29 @@
+From 33dc6a7bf49bc980667bc67cc423feeea861d162 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:35 +0900
+Subject: [PATCH] [tier 2] vision-on-demand: keep the vision tower in host
+ memory between image batches
+
+The vision tower's GPU memory when serving text.
+`SGLANG_DSV4_VISION_ON_DEMAND=1` moves the tower and aligner to pinned
+host memory after loading and puts them on the GPU only while a batch's
+images are encoded (if the KV plan of `kv-lend-plan` is applied, it
+accounts for the copy). `--language-model-only` makes DeepSeek V4 build
+and load no tower at all, as SGLang's flag does for other multimodal
+models.
+
+Numerics: Bit-identical: placement only (image batches pay a
+host-to-device copy). `--language-model-only` leaves text output
+unchanged.
+
+Prerequisites: `wo-a-fp8`.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ python/sglang/srt/models/deepseek_v4.py | 102 +++++++++++++++++++++---
+ 1 file changed, 90 insertions(+), 12 deletions(-)
+
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
 index 8abaa5bd..692242ea 100644
 --- a/python/sglang/srt/models/deepseek_v4.py

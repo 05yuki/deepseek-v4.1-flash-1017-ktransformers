@@ -1,3 +1,31 @@
+From aaf805d586fb52f8a128e1aa92bbdf35e6b15451 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:35 +0900
+Subject: [PATCH] [tier 2] wo-a-fp8: keep wo_a in the checkpoint's FP8, read by
+ a GEMV in decode
+
+DeepSeek V4 attention's `wo_a` in FP8
+(`deepseek_common/wo_a_fp8_gemv.py`). `SGLANG_DSV4_WO_A_FP8_NATIVE=1`
+keeps the checkpoint's FP8 `wo_a` as loaded (no bf16 copy): decode reads
+it with an FP8 GEMV, prefill dequantizes it into one shared bf16 buffer
+per device. `SGLANG_DSV4_WO_A_FP8_GEMV=1` adds an exact FP8 copy of a
+bf16 `wo_a` for decode, and `SGLANG_DSV4_WO_A_FP8_ONLY=1` then frees the
+bf16 weight.
+
+Numerics: Decode GEMV not bit-identical (fp32 summation order; 99.98% of
+outputs equal, the rest 1 ulp). The prefill dequantize path is
+bit-identical (the same bf16 values).
+
+Prerequisites: none; applies alone on tier 1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ .../models/deepseek_common/wo_a_fp8_gemv.py   |  73 +++++++++
+ python/sglang/srt/models/deepseek_v4.py       | 151 +++++++++++++++++-
+ 2 files changed, 222 insertions(+), 2 deletions(-)
+ create mode 100644 python/sglang/srt/models/deepseek_common/wo_a_fp8_gemv.py
+
 diff --git a/python/sglang/srt/models/deepseek_common/wo_a_fp8_gemv.py b/python/sglang/srt/models/deepseek_common/wo_a_fp8_gemv.py
 new file mode 100644
 index 00000000..8ff875fa
