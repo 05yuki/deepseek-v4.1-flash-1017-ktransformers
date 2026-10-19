@@ -221,6 +221,9 @@ Tier 2.
   decode; the SwiGLU clamp is applied (`KT_SWIGLU_CLAMP`).
 - **Scale codes** (`KT_MXFP4_SCALE_CODES`, on): one byte per 32-value scale group instead
   of an fp32 scale, 15% fewer bytes a weight, bit-identical results.
+- **Decode reads** (`KT_MXFP4_DEC_VCONV`, `KT_MXFP4_DEC_PFS=1024`, on): each task converts the
+  activation row to the kernel's order with PSHUFB instead of a scalar loop, and the weights
+  are prefetched 1 KB ahead, a line every 4 groups. Bit-identical results.
 - **Shared expert memory** (`KT_EXPERT_SHM`, on): the experts live in shared memory on 2 MB
   pages, which the GPU ranks map to stream from (the streamed prefill).
 - **Placement on the CPU side**: each NUMA part loads the experts the placement assigns to
@@ -253,6 +256,8 @@ them unchanged, which may not be their best:
 - `tools/e4m3-emulation-test.py`: the fp32 e4m3 rounding for GPUs before sm89.
 - `tools/dsv41-encoding-check.py`: SGLang's chat encoding and tool parsing against the
   checkpoint's `encoding/encoding.py` and its tests, byte for byte.
+- `tools/kt-mxfp4-decode-bw.py`: the CPU experts' decode call on one socket (time, read rate,
+  output hash), to compare kt-kernel switches and against the socket's read bandwidth.
 - `tools/mxfp4-fp32-moe-test.py`: the GPU MoE kernels against an fp64 reference and Marlin,
   and their outputs repeating bit for bit.
 - `tools/bench.py`: the README's decode and prefill numbers, against a running server.

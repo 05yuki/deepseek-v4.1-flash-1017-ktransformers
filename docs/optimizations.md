@@ -21,9 +21,10 @@ How it was measured:
 
 ## Decode
 
-Where the time goes now (1017, defaults, nsys): a token takes 22.5 ms. The first GPU is busy
-for 13.0 ms of it and waits 9.0 ms for the CPU experts, which read about 88 GB/s a socket,
-78% of what the two sockets' eight CCDs can read (226 GB/s).
+Where the time goes (1017, nsys, before the CPU experts' decode reads below): a token took
+22.5 ms. The first GPU was busy for 13.0 ms of it and waited 9.0 ms for the CPU experts. On
+one socket alone (`tools/kt-mxfp4-decode-bw.py`, 32 threads, 4 experts a call) the CPU kernel
+read 75 GB/s of the 118 GB/s the socket streams, 83 GB/s after the decode reads.
 
 | change | before → after | release |
 |---|---|---|
@@ -38,6 +39,7 @@ for 13.0 ms of it and waits 9.0 ms for the CPU experts, which read about 88 GB/s
 | The CPU's MXFP4 scales as one-byte codes instead of fp32 (`KT_MXFP4_SCALE_CODES`) | 34.81 → 36.06 tok/s, output bit-identical | 1017 |
 | The engram row lookups start with the token on a side stream, not at layers 1 and 14 (`SGLANG_DSV41_ENGRAM_PREFETCH_ROWS`) | 0.7 ms a layer of GPU idle gone; 35.9 → 37.4 tok/s, values unchanged | 1017 |
 | Decode's block-FP8 GEMMs through a GEMV stepping K by 512 instead of the 32-value scale group (`SGLANG_FP8_GEMV`) | `wq_b` 78.9 → 33.7 µs, engram `wkv` 552 → 208 µs; 37.4 → 44.2 tok/s | 1017 |
+| The CPU experts' activation conversion with PSHUFB and a weight prefetch 1 KB ahead (`KT_MXFP4_DEC_VCONV`, `KT_MXFP4_DEC_PFS`) | a call 502 → 455 µs, output bit-identical; 44.72 → 46.01 tok/s | 1017 |
 
 The GPU experts run on Triton kernels in the checkpoint's own MXFP4 layout
 (`SGLANG_MXFP4_MOE_FP32`), rounding to bf16 once, at the weighted sum. Marlin rounded seven
@@ -77,6 +79,10 @@ None of these takes tokens from the KV pool. The 1M-token pool comes first.
 - **A placement from 1017's own routing**: recorded on 3,300 tokens of one topic, it left more
   routes on the CPU on other prose (decode 36.06 → 35.56). The earlier release's placement
   stays. A small static sample is the wrong tool; an adaptive cache is the next step.
+- **The CPU kernel's decode, other ways** (one socket, 4 experts a call): whole weight rows
+  prefetched at once (down -13 µs, gate/up +12 µs), the activation's conversion done once per
+  expert on one thread (502 → 545 µs), row slices sized to fill whole rounds of the threads
+  (gate/up 278 → 299 µs).
 - **fp32 intermediates in the CPU experts**: no NLL change; the per-expert rounding is not what
   moves the NLL any more.
 - **SWA bounded replay** (`--enable-decoder-swa-bounded-replay`): halves prefill, but the third

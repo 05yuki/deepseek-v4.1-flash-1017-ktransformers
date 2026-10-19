@@ -32,18 +32,16 @@ KT_COMMIT=95009ea6856c0799e517e93cb12be5e8494bc7ce
 TIER="${TIER:-3}"
 [[ "$TIER" =~ ^[0123]$ ]] || { echo "TIER must be 0, 1, 2 or 3" >&2; exit 2; }
 SGLANG_TIER_PATCHES=(sglang-tier0-run.patch sglang-tier1-long-prompts.patch sglang-tier2-speed.patch sglang-tier3-no-p2p.patch)
-kt_variant=pinned
-(( TIER >= 2 )) && kt_variant=patched
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 mkdir -p third_party build state
 step() { printf '\n== %s\n' "$*"; }
-# a step's marker file holds what it built (an empty one, from before tiers, is the full build)
-built_as() {
-  local marker="$1" want="$2" full="$3" got
-  [[ -f "$marker" ]] || return 1
-  got="$(cat "$marker")"
-  [[ "$got" == "$want" || ( -z "$got" && "$want" == "$full" ) ]]
-}
+# a step's marker file holds what it built: the tier or variant and a hash of the patches, so a
+# changed patch is applied (and kt-kernel rebuilt) again
+built_as() { [[ -f "$1" && "$(cat "$1")" == "$2" ]]; }
+patch_hash() { (cd "$here/patches" && cat "$@") | sha256sum | cut -c1-12; }
+sglang_state="$TIER $(patch_hash "${SGLANG_TIER_PATCHES[@]:0:TIER+1}")"
+kt_variant=pinned
+(( TIER >= 2 )) && kt_variant="patched $(patch_hash kt-kernel-tree.patch kt-kernel-llama-cpp.patch kt-kernel-load-prefetch.py)"
 # a patch is checked against the pinned tree first; nothing is applied when it does not fit
 apply_checked() {
   local tree="$1" patch="$2"
@@ -58,8 +56,7 @@ step "SGLang @ ${SGLANG_COMMIT:0:8}, tier $TIER"
 if [[ ! -d third_party/sglang/.git ]]; then
   git clone --filter=blob:none https://github.com/sgl-project/sglang.git third_party/sglang
 fi
-# (a tree from before the tiers lacks tier 0's chat encoding: applied again)
-if ! built_as third_party/sglang/.dsv41-1017-patched "$TIER" none; then
+if ! built_as third_party/sglang/.dsv41-1017-patched "$sglang_state"; then
   # the dsv4.1 branch this commit came from is gone from sgl-project/sglang; the commit is
   # still fetchable there, and tagged in a fork as a fallback
   git -C third_party/sglang fetch --quiet origin "$SGLANG_COMMIT" 2>/dev/null \
@@ -69,19 +66,19 @@ if ! built_as third_party/sglang/.dsv41-1017-patched "$TIER" none; then
   for ((t = 0; t <= TIER; t++)); do
     apply_checked third_party/sglang "$here/patches/${SGLANG_TIER_PATCHES[$t]}"
   done
-  echo "$TIER" > third_party/sglang/.dsv41-1017-patched
+  echo "$sglang_state" > third_party/sglang/.dsv41-1017-patched
 fi
 
 step "KTransformers @ ${KT_COMMIT:0:8}, $kt_variant"
 if [[ ! -d third_party/ktransformers/.git ]]; then
   git clone --filter=blob:none https://github.com/kvcache-ai/ktransformers.git third_party/ktransformers
 fi
-if ! built_as third_party/ktransformers/.dsv41-1017-patched "$kt_variant" patched; then
+if ! built_as third_party/ktransformers/.dsv41-1017-patched "$kt_variant"; then
   git -C third_party/ktransformers checkout --quiet --force "$KT_COMMIT"
   git -C third_party/ktransformers clean -fdq
   git -C third_party/ktransformers submodule update --init --force --quiet third_party/llama.cpp third_party/pybind11
   git -C third_party/ktransformers/third_party/llama.cpp clean -fdq
-  if [[ "$kt_variant" == patched ]]; then
+  if [[ "$kt_variant" == patched* ]]; then
     apply_checked third_party/ktransformers "$here/patches/kt-kernel-tree.patch"
     apply_checked third_party/ktransformers/third_party/llama.cpp "$here/patches/kt-kernel-llama-cpp.patch"
   fi
@@ -121,7 +118,7 @@ fi
 
 step "kt-kernel (CPU experts)"
 site="$("$py" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-if ! built_as build/.kt-kernel-done "$kt_variant" patched; then
+if ! built_as build/.kt-kernel-done "$kt_variant"; then
   if [[ -z "${KT_CUDA_ARCHS:-}" ]] && command -v nvidia-smi >/dev/null; then
     KT_CUDA_ARCHS="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d . | sort -u | paste -sd';')"
   fi
@@ -133,7 +130,7 @@ if ! built_as build/.kt-kernel-done "$kt_variant" patched; then
   echo "CUDA archs $CPUINFER_CUDA_ARCHS, CPU target $CPUINFER_CPU_INSTRUCT"
   pip_install --no-deps --no-build-isolation third_party/ktransformers/kt-kernel
   # each expert layer is read into the page cache in parallel before kt-kernel copies it
-  [[ "$kt_variant" == patched ]] && "$py" patches/kt-kernel-load-prefetch.py "$site"
+  [[ "$kt_variant" == patched* ]] && "$py" patches/kt-kernel-load-prefetch.py "$site"
   echo "$kt_variant" > build/.kt-kernel-done
 fi
 

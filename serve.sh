@@ -37,7 +37,7 @@ alias_name="${SGLANG_SERVED_NAME:-$(basename "$model")}"
 [[ -f "$source_dir/sglang/srt/layers/engram.py" ]] || { echo "run ./setup.sh first (patched SGLang missing)" >&2; exit 3; }
 [[ -f "$adapter_dir/librow_store.so" ]] || { echo "run ./setup.sh first (engram-adapter/librow_store.so missing)" >&2; exit 3; }
 # the tier setup.sh applied (an empty marker, from before tiers, is the full tree)
-tier="$(cat "$here/third_party/sglang/.dsv41-1017-patched" 2>/dev/null || true)"
+tier="$(cut -d' ' -f1 "$here/third_party/sglang/.dsv41-1017-patched" 2>/dev/null || true)"
 tier="${tier:-3}"
 if [[ ! -f "$engram_dir/engram-manifest.json" ]]; then
   "$python" "$here/tools/make-engram-manifest.py" "$model" "$engram_dir" >&2
@@ -145,6 +145,10 @@ export KT_SWIGLU_CLAMP="${KT_SWIGLU_CLAMP:-1}"
 # the CPU experts read a one-byte code per 32-value scale group instead of an fp32 scale
 # (15% fewer bytes a weight, bit-identical; 0: fp32 scales)
 export KT_MXFP4_SCALE_CODES="${KT_MXFP4_SCALE_CODES:-1}"
+# the CPU experts' decode converts the activation row with PSHUFB and prefetches the weights
+# 1 KB ahead, a line every 4 groups (bit-identical; 0 / 0: as before)
+export KT_MXFP4_DEC_VCONV="${KT_MXFP4_DEC_VCONV:-1}"
+export KT_MXFP4_DEC_PFS="${KT_MXFP4_DEC_PFS:-1024}"
 export SGLANG_UNBALANCED_LOAD_TIMEOUT_S="${SGLANG_UNBALANCED_LOAD_TIMEOUT_S:-1800}"
 # the first launch of a new environment compiles its kernels inside the warmup request
 # (over 10 minutes here), past SGLang's 600 s default; later launches reuse the cache
