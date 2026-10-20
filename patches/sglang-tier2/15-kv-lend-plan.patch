@@ -1,4 +1,4 @@
-From 09736901dade54046f8e0c67c0122490c1cf0d5b Mon Sep 17 00:00:00 2001
+From 111709bcbe227ab15ca7a1c362995af64af9d9f5 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 2] kv-lend-plan: lend the KV pool's free pages to
@@ -25,11 +25,11 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
  .../sglang/srt/layers/moe/kt_kv_hot_lend.py   | 550 +++++++++++
  .../srt/layers/moe/kt_kv_prefill_lend.py      | 914 ++++++++++++++++++
- .../sglang/srt/layers/moe/kt_prefill_plan.py  | 248 +++++
+ .../sglang/srt/layers/moe/kt_prefill_plan.py  | 253 +++++
  python/sglang/srt/managers/schedule_batch.py  |  11 +-
  python/sglang/srt/managers/scheduler.py       |   9 +
  .../srt/mem_cache/kv_cache_configurator.py    |  19 +-
- 6 files changed, 1746 insertions(+), 5 deletions(-)
+ 6 files changed, 1751 insertions(+), 5 deletions(-)
  create mode 100644 python/sglang/srt/layers/moe/kt_kv_hot_lend.py
  create mode 100644 python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
  create mode 100644 python/sglang/srt/layers/moe/kt_prefill_plan.py
@@ -1512,10 +1512,10 @@ index 0000000000..ea5ba22626
 +            setattr(a, k, fn)
 diff --git a/python/sglang/srt/layers/moe/kt_prefill_plan.py b/python/sglang/srt/layers/moe/kt_prefill_plan.py
 new file mode 100644
-index 0000000000..305d292e92
+index 0000000000..a2b878d9f2
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_prefill_plan.py
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,253 @@
 +"""The prefill chunk planned per request (KT_PREFILL_PLAN=1, with the prefill lend
 +and, for the room of the free KV pages, KT_PREFILL_KV_LEND=1).
 +
@@ -1656,6 +1656,11 @@ index 0000000000..305d292e92
 +        mine = torch.cuda.mem_get_info()[0] + delta
 +    else:
 +        mine = -1
++    if mine >= 0:
++        # what earlier windows left in the lend's scratch (the stream's buffers and
++        # graph pool) is reused by the next chunks, and the fitted cost includes it
++        # (kt_lend.end_window)
++        mine += int(kt_lend.STATE.get("scratch_kept", 0) or 0)
 +    if mine >= 0 and kt_lend.STATE.get("phase") != "prefill":
 +        # the hot lend's share of the driver's free memory comes back at the window's
 +        # start (sglang-kt-kv-hot-spare-plan.py)

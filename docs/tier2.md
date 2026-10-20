@@ -73,9 +73,9 @@ after launch pays a one-time warm-up; the second is a new 35,000-token prompt on
 | the streamed-prefill set (base) | 56.8 | 38.8 | 18.1 | 2.59 |
 | `gpu-moe-fp32` | 55.3 | 37.2 | 18.4 | 2.62 |
 | `wo-a-fp8` | 56.9 | 38.8 | 18.3 | 3.17 |
-| `kv-vmm`, `kv-lend-plan` | 46.1 | 31.8 | 18.4 | 2.69 |
-| `kv-vmm`, `kv-lend-plan`, `hot-lend` | 43.5 | 28.5 | 18.8 | 2.66 |
-| all sixteen | 42.2 | 23.5 | 45.3 | 4.24 |
+| `kv-vmm`, `kv-lend-plan` | 43.9 | 24.5 | 18.4 | 2.69 |
+| `kv-vmm`, `kv-lend-plan`, `hot-lend` | 44.3 | 24.7 | 19.0 | 2.66 |
+| all sixteen | 41.2 | 20.9 | 45.6 | 4.24 |
 
 Numerics: the 2-token NLL check gives the base's value for every patch above but four.
 `fp8-decode` and `gpu-moe-fp32` change the GPU arithmetic (see their Numerics lines), and
@@ -375,7 +375,7 @@ Switches (code / serve.sh):
 
 Numerics: The lend is bit-identical. The plan picks per-request chunk sizes, so the prefill chunking (and NLL) moves against a fixed chunk. The SWA lend changes memory only.
 
-Effect: the 35K prompt on the streamed-prefill set goes 56.8 → 46.1 s (first, 5 chunks of 7,168 rows) and 38.8 → 31.8 s (second, 6 chunks of 6,144): each chunk streams the CPU experts to the GPU once, so fewer chunks take less time. The second prompt gets smaller chunks because the stream's buffers the first prompt grew (1.4 GB) stay mapped, and the plan counts them as used although the next chunk reuses them. Decode does not change (15.9 alone). The plan learns its cost a row from the setup's earlier launches, so this row and the next are measured after the setup has launched before.
+Effect: the 35K prompt on the streamed-prefill set goes 56.8 → 43.9 s (first) and 38.8 → 24.5 s (second), 4 chunks of 9,216 rows each time: each chunk streams the CPU experts to the GPU once, so fewer chunks take less time. The stream's buffers the first prompt grew (1.4 GB) stay mapped, and the plan counts them as free for the next prompt, whose chunks reuse them. Decode does not change (15.9 alone). The plan learns its cost a row from the setup's earlier launches, so this row and the next are measured after the setup has launched before.
 
 Prerequisites: `kv-vmm`, `prefill-lend`.
 
@@ -401,7 +401,7 @@ Switches (code / serve.sh):
 
 Numerics: Not bit-identical: the lent experts run in the GPU MoE kernel instead of kt-kernel, and how many are lent depends on the free KV pages at the time, so decode output depends on load.
 
-Effect: decode 18.4 → 18.8 tok/s on the streamed-prefill set with `kv-vmm` and `kv-lend-plan`. The 35K prompt goes 46.1 → 43.5 s (first) and 31.8 → 28.5 s (second): the plan saw more free memory at the window's start (8,064 against 6,812 MiB for the first prompt) and cut 4 chunks of 9,216 rows and then 5 of 7,168, against 5 of 7,168 and 6 of 6,144.
+Effect: decode 18.4 → 19.0 tok/s on the streamed-prefill set with `kv-vmm` and `kv-lend-plan`. The 35K prompt stays where it was (43.9 → 44.3 s first, 24.5 → 24.7 s second, 4 chunks of 9,216 rows in both): the slots give their memory back when a prefill window starts.
 
 Prerequisites: `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan`.
 

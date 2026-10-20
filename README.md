@@ -197,9 +197,9 @@ one request at a time), measured with `tools/bench.py`:
 
 | | |
 |---|---|
-| decode, Japanese prose | 43.5 tok/s |
-| prefill, 35,000-token prompt | 780 tok/s |
-| prefill, 131,072-token prompt | 764 tok/s |
+| decode, Japanese prose | 43.6 tok/s |
+| prefill, 35,000-token prompt | 779 tok/s |
+| prefill, 131,072-token prompt | 776 tok/s |
 | prefill, 524,288-token prompt | 659 tok/s |
 | prefill, 1,000,000-token prompt | 558 tok/s (30 minutes) |
 

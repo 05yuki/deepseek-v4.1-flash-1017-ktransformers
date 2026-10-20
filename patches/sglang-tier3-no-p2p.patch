@@ -1,4 +1,4 @@
-From ca9028936559b22a184d798da5f02cc69dcc9536 Mon Sep 17 00:00:00 2001
+From 5b498376f02fac42a415402d95ca0d94d99954e3 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:37 +0900
 Subject: [PATCH] [tier 3] distributed: all-reduce through pinned host memory
