@@ -1,4 +1,4 @@
-From 7f9fb3f2597b8ab830abdc813cc90037ba565995 Mon Sep 17 00:00:00 2001
+From 3b910acb1c7a4a48ec44e7889f050bf2cb08c450 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:33 +0900
 Subject: [PATCH] [tier 0] model-loader: make the unbalanced load barrier
@@ -16,10 +16,10 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  1 file changed, 3 insertions(+), 1 deletion(-)
 
 diff --git a/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py b/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
-index e3c22d6f..24f9b5e4 100644
+index 1210e458db..29bfcfd9cf 100644
 --- a/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
 +++ b/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
-@@ -48,7 +48,9 @@ logger = logging.getLogger(__name__)
+@@ -53,7 +53,9 @@ logger = logging.getLogger(__name__)
  _is_npu = is_npu()
  
  

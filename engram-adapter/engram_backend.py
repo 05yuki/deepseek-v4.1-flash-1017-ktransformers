@@ -125,14 +125,19 @@ def _start_timing_log(store, layer_id):
 def install(module):
     cls = module.EngramEmbedding
 
-    def init(self, num_embeddings, dim, layer_id):
+    def init(self, num_embeddings, dim, layer_id, column_bounds=None):
         torch.nn.Module.__init__(self)
         assert dim == DIM, dim
         par = module.get_parallel()
         self.dim, self.tp_size = dim, par.tp_size
         rank = par.tp_rank
-        self.row_start = num_embeddings * rank // self.tp_size
-        end = num_embeddings * (rank + 1) // self.tp_size
+        # SGLang's own split when it has one (rows on hash-column boundaries),
+        # so each row has exactly the owner the all-reduce expects
+        if column_bounds is not None and hasattr(module, "shard_range"):
+            self.row_start, end = module.shard_range(num_embeddings, column_bounds, rank, self.tp_size)
+        else:
+            self.row_start = num_embeddings * rank // self.tp_size
+            end = num_embeddings * (rank + 1) // self.tp_size
         self.rows, self.host_table = end - self.row_start, None
 
         table_dir = Path(os.environ["DSV41_ENGRAM_DIR"])

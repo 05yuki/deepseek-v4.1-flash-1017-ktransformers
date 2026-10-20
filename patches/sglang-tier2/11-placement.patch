@@ -1,4 +1,4 @@
-From ea9ca0d946097ede909adfbabf968a7915e1141f Mon Sep 17 00:00:00 2001
+From 5a7fbb65cc57feacb89f7f055c264ac0c60ea958 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 2] placement: map logical to physical expert ids for a
@@ -25,7 +25,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  1 file changed, 68 insertions(+)
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 9f0cc8ee..ba0e35ed 100644
+index c16902d1a8..5aef8bf7ac 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -151,7 +151,36 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
@@ -65,9 +65,9 @@ index 9f0cc8ee..ba0e35ed 100644
  
  
  def _kt_swiglu_kwargs(layer: torch.nn.Module) -> dict:
-@@ -376,6 +405,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
-         topk_output = dispatch_output.topk_output
-         topk_weights, topk_ids, _ = topk_output
+@@ -377,6 +406,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         # attributes, not unpacking: the packed variant carries a fourth field
+         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
  
 +        # KT_ROUTING_DUMP=<prefix>: accumulate a [layers, experts] histogram of
 +        # the routed expert ids on the GPU (a captured index_add_, so it keeps
@@ -77,7 +77,7 @@ index 9f0cc8ee..ba0e35ed 100644
          # Submit forward task to CPU (non-blocking)
          self.wrapper.submit_forward(
              x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
-@@ -423,6 +457,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -424,6 +458,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
  
          x = dispatch_output.hidden_states
          topk_output = dispatch_output.topk_output
@@ -103,7 +103,7 @@ index 9f0cc8ee..ba0e35ed 100644
  
          # Step 1: Submit CPU expert computation (non-blocking)
          if self.tp_rank == 0:
-@@ -468,6 +521,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -469,6 +522,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
  
          return StandardCombineInput(hidden_states=output)
  

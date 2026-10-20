@@ -1,6 +1,6 @@
-From 33dc6a7bf49bc980667bc67cc423feeea861d162 Mon Sep 17 00:00:00 2001
+From f0060216a3b378e59601a8364b56932b8b2f946b Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
-Date: Mon, 19 Oct 2026 16:44:35 +0900
+Date: Mon, 19 Oct 2026 22:59:06 +0900
 Subject: [PATCH] [tier 2] vision-on-demand: keep the vision tower in host
  memory between image batches
 
@@ -8,45 +8,42 @@ The vision tower's GPU memory when serving text.
 `SGLANG_DSV4_VISION_ON_DEMAND=1` moves the tower and aligner to pinned
 host memory after loading and puts them on the GPU only while a batch's
 images are encoded (if the KV plan of `kv-lend-plan` is applied, it
-accounts for the copy). `--language-model-only` makes DeepSeek V4 build
-and load no tower at all, as SGLang's flag does for other multimodal
-models.
+accounts for the copy). For no tower at all, SGLang's
+`--language-model-only` already skips it for DeepSeek V4.1.
 
 Numerics: Bit-identical: placement only (image batches pay a
-host-to-device copy). `--language-model-only` leaves text output
-unchanged.
+host-to-device copy).
 
 Prerequisites: `wo-a-fp8`.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
- python/sglang/srt/models/deepseek_v4.py | 102 +++++++++++++++++++++---
- 1 file changed, 90 insertions(+), 12 deletions(-)
+ python/sglang/srt/models/deepseek_v4.py | 98 ++++++++++++++++++++++---
+ 1 file changed, 87 insertions(+), 11 deletions(-)
 
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 8abaa5bd..692242ea 100644
+index 75a5300757..9618ed3c32 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -1,6 +1,7 @@
- from __future__ import annotations
- 
- import concurrent.futures
-+import contextlib
- import functools
- import logging
- import time
-@@ -523,6 +524,67 @@ def _o_fp8_qdq_block() -> int:
+@@ -467,6 +467,79 @@ def _o_fp8_qdq_block() -> int:
  _O_FP8_QDQ_BLOCK = _o_fp8_qdq_block()
  
  
-+# sglang-dsv4-vision-on-demand.py
-+_VISION_ON_DEMAND = __import__("os").environ.get("SGLANG_DSV4_VISION_ON_DEMAND", "0") == "1"
++def _vision_on_demand() -> bool:
++    """SGLANG_DSV4_VISION_ON_DEMAND=1: the vision tower lives in pinned host memory and
++    comes to the GPU only while a batch's images are encoded."""
++    import os
++
++    return os.environ.get("SGLANG_DSV4_VISION_ON_DEMAND", "0") == "1"
++
++
++_VISION_ON_DEMAND = _vision_on_demand()
 +
 +
 +def _vision_offload(model) -> None:
 +    """After loading: the vision tower's parameters to pinned host memory, their GPU
-+    storage freed (SGLANG_DSV4_VISION_ON_DEMAND=1)."""
++    storage freed."""
 +    if not _VISION_ON_DEMAND or getattr(model, "vision", None) is None:
 +        return
 +    store, nbytes = [], 0
@@ -65,8 +62,11 @@ index 8abaa5bd..692242ea 100644
 +    torch.cuda.empty_cache()
 +    model._vision_store = store
 +    model._vision_resident = False
-+    logger.info("vision tower on demand: %.1f MiB of %d parameters moved to pinned host memory",
-+                nbytes / 2**20, len(store))
++    logger.info(
++        "vision tower on demand: %.1f MiB of %d parameters moved to pinned host memory",
++        nbytes / 2**20,
++        len(store),
++    )
 +    try:
 +        # the prefill plan gives a request with images that much less room
 +        from sglang.srt.layers.moe import kt_prefill_plan
@@ -76,7 +76,7 @@ index 8abaa5bd..692242ea 100644
 +        pass
 +
 +
-+@contextlib.contextmanager
++@contextmanager
 +def _vision_on_gpu(model):
 +    """Around an image batch: the tower's parameters back on the GPU, freed after."""
 +    store = getattr(model, "_vision_store", None)
@@ -101,29 +101,14 @@ index 8abaa5bd..692242ea 100644
 +        for p, host in store:
 +            p.data = torch.empty(0, dtype=host.dtype, device=dev)
 +        model._vision_resident = False
- # sglang-dsv4-wo-a-fp8-native.py
- _WO_A_FP8_NATIVE = __import__("os").environ.get("SGLANG_DSV4_WO_A_FP8_NATIVE", "0") == "1"
- 
-@@ -4255,7 +4317,15 @@ class DeepseekV4ForCausalLM(nn.Module):
-         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
-         self.determine_num_fused_shared_experts()
-         self.vision = None
--        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
-+        # sglang-dsv4-language-model-only.py: --language-model-only builds no tower
-+        self._lm_only = bool(getattr(config, "language_model_only", False))
-+        if not self._lm_only:
-+            from sglang.srt.runtime_context import get_disagg
 +
-+            self._lm_only = bool(getattr(get_disagg(), "language_model_only", False))
-+        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0 and self._lm_only:
-+            logger.info("--language-model-only: the vision tower and aligner are not built")
-+        elif config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
-             if (
-                 get_parallel().attn_cp_size != 1
-                 or get_pp_group().world_size != 1
-@@ -4357,17 +4427,19 @@ class DeepseekV4ForCausalLM(nn.Module):
-     def _prepare_mm_embeddings(self, input_ids, forward_batch):
++
+ def _wo_a_fp8_native() -> bool:
+     """SGLANG_DSV4_WO_A_FP8_NATIVE=1: wo_a stays in the checkpoint's FP8 blocks (any block
+     size), read by a GEMV in single-token decode and dequantized for other forwards."""
+@@ -4708,17 +4781,19 @@ class DeepseekV4ForCausalLM(nn.Module):
  
+     def _prepare_mm_embeddings(self, input_ids, forward_batch):
          # Keep scheduler hash IDs intact: the shared embedder clamps its input in place.
 -        input_embeds, _ = embed_mm_inputs(
 -            mm_inputs_list=[
@@ -136,7 +121,7 @@ index 8abaa5bd..692242ea 100644
 -            input_embedding=self.get_input_embeddings(),
 -            multimodal_model=self,
 -        )
-+        # The tower is on the GPU for this batch only (sglang-dsv4-vision-on-demand.py).
++        # With SGLANG_DSV4_VISION_ON_DEMAND the tower is on the GPU for this batch only.
 +        with _vision_on_gpu(self):
 +            input_embeds, _ = embed_mm_inputs(
 +                mm_inputs_list=[
@@ -152,23 +137,11 @@ index 8abaa5bd..692242ea 100644
          forward_batch.mm_input_embeds = input_embeds
          return input_embeds
  
-@@ -4564,6 +4636,7 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4934,6 +5009,7 @@ class DeepseekV4ForCausalLM(nn.Module):
  
      def post_load_weights(self, is_nextn=False, weight_names=None):
          if not is_nextn:
 +            _vision_offload(self)
-             _build_wo_a_fp8_copies(self)
              _setup_wo_a_native(self)
          if self.wo_a_fp8:
-@@ -4809,6 +4882,11 @@ class DeepseekV4ForCausalLM(nn.Module):
-                 try:
-                     use_async_loading = should_async_load(loaded_weight)
- 
-+                    if getattr(self, "_lm_only", False) and name.startswith(
-+                        ("vision.", "aligner.", "image_")
-+                    ):
-+                        # sglang-dsv4-language-model-only.py: no tower to load into
-+                        continue
-                     name = self.remap_weight_name_to_dpsk_hf_format(
-                         name,
-                         is_nextn=is_nextn,
+             self._setup_fp8_wo_a_scales(is_nextn)

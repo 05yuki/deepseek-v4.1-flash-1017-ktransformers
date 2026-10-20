@@ -1,0 +1,42 @@
+From 325abcab76f1d59851f64d638e2f0b335949fc6c Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:34 +0900
+Subject: [PATCH] [tier 0] sm120: the V4.1 indexer takes the torch path on
+ SM12x
+
+The V4.1 indexer's is_sm100_or_newer() leaves out compute capability 12:
+DeepGEMM has no SM12x build, and the candidate indexer stopped at
+startup with "the candidate indexer needs DeepGEMM's paged sparse MQA
+logits". SM12x now takes Hopper's torch indexer.
+
+The sparse-MLA changes this tier carried on the earlier base (page-split
+of the extra KV source, lanes past topk_length masked) are not needed
+with FlashInfer 0.7.2: a 48K-token prefill runs without them and the NLL
+matches.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ .../srt/layers/attention/dsv4/v41_indexer/__init__.py    | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py b/python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py
+index dd03f26d51..fbc57c5f83 100644
+--- a/python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py
++++ b/python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py
+@@ -41,9 +41,12 @@ __all__ = [
+ 
+ @functools.cache
+ def is_sm100_or_newer() -> bool:
+-    # DeepGEMM's fp8_fp4 mqa-logits kernels need SM100+; Hopper and non-CUDA devices
+-    # take the torch indexer.
+-    return is_cuda() and torch.cuda.get_device_capability()[0] >= 10
++    # DeepGEMM's fp8_fp4 mqa-logits kernels need SM100+; Hopper, SM12x (no DeepGEMM
++    # build) and non-CUDA devices take the torch indexer.
++    if not is_cuda():
++        return False
++    major = torch.cuda.get_device_capability()[0]
++    return major >= 10 and major != 12
+ 
+ 
+ @functools.cache

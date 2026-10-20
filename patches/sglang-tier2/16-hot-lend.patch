@@ -1,4 +1,4 @@
-From 7a4893f0c5a74435ebb2ed5b93329a534ac89eb7 Mon Sep 17 00:00:00 2001
+From 91e1b450ea9868a28a4d3866cce67e9b5b6a2aae Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 2] hot-lend: more hot experts in the KV pool's free
@@ -27,10 +27,10 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  2 files changed, 26 insertions(+), 1 deletion(-)
 
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-index a1f0e7f0..bcd700b7 100644
+index a2d9fb1292..3baac7f676 100644
 --- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 +++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-@@ -1073,6 +1073,13 @@ class FusedMoE(torch.nn.Module):
+@@ -1105,6 +1105,13 @@ class FusedMoE(torch.nn.Module):
          ):
              if self.quant_method.num_gpu_experts != -1:
                  if expert_id >= self.quant_method.num_gpu_experts:
@@ -45,7 +45,7 @@ index a1f0e7f0..bcd700b7 100644
  
          self._weight_loader_impl(
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 5e5cdd9b..c56eee77 100644
+index a088c8c0e0..4c5a5b9afd 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -308,6 +308,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
@@ -72,7 +72,7 @@ index 5e5cdd9b..c56eee77 100644
          # Last layer loaded on this rank: optionally build the streamer and
          # pin every layer's arenas now (KT_GPU_STREAM_EARLY_INIT).
          num_layers = getattr(self.kt_config, "num_layers", None)
-@@ -520,10 +530,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -521,10 +531,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                  self.submit(layer, cpu_do)
                  cpu_share = True
  
@@ -89,7 +89,7 @@ index 5e5cdd9b..c56eee77 100644
  
          # Step 2: Prepare GPU computation by masking CPU expert IDs
          # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
-@@ -564,6 +579,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -565,6 +580,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                  hot_reference_check(self, layer, x, physical_ids, topk_output.topk_weights, output, streamer)
          else:
              output = torch.zeros_like(x)
@@ -98,7 +98,7 @@ index 5e5cdd9b..c56eee77 100644
  
          # Step 4: Synchronize CPU results and merge with GPU results
          if streamer is not None:
-@@ -574,6 +591,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -575,6 +592,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
              cpu_output = self.sync(x)
              output = output + cpu_output
  

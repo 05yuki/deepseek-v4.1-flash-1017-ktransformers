@@ -1,4 +1,4 @@
-From ef959105338dd81fce3d102750b0576618490312 Mon Sep 17 00:00:00 2001
+From aef52a5040ae8b695a5c0b1967c1a2e01e4c4ab0 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] [tier 2] launch-timing: KT_LAUNCH_TIMING, a timeline of the
@@ -25,7 +25,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 
 diff --git a/python/sglang/srt/layers/moe/kt_launch_timing.py b/python/sglang/srt/layers/moe/kt_launch_timing.py
 new file mode 100644
-index 00000000..ca4bce4b
+index 0000000000..39159dac25
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_launch_timing.py
 @@ -0,0 +1,397 @@
@@ -75,9 +75,9 @@ index 00000000..ca4bce4b
 +    global _rank
 +    if _rank is None:
 +        try:
-+            from sglang.srt.distributed import get_tensor_model_parallel_rank
++            from sglang.srt.runtime_context import get_parallel
 +
-+            _rank = get_tensor_model_parallel_rank()
++            _rank = get_parallel().tp_rank
 +        except Exception:
 +            return "?"
 +    return _rank
@@ -427,10 +427,10 @@ index 00000000..ca4bce4b
 +        log(f"loader not wrapped: {e}")
 +    log("installed")
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index cd539390..2d1e06ae 100644
+index ec85d24a66..5e4a7c1db0 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -1144,6 +1144,11 @@ class ModelRunner:
+@@ -1258,6 +1258,11 @@ class ModelRunner:
  
      def load_model(self):
          tic_total = time.perf_counter()

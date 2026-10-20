@@ -1,11 +1,11 @@
 # Tier 2, one patch per feature
 
 Tier 2 is one patch per feature in `patches/sglang-tier2/`, applied in the order of their numbers on
-SGLang `1aa0e962` after tiers 0 and 1; tier 3 applies on top. `setup.sh` applies all of them by
+SGLang main at `ed0b8f43` after tier 0 (tier 1 is empty); tier 3 applies on top. `setup.sh` applies all of them by
 default; `SGLANG_FEATURES=a,b,...` picks some (the names below), and `serve.sh` turns on only what
 was applied.
 
-A patch with no prerequisites applies alone on tier 1. A patch with prerequisites applies on tier 1
+A patch with no prerequisites applies alone on tier 0. A patch with prerequisites applies on tier 0
 plus those patches (`patches/sglang-tier2/requires.txt`, checked by `setup.sh`). Combinations that
 apply: each patch alone, all of them, and all of them but any one (with what needs it); other
 combinations may need `git apply -3`. Served and checked end to end: all of them, none, and each
@@ -39,64 +39,67 @@ the code" are on as soon as the patch is applied.
 Each patch added to a base, one launch each, on the machine in the README (2 × EPYC 7452, 2 × RTX
 5070 Ti), `TIER=3` with the kt-kernel patch and `SGLANG_FEATURES` set to the base plus the patch.
 Decode is the median of the server's generation throughput over four 1,024-token Japanese prose
-answers; free VRAM is what the server reports after loading (`available_gpu_mem`, GPU 0).
+answers; free VRAM is what the server reports after loading (`available_gpu_mem`, GPU 0). "For"
+says what the patch is meant to change; a patch whose number does not move here has its reason
+in its section.
 
 Decode and memory, on tiers 0, 1 and 3 with no tier-2 patch (`SGLANG_FEATURES=none`):
 
-| added | decode (tok/s) | free VRAM (GB) |
-|---|---|---|
-| nothing (base) | 15.9 | 3.23 |
-| `fp8-decode` | 27.7 | 3.23 |
-| `placement` | 18.2 | 3.23 |
-| `engram-row-prefetch` | 16.3 | 3.22 |
-| `wo-a-fp8` | 16.1 | 3.81 |
-| `wo-a-fp8`, `vision-on-demand` | 16.1 | 4.76 |
-| `gpu-moe-fp32` | 15.9 | 3.27 |
-| `cutlass-kt-expert-count`, `thinking-default-parser`, `loading`, `launch-timing`, `pool-swa-guard`, `kv-vmm`, `prefill-lend` (each alone) | 15.8 to 15.9 | 3.16 to 3.23 |
+| added | for | decode (tok/s) | free VRAM (GB) |
+|---|---|---|---|
+| nothing (base) | | 15.9 | 3.16 |
+| [`fp8-decode`](#01-fp8-decode) | decode | 27.3 | 3.16 |
+| [`placement`](#11-placement) | decode | 18.4 | 3.16 |
+| [`engram-row-prefetch`](#04-engram-row-prefetch) | decode | 16.2 | 3.16 |
+| `fp8-decode`, `engram-row-prefetch` | | 28.2 | 3.16 |
+| [`wo-a-fp8`](#05-wo-a-fp8) | decode, memory | 16.1 | 3.74 |
+| `fp8-decode`, `wo-a-fp8` | | 28.3 | 3.74 |
+| `wo-a-fp8`, [`vision-on-demand`](#06-vision-on-demand) | memory | 16.1 | 4.69 |
+| [`gpu-moe-fp32`](#02-gpu-moe-fp32) | numerics | 15.8 | 3.20 |
+| [`loading`](#08-loading), [`launch-timing`](#09-launch-timing), [`pool-swa-guard`](#10-pool-swa-guard) (each alone) | startup | 15.9 to 16.0 | 3.16 |
+| [`kv-vmm`](#12-kv-vmm), [`prefill-lend`](#13-prefill-lend), [`kv-lend-plan`](#15-kv-lend-plan) (each alone) | prefill (below) | 15.9 to 16.0 | 3.07 to 3.16 |
+| [`cutlass-kt-expert-count`](#03-cutlass-kt-expert-count), [`thinking-default-parser`](#07-thinking-default-parser) (each alone) | fixes | 15.9 to 16.0 | 3.16 |
 
-The patches in the last row do not aim at decode: `loading` and `launch-timing` are about startup,
-`kv-vmm` and `prefill-lend` about prefill (below), the others fixes and guards. The gains do not
-add up: a token waits for the slower of the CPU and GPU experts in each layer, so a cut on one
-side shows only where that side was the slower.
+The gains do not add up. A token waits for the slower of the CPU and GPU experts in each layer,
+so a cut on one side shows only where that side was the slower; a fixed cut a token shows more
+as the token gets shorter.
 
 A 35,000-token prompt, on the streamed-prefill set (`loading`, `placement`, `prefill-lend`,
-`stream-prefill`; without it the prompt's experts run on the CPU). The first prompt after launch
-pays a one-time warm-up; the second is a new 35,000-token prompt on the warm server:
+`stream-prefill`; without it a prompt's experts run on the CPU, about 40 tok/s). The first prompt
+after launch pays a one-time warm-up; the second is a new 35,000-token prompt on the warm server:
 
 | added | 35K, first (s) | 35K, second (s) | decode (tok/s) | free VRAM (GB) |
 |---|---|---|---|---|
-| no tier-2 patch (the experts on the CPU) | 846.5 | | | |
-| the streamed-prefill set (base) | 83.1 | 65.4 | 17.9 | 2.65 |
-| `gpu-moe-fp32` | 80.6 | 62.7 | 17.8 | 2.67 |
-| `wo-a-fp8` | 83.0 | 65.4 | 18.2 | 3.24 |
-| `kv-vmm`, `kv-lend-plan` | 65.3 | 47.5 | 17.9 | 2.75 |
-| `kv-vmm`, `kv-lend-plan`, `hot-lend` | 60.6 | 42.2 | 18.7 | 2.72 |
-| all sixteen | 54.3 | 35.3 | 46.0 | 4.23 |
+| the streamed-prefill set (base) | 56.8 | 38.8 | 18.1 | 2.59 |
+| `gpu-moe-fp32` | 55.3 | 37.2 | 18.4 | 2.62 |
+| `wo-a-fp8` | 56.9 | 38.8 | 18.3 | 3.17 |
+| `kv-vmm`, `kv-lend-plan` | 46.1 | 31.8 | 18.4 | 2.69 |
+| `kv-vmm`, `kv-lend-plan`, `hot-lend` | 43.5 | 28.5 | 18.8 | 2.66 |
+| all sixteen | 42.2 | 23.5 | 45.3 | 4.24 |
 
 Numerics: the 2-token NLL check gives the base's value for every patch above but four.
-`fp8-decode` and `gpu-moe-fp32` change the GPU arithmetic (see their Numerics lines; `gpu-moe-fp32`
-gives the same value again on a second launch), and `placement` and `hot-lend` change which experts
-run on the GPU.
+`fp8-decode` and `gpu-moe-fp32` change the GPU arithmetic (see their Numerics lines), and
+`placement` and `hot-lend` change which experts run on the GPU.
 
 ## 01 fp8-decode
 
-Faster block-FP8 dense GEMMs for decode-sized inputs. With up to four rows, `w8a8_block_fp8_matmul` runs a Triton GEMV (`fp8_block_gemv.py`) that steps K over several scale groups at a time. With up to 16 rows and no tuned config for the shape, the Triton matmul uses a split-K tiling. `SGLANG_FP8_DECODE_SPLITK=1` also sends the decode rows (up to 16) of the CUTLASS block-FP8 linear through that Triton matmul, with the operands CUTLASS would have been given; prefill stays on CUTLASS.
+Faster block-FP8 dense GEMMs for decode-sized inputs. With up to four rows, `w8a8_block_fp8_matmul` runs a Triton GEMV (`fp8_block_gemv.py`) that steps K over several scale groups at a time. With up to 16 rows and no tuned config for the shape, the Triton matmul uses a split-K tiling.
 
 Switches (code / serve.sh):
 
 - `SGLANG_FP8_GEMV`: 1 (on in the code) / 1
 - `SGLANG_FP8_SKINNY`: 1 (on in the code); SGLANG_FP8_SKINNY_SPLIT_K 4, _BLOCK_N 128, _LOG / unset (on)
-- `SGLANG_FP8_DECODE_SPLITK`: 0 / unset (off)
 
 Numerics: Not bit-identical when on: the same FP8 operands summed in a different fp32 order (GEMV, split-K). Prefill shapes are unchanged.
 
-Prerequisites: none; applies alone on tier 1.
+Effect: decode 15.9 → 27.3 tok/s alone (a token 62.7 → 36.6 ms). Without it the dense FP8 GEMMs are the longer side of a token.
+
+Prerequisites: none; applies alone on tier 0.
 
 Files (under `python/sglang/`):
 
 - `kernels/ops/quantization/fp8_block_gemv.py` (new)
-- `kernels/ops/quantization/fp8_kernel.py`
-- `srt/layers/quantization/fp8_utils.py`
+- `kernels/ops/gemm/fp8_kernel.py`
 
 ## 02 gpu-moe-fp32
 
@@ -109,7 +112,9 @@ Switches (code / serve.sh):
 
 Numerics: Not bit-identical to Marlin: fewer bf16 roundings, closer to an fp32 reference. The fp32 MoE repeats bit for bit from launch to launch.
 
-Prerequisites: none; applies alone on tier 1.
+Effect: no speed change in decode (15.8 against 15.9): the experts do the same work with fewer roundings. The first 35K prompt on the streamed-prefill set goes 56.8 → 55.3 s. The long NLL of single launches moved both ways (3.1479 → 3.1645 alone, 3.1346 → 3.1144 on the streamed-prefill set), within what launches differ by; the rounding itself is checked against an fp64 reference by `tools/mxfp4-fp32-moe-test.py`.
+
+Prerequisites: none; applies alone on tier 0.
 
 Files (under `python/sglang/`):
 
@@ -124,7 +129,9 @@ A fix in the FlashInfer CUTLASS MXFP4 MoE method: the expert count is taken from
 
 Numerics: No switch. Identical without KTransformers (both counts agree); under KTransformers the CUTLASS MXFP4 path used to fail.
 
-Prerequisites: none; applies alone on tier 1.
+Effect: nothing to measure with `serve.sh`'s default, which runs the resident experts through Marlin's method or `gpu-moe-fp32`'s kernels. With `KT_HOT_BACKEND` set to anything but `marlin` they run through FlashInfer's CUTLASS MXFP4 MoE, which under KTransformers fails without this fix.
+
+Prerequisites: none; applies alone on tier 0.
 
 Files (under `python/sglang/`):
 
@@ -140,25 +147,28 @@ Switches (code / serve.sh):
 
 Numerics: Bit-identical: only the lookup moves.
 
-Prerequisites: none; applies alone on tier 1.
+Effect: a token about 1 ms shorter, alone (15.9 → 16.2 tok/s, 62.7 → 61.8 ms) and with `fp8-decode` (27.3 → 28.2 tok/s, 36.6 → 35.5 ms). The cut is a fixed time a token, so it shows more as the token gets shorter.
+
+Prerequisites: none; applies alone on tier 0.
 
 Files (under `python/sglang/`):
 
+- `srt/layers/engram.py`
 - `srt/models/deepseek_v4.py`
 
 ## 05 wo-a-fp8
 
-DeepSeek V4 attention's `wo_a` in FP8 (`deepseek_common/wo_a_fp8_gemv.py`). `SGLANG_DSV4_WO_A_FP8_NATIVE=1` keeps the checkpoint's FP8 `wo_a` as loaded (no bf16 copy): decode reads it with an FP8 GEMV, prefill dequantizes it into one shared bf16 buffer per device. `SGLANG_DSV4_WO_A_FP8_GEMV=1` adds an exact FP8 copy of a bf16 `wo_a` for decode, and `SGLANG_DSV4_WO_A_FP8_ONLY=1` then frees the bf16 weight.
+DeepSeek V4 attention's `wo_a` in FP8 (`deepseek_common/wo_a_fp8_gemv.py`). `SGLANG_DSV4_WO_A_FP8_NATIVE=1` keeps the checkpoint's FP8 `wo_a` as loaded (no bf16 copy): decode reads it with an FP8 GEMV, prefill dequantizes it into one shared bf16 buffer per device. SGLang main's own FP8 `wo_a` GEMM takes 128 x 128 blocks; 1017's are 32 x 32, so this path is still needed.
 
 Switches (code / serve.sh):
 
 - `SGLANG_DSV4_WO_A_FP8_NATIVE`: 0 / 1
-- `SGLANG_DSV4_WO_A_FP8_GEMV`: 0 / unset (off)
-- `SGLANG_DSV4_WO_A_FP8_ONLY`: 0 / unset (off)
 
 Numerics: Decode GEMV not bit-identical (fp32 summation order; 99.98% of outputs equal, the rest 1 ulp). The prefill dequantize path is bit-identical (the same bf16 values).
 
-Prerequisites: none; applies alone on tier 1.
+Effect: 0.58 GB more free VRAM on each GPU (3.16 → 3.74 GB), the bf16 copy of `wo_a` that is no longer made. Decode: a token 0.6 ms shorter alone (15.9 → 16.1 tok/s), 1.3 ms with `fp8-decode` (27.3 → 28.3 tok/s). Prefill does not change (56.9 against 56.8 s on the streamed-prefill set): it computes on the same bf16 values.
+
+Prerequisites: none; applies alone on tier 0.
 
 Files (under `python/sglang/`):
 
@@ -167,14 +177,15 @@ Files (under `python/sglang/`):
 
 ## 06 vision-on-demand
 
-The vision tower's GPU memory when serving text. `SGLANG_DSV4_VISION_ON_DEMAND=1` moves the tower and aligner to pinned host memory after loading and puts them on the GPU only while a batch's images are encoded (if the KV plan of `kv-lend-plan` is applied, it accounts for the copy). `--language-model-only` makes DeepSeek V4 build and load no tower at all, as SGLang's flag does for other multimodal models.
+The vision tower's GPU memory when serving text. `SGLANG_DSV4_VISION_ON_DEMAND=1` moves the tower and aligner to pinned host memory after loading and puts them on the GPU only while a batch's images are encoded (if the KV plan of `kv-lend-plan` is applied, it accounts for the copy). To serve text only, SGLang main's own `--language-model-only` builds and loads no tower at all.
 
 Switches (code / serve.sh):
 
 - `SGLANG_DSV4_VISION_ON_DEMAND`: 0 / 1
-- `--language-model-only (CLI)`: off / not passed
 
-Numerics: Bit-identical: placement only (image batches pay a host-to-device copy). `--language-model-only` leaves text output unchanged.
+Numerics: Bit-identical: placement only (image batches pay a host-to-device copy).
+
+Effect: 0.95 GB more free VRAM on each GPU (3.74 → 4.69 GB with `wo-a-fp8`). Decode and text prefill do not change: the tower is not used without images. In the full setup the hot lend fills the freed memory with more experts.
 
 Prerequisites: `wo-a-fp8`.
 
@@ -192,7 +203,9 @@ Switches (code / serve.sh):
 
 Numerics: No switch of its own. Identical unless `SGLANG_DEFAULT_THINKING=1`.
 
-Prerequisites: none; applies alone on tier 1.
+Effect: none on speed; it changes how the output is split into reasoning and content.
+
+Prerequisites: none; applies alone on tier 0.
 
 Files (under `python/sglang/`):
 
@@ -211,7 +224,9 @@ Switches (code / serve.sh):
 
 Numerics: Bit-identical: the skipped tensors are ones the loader dropped anyway; the rest is I/O and placement.
 
-Prerequisites: none; applies alone on tier 1.
+Effect: ready 149 s after start, against 173 to 224 s (median 177 s) for the other launches of the decode table (one launch each). It does not change decode.
+
+Prerequisites: none; applies alone on tier 0.
 
 Files (under `python/sglang/`):
 
@@ -229,7 +244,9 @@ Switches (code / serve.sh):
 
 Numerics: No effect on outputs.
 
-Prerequisites: none; applies alone on tier 1.
+Effect: none unless `KT_LAUNCH_TIMING=1`; it only records.
+
+Prerequisites: none; applies alone on tier 0.
 
 Files (under `python/sglang/`):
 
@@ -242,7 +259,9 @@ A startup check in the pool configurator for DeepSeek V4: an SWA pool smaller th
 
 Numerics: No switch. No effect on outputs; a setup that used to hang now fails at startup.
 
-Prerequisites: none; applies alone on tier 1.
+Effect: none on a setup that fits; it is one check at startup.
+
+Prerequisites: none; applies alone on tier 0.
 
 Files (under `python/sglang/`):
 
@@ -259,7 +278,9 @@ Switches (code / serve.sh):
 
 Numerics: Changes outputs under a placement (without it the wrapper ran logical ids in physical slots, i.e. the wrong experts); identical without one. The dump does not change outputs.
 
-Prerequisites: none; applies alone on tier 1.
+Effect: decode 15.9 → 18.4 tok/s alone: the 5 resident experts a layer are the hottest ones instead of experts 0 to 4.
+
+Prerequisites: none; applies alone on tier 0.
 
 Files (under `python/sglang/`):
 
@@ -275,7 +296,9 @@ Switches (code / serve.sh):
 
 Numerics: Bit-identical.
 
-Prerequisites: none; applies alone on tier 1.
+Effect: none alone (decode 16.0); it is what `kv-lend-plan` lends from (35K below).
+
+Prerequisites: none; applies alone on tier 0.
 
 Files (under `python/sglang/`):
 
@@ -284,17 +307,20 @@ Files (under `python/sglang/`):
 
 ## 13 prefill-lend
 
-`KT_PREFILL_LEND=1`: during a streamed prefill the GPU-resident weights give their memory to the prefill's scratch and come back layer by layer, at the same addresses, just before each layer runs (`kt_lend.py`, hooked into the loader and the model runner's forward). `KT_PREFILL_LEND_PROBE` measures how large a chunk fits before serving (`kt_lend_probe.py`, used by `lib/kt-lend-auto.sh`). `KT_FAST_PINNED=1` pins the lend's host buffers as huge-page memory registered with `cudaHostRegister` instead of `cudaHostAlloc` (`kt_pinned.py`). DeepSeek V4's padded query buffer is allocated in the prefill's scratch. The lend calls into the streamed prefill, the KV lend and the hot lend only when those patches are applied and on.
+`KT_PREFILL_LEND=1`: during a streamed prefill the GPU-resident weights give their memory to the prefill's scratch and come back layer by layer, at the same addresses, just before each layer runs (`kt_lend.py`, hooked into the loader and the model runner's forward). `KT_PREFILL_LEND_PROBE` measures how large a chunk fits before serving (`kt_lend_probe.py`, used by `lib/kt-lend-auto.sh`). `KT_FAST_PINNED=1` pins the lend's host buffers as huge-page memory registered with `cudaHostRegister` instead of `cudaHostAlloc` (`kt_pinned.py`). DeepSeek V4's padded query buffer is allocated in the prefill's scratch. V4's hc mixing weights stay resident, packed in one buffer (`KT_PREFILL_LEND_RESIDENT`, `hc_`): SGLang main's layer boundary reads the next layer's before that layer runs. The tail source KV write, which reads its layer's weights before the layer runs, enters the layer first, and the decoder replay tail's CUDA graphs are not used while the lend is on (they would keep the addresses of their capture). The lend calls into the streamed prefill, the KV lend and the hot lend only when those patches are applied and on.
 
 Switches (code / serve.sh):
 
 - `KT_PREFILL_LEND`: 0; KT_PREFILL_LEND_HINT, _MARGIN_MB, _SKIP, _LONG_SEQ, _MAX_CHUNK, ... / 1 (via lib/kt-lend-auto.sh)
 - `KT_PREFILL_LEND_PROBE`: unset / set by lib/kt-lend-auto.sh on the calibration launch
 - `KT_FAST_PINNED`: 0 / 0
+- `KT_PREFILL_LEND_RESIDENT`: hc_ / hc_
 
 Numerics: Bit-identical at a given chunk size. It lets the launcher pick a larger chunk, and the chunk size moves NLL.
 
-Prerequisites: none; applies alone on tier 1.
+Effect: none in decode (15.9). It is part of the streamed-prefill set, whose 35K prompt takes 56.8 s against about 15 minutes on the CPU.
+
+Prerequisites: none; applies alone on tier 0.
 
 Files (under `python/sglang/`):
 
@@ -305,10 +331,11 @@ Files (under `python/sglang/`):
 - `srt/model_executor/model_runner.py`
 - `srt/model_loader/loader.py`
 - `srt/models/deepseek_v4.py`
+- `srt/models/deepseek_v4_replay_tail.py`
 
 ## 14 stream-prefill
 
-`KT_GPU_STREAM_PREFILL=<tokens>`: above that many tokens the CPU experts are not computed by kt-kernel; their weights are copied to the GPU in groups and computed there, the copy of the next group overlapping the compute of the current one (`kt_stream_prefill.py`). `KT_GPU_STREAM_W16=1` dequantizes each group to bf16 and runs FlashInfer's bf16 CUTLASS MoE (SM89+); otherwise the SM120 MXFP8 x MXFP4 kernel. `KT_GPU_STREAM_ZEROCOPY` reads kt-kernel's shared expert memory directly and `KT_GPU_STREAM_GRAPH` launches each group as one CUDA graph. One CUTLASS MoE workspace per GPU is preallocated before the decode graphs are captured, for the resident experts as well (this part is always on), and `KT_GPU_STREAM_ROW_BLOCK` splits long chunks into row blocks. Also: early streamer init, CPU groups (`KT_STREAM_CPU_GROUPS`), a reference check (`KT_HOT_CHECK`), and comment updates in the wrapper.
+`KT_GPU_STREAM_PREFILL=<tokens>`: above that many tokens the CPU experts are not computed by kt-kernel; their weights are copied to the GPU in groups and computed there, the copy of the next group overlapping the compute of the current one (`kt_stream_prefill.py`). `KT_GPU_STREAM_W16=1` dequantizes each group to bf16 and runs FlashInfer's bf16 CUTLASS MoE (SM89+); otherwise the SM120 MXFP8 x MXFP4 kernel. `KT_GPU_STREAM_ZEROCOPY` reads kt-kernel's shared expert memory directly and `KT_GPU_STREAM_GRAPH` launches each group as one CUDA graph. One CUTLASS MoE workspace per GPU is preallocated before the decode graphs are captured, for the resident experts as well (this part is always on), and `KT_GPU_STREAM_ROW_BLOCK` splits long chunks into row blocks. Under the prefill lend the graphs' shared input and output buffers grow in steps of `KT_STREAM_GIN_STEP` rows as chunks get larger, instead of being sized for the plan's cap at once. Also: early streamer init, CPU groups (`KT_STREAM_CPU_GROUPS`), a reference check (`KT_HOT_CHECK`), and comment updates in the wrapper. With SGLang main's decoder bounded replay, the layers from the replay's start run over each chunk's last 128 rows only; below the threshold those calls stay on the CPU, which is faster than streaming them (`KT_GPU_STREAM_IN_WINDOW=1` streams every call of a streamed forward, for comparison).
 
 Switches (code / serve.sh):
 
@@ -320,8 +347,12 @@ Switches (code / serve.sh):
 - `KT_GPU_STREAM_EARLY_INIT`: 0 / 1
 - `KT_GPU_STREAM_ROW_BLOCK`: 0 / 4096 (lib/kt-lend-auto.sh)
 - `KT_STREAM_CPU_GROUPS, KT_HOT_CHECK`: 0 / unset
+- `KT_GPU_STREAM_IN_WINDOW`: 0 / 0
+- `KT_STREAM_GIN_STEP`: 4096 / unset (4096)
 
 Numerics: Not bit-identical when on: the streamed CPU experts run on the GPU (W16: bf16 rounding instead of kt-kernel's; the MXFP8 mode has a larger error). The shared workspace changes memory only. ZEROCOPY needs the kt-kernel tree patch (`KT_EXPERT_SHM`).
+
+Effect: a 35K prompt in 56.8 s (first) and 38.8 s (second) with `loading`, `placement` and `prefill-lend`, against about 15 minutes with the experts on the CPU.
 
 Prerequisites: `prefill-lend`, `loading`, `placement`.
 
@@ -343,6 +374,8 @@ Switches (code / serve.sh):
 - `KT_PREFILL_SWA_LEND`: 0; KT_PREFILL_SWA_* / 1
 
 Numerics: The lend is bit-identical. The plan picks per-request chunk sizes, so the prefill chunking (and NLL) moves against a fixed chunk. The SWA lend changes memory only.
+
+Effect: the 35K prompt on the streamed-prefill set goes 56.8 → 46.1 s (first, 5 chunks of 7,168 rows) and 38.8 → 31.8 s (second, 6 chunks of 6,144): each chunk streams the CPU experts to the GPU once, so fewer chunks take less time. The second prompt gets smaller chunks because the stream's buffers the first prompt grew (1.4 GB) stay mapped, and the plan counts them as used although the next chunk reuses them. Decode does not change (15.9 alone). The plan learns its cost a row from the setup's earlier launches, so this row and the next are measured after the setup has launched before.
 
 Prerequisites: `kv-vmm`, `prefill-lend`.
 
@@ -367,6 +400,8 @@ Switches (code / serve.sh):
 - `KT_KV_HOT_SLOTS_MAX, _RESERVE, _MIN_MB, _RETRY, _MARGIN_MB, _CHECK*`: unset / unset
 
 Numerics: Not bit-identical: the lent experts run in the GPU MoE kernel instead of kt-kernel, and how many are lent depends on the free KV pages at the time, so decode output depends on load.
+
+Effect: decode 18.4 → 18.8 tok/s on the streamed-prefill set with `kv-vmm` and `kv-lend-plan`. The 35K prompt goes 46.1 → 43.5 s (first) and 31.8 → 28.5 s (second): the plan saw more free memory at the window's start (8,064 against 6,812 MiB for the first prompt) and cut 4 chunks of 9,216 rows and then 5 of 7,168, against 5 of 7,168 and 6 of 6,144.
 
 Prerequisites: `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan`.
 

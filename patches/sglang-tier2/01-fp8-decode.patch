@@ -1,37 +1,119 @@
-From c73241fe357ef350b3da7be242d44bb4a17a0aba Mon Sep 17 00:00:00 2001
+From a98eadda5b74c851a538019e42d04505d79f5a49 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
-Date: Mon, 19 Oct 2026 16:44:34 +0900
+Date: Mon, 19 Oct 2026 22:56:28 +0900
 Subject: [PATCH] [tier 2] fp8-decode: block-FP8 GEMV and split-K for
  decode-sized dense GEMMs
 
 Faster block-FP8 dense GEMMs for decode-sized inputs. With up to four
-rows, `w8a8_block_fp8_matmul` runs a Triton GEMV (`fp8_block_gemv.py`)
-that steps K over several scale groups at a time. With up to 16 rows and
-no tuned config for the shape, the Triton matmul uses a split-K tiling.
-`SGLANG_FP8_DECODE_SPLITK=1` also sends the decode rows (up to 16) of
-the CUTLASS block-FP8 linear through that Triton matmul, with the
-operands CUTLASS would have been given; prefill stays on CUTLASS.
+rows, `w8a8_block_fp8_matmul_triton` runs a Triton GEMV
+(`fp8_block_gemv.py`) that steps K over several scale groups at a time.
+With up to 16 rows and no tuned config for the shape, the Triton matmul
+uses a split-K tiling.
 
 Numerics: Not bit-identical when on: the same FP8 operands summed in a
 different fp32 order (GEMV, split-K). Prefill shapes are unchanged.
 
-Prerequisites: none; applies alone on tier 1.
+Prerequisites: none.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
- .../ops/quantization/fp8_block_gemv.py        | 127 ++++++++++++++++++
- .../kernels/ops/quantization/fp8_kernel.py    |  54 +++++++-
- .../srt/layers/quantization/fp8_utils.py      |  61 +++++++++
- 3 files changed, 241 insertions(+), 1 deletion(-)
+ python/sglang/kernels/ops/gemm/fp8_kernel.py  |  51 +++++-
+ .../ops/quantization/fp8_block_gemv.py        | 172 ++++++++++++++++++
+ 2 files changed, 222 insertions(+), 1 deletion(-)
  create mode 100644 python/sglang/kernels/ops/quantization/fp8_block_gemv.py
 
+diff --git a/python/sglang/kernels/ops/gemm/fp8_kernel.py b/python/sglang/kernels/ops/gemm/fp8_kernel.py
+index 2e7bdd7aaa..1061338ebc 100644
+--- a/python/sglang/kernels/ops/gemm/fp8_kernel.py
++++ b/python/sglang/kernels/ops/gemm/fp8_kernel.py
+@@ -23,6 +23,7 @@ from sglang.srt.utils.custom_op import register_custom_op
+ _is_cuda = is_cuda()
+ _is_hip = is_hip()
+ _is_gfx1250 = is_gfx1250_supported()
++_FP8_GEMV = os.environ.get("SGLANG_FP8_GEMV", "1") == "1"
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -773,6 +774,9 @@ def w8a8_mxfp8_matmul_deepgemm(
+     return C
+ 
+ 
++_skinny_seen = set()
++
++
+ def w8a8_block_fp8_matmul_triton(
+     A: torch.Tensor,
+     B: torch.Tensor,
+@@ -802,6 +806,21 @@ def w8a8_block_fp8_matmul_triton(
+ 
+     block_n, block_k = block_size
+ 
++    # Decode-sized calls step K by several scale groups (the block kernel steps
++    # by one, 32 on V4.1-1017); SGLANG_FP8_GEMV=0 turns it off.
++    if (
++        M <= 4
++        and _FP8_GEMV
++        and not _is_hip
++        and not _is_gfx1250
++        and As.dtype == torch.float
++        and Bs.dtype == torch.float
++    ):
++        from sglang.kernels.ops.quantization.fp8_block_gemv import fp8_block_gemv
++
++        fp8_block_gemv(A.view(M, K), B, As.reshape(M, -1), Bs, block_size, C.view(M, N))
++        return C
++
+     configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
+     if configs:
+         # If an optimal configuration map has been found, look up the
+@@ -819,9 +838,39 @@ def w8a8_block_fp8_matmul_triton(
+             "num_stages": 3,
+         }
+ 
++    # Skinny GEMMs (decode: M is the batch, 1 here) with the default tiling
++    # launch only N/128 CTAs, each streaming a K x 128 strip alone: on the
++    # RTX 5070 Ti (no tuned config) that is 250-500 GB/s against ~900. For
++    # M <= 16 use the split-K kernel with a 16-row tile: measured 3-6x faster
++    # on N=2048..7168 and ~1.2x on N=16384+. SGLANG_FP8_SKINNY=0 turns it off;
++    # SGLANG_FP8_SKINNY_SPLIT_K / _BLOCK_N override the tile.
++    skinny = (
++        not configs
++        and M <= 16
++        and not _is_hip
++        and not _is_gfx1250
++        and os.environ.get("SGLANG_FP8_SKINNY", "1") == "1"
++    )
++    if skinny:
++        config = {
++            "BLOCK_SIZE_M": 16,
++            "BLOCK_SIZE_N": int(os.environ.get("SGLANG_FP8_SKINNY_BLOCK_N", "128")),
++            "BLOCK_SIZE_K": block_size[1],
++            "GROUP_SIZE_M": 1,
++            "num_warps": 4,
++            "num_stages": 3,
++            "SWAP_AB": False,
++            "SPLIT_K": int(os.environ.get("SGLANG_FP8_SKINNY_SPLIT_K", "4")),
++        }
++        if os.environ.get("SGLANG_FP8_SKINNY_LOG") == "1":
++            key = (M, N, K)
++            if key not in _skinny_seen:
++                _skinny_seen.add(key)
++                logger.info("fp8 skinny gemm shape M=%d N=%d K=%d", M, N, K)
++
+     # Split-K accumulates K in SPLIT_K separate fp32 partials, so its results
+     # do not match the single-accumulator kernels bit-for-bit.
+-    hopper_tuned = get_platform().is_sm90 and (
++    hopper_tuned = (get_platform().is_sm90 or skinny) and (
+         config.get("SWAP_AB", False) or config.get("SPLIT_K", 1) > 1
+     )
+     if hopper_tuned:
 diff --git a/python/sglang/kernels/ops/quantization/fp8_block_gemv.py b/python/sglang/kernels/ops/quantization/fp8_block_gemv.py
 new file mode 100644
-index 00000000..29b39b30
+index 0000000000..c5559254c4
 --- /dev/null
 +++ b/python/sglang/kernels/ops/quantization/fp8_block_gemv.py
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,172 @@
 +"""Block-FP8 W8A8 GEMV for decode (M <= 4): the same arithmetic as _w8a8_block_fp8_matmul_hopper (the activation
 +quantized per token group, the weight per block; each group's fp8 products summed in fp32, times the two scales,
 +summed over the groups), with the K loop in steps of several groups instead of one.
@@ -50,13 +132,28 @@ index 00000000..29b39b30
 +
 +@triton.jit
 +def _fp8_block_gemv_kernel(
-+    A, B, C, As, Bs,
-+    M, N, K,
-+    stride_am, stride_bn, stride_cs, stride_cm,
-+    stride_As_m, stride_As_k, stride_Bs_n, stride_Bs_k,
++    A,
++    B,
++    C,
++    As,
++    Bs,
++    M,
++    N,
++    K,
++    stride_am,
++    stride_bn,
++    stride_cs,
++    stride_cm,
++    stride_As_m,
++    stride_As_k,
++    stride_Bs_n,
++    stride_Bs_k,
 +    k_per_split,
-+    GROUP_N: tl.constexpr, GROUP_K: tl.constexpr,
-+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, MB: tl.constexpr,
++    GROUP_N: tl.constexpr,
++    GROUP_K: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    MB: tl.constexpr,
 +):
 +    pid_n = tl.program_id(0)
 +    split = tl.program_id(1)
@@ -74,16 +171,26 @@ index 00000000..29b39b30
 +    for k0 in range(k_start, k_end, BLOCK_K):
 +        offs_k = k0 + tl.arange(0, BLOCK_K)
 +        kmask = offs_k < k_end
-+        b = tl.load(B + offs_n[:, None] * stride_bn + offs_k[None, :],
-+                    mask=nmask[:, None] & kmask[None, :], other=0.0).to(tl.float32)
++        b = tl.load(
++            B + offs_n[:, None] * stride_bn + offs_k[None, :],
++            mask=nmask[:, None] & kmask[None, :],
++            other=0.0,
++        ).to(tl.float32)
 +        kg = k0 // GROUP_K + tl.arange(0, G)
 +        gmask = (kg < n_groups_k) & (kg * GROUP_K < k_end)
-+        b_s = tl.load(Bs + b_s_row[:, None] + kg[None, :] * stride_Bs_k,
-+                      mask=nmask[:, None] & gmask[None, :], other=0.0)
++        b_s = tl.load(
++            Bs + b_s_row[:, None] + kg[None, :] * stride_Bs_k,
++            mask=nmask[:, None] & gmask[None, :],
++            other=0.0,
++        )
 +        for mi in tl.static_range(MB):
 +            if mi < M:
-+                a = tl.load(A + mi * stride_am + offs_k, mask=kmask, other=0.0).to(tl.float32)
-+                a_s = tl.load(As + mi * stride_As_m + kg * stride_As_k, mask=gmask, other=0.0)
++                a = tl.load(A + mi * stride_am + offs_k, mask=kmask, other=0.0).to(
++                    tl.float32
++                )
++                a_s = tl.load(
++                    As + mi * stride_As_m + kg * stride_As_k, mask=gmask, other=0.0
++                )
 +                part = tl.sum(tl.reshape(b * a[None, :], (BLOCK_N, G, GROUP_K)), axis=2)
 +                contrib = tl.sum(part * a_s[None, :] * b_s, axis=1)
 +                if mi == 0:
@@ -149,197 +256,33 @@ index 00000000..29b39b30
 +        P = torch.empty((split, M, N), device=A.device, dtype=torch.float32)
 +        stride_cs = M * N
 +    _fp8_block_gemv_kernel[(nb, split)](
-+        A, B, P, As, Bs, M, N, K,
-+        A.stride(0), B.stride(0), stride_cs, N,
-+        As.stride(0), As.stride(1), Bs.stride(0), Bs.stride(1),
++        A,
++        B,
++        P,
++        As,
++        Bs,
++        M,
++        N,
++        K,
++        A.stride(0),
++        B.stride(0),
++        stride_cs,
++        N,
++        As.stride(0),
++        As.stride(1),
++        Bs.stride(0),
++        Bs.stride(1),
 +        k_per_split,
-+        GROUP_N=gn, GROUP_K=gk, BLOCK_N=block_n, BLOCK_K=block_k, MB=mb,
-+        num_warps=4, num_stages=3,
++        GROUP_N=gn,
++        GROUP_K=gk,
++        BLOCK_N=block_n,
++        BLOCK_K=block_k,
++        MB=mb,
++        num_warps=4,
++        num_stages=3,
 +    )
 +    if split > 1:
-+        _fp8_block_gemv_reduce[(triton.cdiv(M * N, 512),)](P, C, M * N, SPLITS=split, BLOCK=512)
++        _fp8_block_gemv_reduce[(triton.cdiv(M * N, 512),)](
++            P, C, M * N, SPLITS=split, BLOCK=512
++        )
 +    return C
-diff --git a/python/sglang/kernels/ops/quantization/fp8_kernel.py b/python/sglang/kernels/ops/quantization/fp8_kernel.py
-index da92c781..6133a2eb 100644
---- a/python/sglang/kernels/ops/quantization/fp8_kernel.py
-+++ b/python/sglang/kernels/ops/quantization/fp8_kernel.py
-@@ -48,6 +48,7 @@ _is_cuda = is_cuda()
- _is_cpu = is_cpu()
- _is_musa = is_musa()
- _is_gfx1250 = is_gfx1250_supported()
-+_FP8_GEMV = os.environ.get("SGLANG_FP8_GEMV", "1") == "1"
- _is_xpu = is_xpu()
- _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
- 
-@@ -1661,6 +1662,9 @@ def w8a8_mxfp8_matmul_deepgemm(
-     return C
- 
- 
-+_skinny_seen = set()
-+
-+
- def w8a8_block_fp8_matmul_triton(
-     A: torch.Tensor,
-     B: torch.Tensor,
-@@ -1690,6 +1694,23 @@ def w8a8_block_fp8_matmul_triton(
- 
-     block_n, block_k = block_size
- 
-+    # sglang-fp8-block-gemv.py: decode-sized calls step K by several scale groups
-+    # (the block kernel steps by one, 32 on V4.1-1017); SGLANG_FP8_GEMV=0 turns it off
-+    if (
-+        M <= 4
-+        and _FP8_GEMV
-+        and not _is_hip
-+        and not _is_gfx1250
-+        and As.dtype == torch.float
-+        and Bs.dtype == torch.float
-+    ):
-+        from sglang.kernels.ops.quantization.fp8_block_gemv import fp8_block_gemv
-+
-+        fp8_block_gemv(
-+            A.view(M, K), B, As.reshape(M, -1), Bs, block_size, C.view(M, N)
-+        )
-+        return C
-+
-     configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
-     if configs:
-         # If an optimal configuration map has been found, look up the
-@@ -1707,13 +1728,44 @@ def w8a8_block_fp8_matmul_triton(
-             "num_stages": 3,
-         }
- 
-+    # Skinny GEMMs (decode: M is the batch, 1 here) with the default tiling
-+    # launch only N/128 CTAs, each streaming a K x 128 strip alone: on the
-+    # RTX 5070 Ti (no tuned config) that is 250-500 GB/s against ~900 and the
-+    # dense projections were 38 of the 70 ms of a V4.1 decode step (09-13).
-+    # For M <= 16 use the split-K kernel with a 16-row tile: measured 3-6x
-+    # faster on N=2048..7168 and ~1.2x on N=16384+. SGLANG_FP8_SKINNY=0 turns
-+    # it off; SGLANG_FP8_SKINNY_SPLIT_K / _BLOCK_N override the tile.
-+    skinny = (
-+        not configs
-+        and M <= 16
-+        and not _is_hip
-+        and not _is_gfx1250
-+        and os.environ.get("SGLANG_FP8_SKINNY", "1") == "1"
-+    )
-+    if skinny:
-+        config = {
-+            "BLOCK_SIZE_M": 16,
-+            "BLOCK_SIZE_N": int(os.environ.get("SGLANG_FP8_SKINNY_BLOCK_N", "128")),
-+            "BLOCK_SIZE_K": block_size[1],
-+            "GROUP_SIZE_M": 1,
-+            "num_warps": 4,
-+            "num_stages": 3,
-+            "SWAP_AB": False,
-+            "SPLIT_K": int(os.environ.get("SGLANG_FP8_SKINNY_SPLIT_K", "4")),
-+        }
-+        if os.environ.get("SGLANG_FP8_SKINNY_LOG") == "1":
-+            key = (M, N, K)
-+            if key not in _skinny_seen:
-+                _skinny_seen.add(key)
-+                logger.info("fp8 skinny gemm shape M=%d N=%d K=%d", M, N, K)
-+
-     if _is_gfx1250:
-         config = {**config, "num_stages": 1}
-         kernel = _w8a8_block_fp8_matmul_gfx1250
-     else:
-         kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)
- 
--    hopper_tuned = get_platform().is_sm90 and (
-+    hopper_tuned = (get_platform().is_sm90 or skinny) and (
-         config.get("SWAP_AB", False) or config.get("SPLIT_K", 1) > 1
-     )
-     if hopper_tuned:
-diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
-index 6093a4f9..a56dde2f 100755
---- a/python/sglang/srt/layers/quantization/fp8_utils.py
-+++ b/python/sglang/srt/layers/quantization/fp8_utils.py
-@@ -1,5 +1,6 @@
- from __future__ import annotations
- 
-+import os
- import logging
- from enum import Enum
- from functools import lru_cache, partial
-@@ -839,6 +840,8 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
-                 "--fp8-gemm-backend=cutlass is deprecated on this hardware. "
-                 "Please switch to DeepGEMM or FlashInfer TRTLLM on SM90/SM100."
-             )
-+        if os.environ.get("SGLANG_FP8_DECODE_SPLITK") == "1":
-+            return cutlass_w8a8_block_fp8_linear_splitk_decode
-         return cutlass_w8a8_block_fp8_linear_with_fallback
- 
-     elif backend.is_aiter():
-@@ -880,6 +883,8 @@ def _dispatch_auto_backend() -> Callable:
-     elif get_platform().is_blackwell and is_flashinfer_available():
-         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
-     elif get_platform().is_sm120:
-+        if os.environ.get("SGLANG_FP8_DECODE_SPLITK") == "1":
-+            return cutlass_w8a8_block_fp8_linear_splitk_decode
-         return cutlass_w8a8_block_fp8_linear_with_fallback
-     elif _use_aiter:
-         return aiter_w8a8_block_fp8_linear
-@@ -1114,6 +1119,62 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
-     return output.to(dtype=input_2d.dtype).view(*output_shape)
- 
- 
-+from sglang.kernels.ops.quantization.fp8_kernel import (  # noqa: E402
-+    _run_per_token_group_quant_8bit_kernel,
-+    fp8_max as _FP8_MAX,
-+    fp8_min as _FP8_MIN,
-+)
-+
-+
-+def cutlass_w8a8_block_fp8_linear_splitk_decode(
-+    input: torch.Tensor,
-+    weight: torch.Tensor,
-+    block_size: List[int],
-+    weight_scale: torch.Tensor,
-+    input_scale: Optional[torch.Tensor] = None,
-+    bias: Optional[torch.Tensor] = None,
-+) -> torch.Tensor:
-+    """cutlass for prefill; decode rows (<= 16) through the Triton split-K
-+    block-FP8 matmul, fed the operands cutlass would have been fed
-+    (patches/sglang-fp8-decode-splitk.py)."""
-+    rows = input.numel() // input.shape[-1]
-+    if rows > 16 or weight.shape[0] % 128 != 0 or weight.shape[1] % 128 != 0:
-+        return cutlass_w8a8_block_fp8_linear_with_fallback(
-+            input, weight, block_size, weight_scale, input_scale, bias
-+        )
-+    if input_scale is not None:
-+        # Pre-quantized (SGLANG_OPT_MOE_QUANT_ONCE): keep the padded row count,
-+        # as the cutlass branch does; the caller slices.
-+        q_input = input.view(-1, input.shape[-1])
-+        output = w8a8_block_fp8_matmul_triton(
-+            q_input, weight, input_scale, weight_scale, block_size,
-+            output_dtype=torch.bfloat16,
-+        )
-+        if bias is not None:
-+            output += bias
-+        return output.view(*input.shape[:-1], weight.shape[0])
-+    input_2d = input.view(-1, input.shape[-1])
-+    # The quant kernel sglang_per_token_group_quant_fp8_row_padded runs, with its
-+    # arguments, into unpadded buffers: the same FP8 values and scales, without
-+    # the two zero-fills of pad rows per GEMM that only cutlass needs (they were
-+    # 486 of ~3,700 kernel launches a decode token, 09-23).
-+    m, k = input_2d.shape
-+    q_input = torch.empty((m, k), device=input_2d.device, dtype=torch.float8_e4m3fn)
-+    x_scale = torch.empty(
-+        (k // block_size[1], m), device=input_2d.device, dtype=torch.float32
-+    ).transpose(0, 1)
-+    _run_per_token_group_quant_8bit_kernel(
-+        input_2d, q_input, x_scale, block_size[1], 1e-10, _FP8_MIN, _FP8_MAX,
-+        scale_ue8m0=False, fuse_silu_and_mul=False, masked_m=None,
-+    )
-+    output = w8a8_block_fp8_matmul_triton(
-+        q_input, weight, x_scale, weight_scale, block_size, output_dtype=input_2d.dtype
-+    )
-+    if bias is not None:
-+        output += bias
-+    return output.to(dtype=input_2d.dtype).view(*input.shape[:-1], weight.shape[0])
-+
-+
- def deepgemm_w8a8_block_fp8_linear_with_fallback(
-     input: torch.Tensor,
-     weight: torch.Tensor,

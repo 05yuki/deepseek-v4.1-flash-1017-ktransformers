@@ -2,7 +2,7 @@
 
 What made decode, prefill and the launch as fast as they are, one mechanism at a time,
 with what it was measured to change. What each patch does and its switch:
-[patches.md](patches.md).
+[patches.md](patches.md) and [tier2.md](tier2.md).
 
 All of it ran on the machine in the README (2 × EPYC 7452, 2 × RTX 5070 Ti 16 GB). Much of
 it was measured on the earlier DeepSeek-V4.1-Flash release, before 1017 existed; each item
@@ -17,7 +17,7 @@ How it was measured:
   against a launch without the change. A change is kept when its NLL lies within the spread of
   repeated launches. A change that only reorders sums is also checked bit for bit where it can be.
 - **Prefill**: wall time of one long prompt with one output token. Random token ids route
-  over more experts than text, so they come out slower (35K: 636 against 674 tok/s).
+  over more experts than text, so they come out slower (about 6% at 35K).
 
 ## Decode
 
@@ -85,11 +85,20 @@ None of these takes tokens from the KV pool. The 1M-token pool comes first.
   (gate/up 278 → 299 µs).
 - **fp32 intermediates in the CPU experts**: no NLL change; the per-expert rounding is not what
   moves the NLL any more.
-- **SWA bounded replay** (`--enable-decoder-swa-bounded-replay`): halves prefill, but the third
-  request of a session came back as garbage. Off.
+
+## SGLang main's decoder bounded replay
+
+On the earlier base the third request of a session came back as garbage with it, and it was
+kept off. SGLang main turns it on by default (the same scheme as DeepSeek's DeepInfer, "YoCo
+prefill truncation"): the layers from 20 on run only over the prompt's last 128 rows. Three
+turns of one chat with the prefix cache on (`DSV41_RADIX=1`, 512 tokens read from the cache in
+turns 2 and 3) come back intact. A 131,072-token prompt takes 242.7 s with it and 266.0 s
+without (`--no-enable-decoder-swa-bounded-replay`).
 
 ## Open
 
-- On fresh builds of this repository, one launch in four gave an NLL 0.002 away from the
-  others. The cause is not found.
+- Launches that should give the same output differ in the long NLL by up to 0.013 (3.1405 to
+  3.1536 over ten single-patch launches in [tier2.md](tier2.md), none with the hot lend),
+  while the 2-token NLL is the same in all of them. Short prefills repeat; the difference
+  comes in somewhere on the longer pieces' path. The cause is not found.
 - 9 ms of a decode token is the GPU waiting for the CPU experts.

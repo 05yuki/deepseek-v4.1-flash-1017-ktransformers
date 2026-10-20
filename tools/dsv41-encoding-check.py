@@ -74,8 +74,18 @@ def short(x, n=160):
     return s if len(s) <= n else s[:n] + "..."
 
 
+def images_by_url(x):
+    """Image records compared by url and order: SGLang trees from upstream #44751 on record
+    {"url": ...} where the reference has {"type": "image", "url": ...}; the prompt is unchanged."""
+    if isinstance(x, dict) and isinstance(x.get("images"), list):
+        return {**x, "images": [i.get("url") if isinstance(i, dict) else i for i in x["images"]]}
+    if isinstance(x, (tuple, list)):
+        return type(x)(images_by_url(v) for v in x)
+    return x
+
+
 def record(group, name, a, b):
-    same = a == b
+    same = images_by_url(a) == images_by_url(b)
     detail = "" if same else f"ref={short(a)}\n        sgl={short(b)}"
     results.append((group, name, same, detail))
 

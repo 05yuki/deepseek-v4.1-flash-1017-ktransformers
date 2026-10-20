@@ -1,4 +1,4 @@
-From 52aecfa0c211da05b72befd244f78f9a8b3562c8 Mon Sep 17 00:00:00 2001
+From e67d1f036bb864f596c0197534e26a5ae0678053 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] [tier 2] loading: skip the CPU-only experts in the GPU
@@ -24,13 +24,13 @@ Prerequisites: none; applies alone on tier 1.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
- python/sglang/srt/layers/moe/kt_ep_wrapper.py |  52 ++++++-
- .../sglang/srt/model_loader/weight_utils.py   | 140 +++++++++++++++++-
- python/sglang/srt/models/deepseek_v4.py       |  47 ++++++
- 3 files changed, 236 insertions(+), 3 deletions(-)
+ python/sglang/srt/layers/moe/kt_ep_wrapper.py |  52 +++++-
+ .../sglang/srt/model_loader/weight_utils.py   | 150 +++++++++++++++++-
+ python/sglang/srt/models/deepseek_v4.py       |  50 ++++++
+ 3 files changed, 250 insertions(+), 2 deletions(-)
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 97982532..9f0cc8ee 100644
+index d2396afa94..c16902d1a8 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -38,6 +38,42 @@ except ImportError:
@@ -115,17 +115,18 @@ index 97982532..9f0cc8ee 100644
  
      def create_moe_runner(
 diff --git a/python/sglang/srt/model_loader/weight_utils.py b/python/sglang/srt/model_loader/weight_utils.py
-index fd659e7c..d250f1aa 100644
+index a77aecb388..1e7a991548 100644
 --- a/python/sglang/srt/model_loader/weight_utils.py
 +++ b/python/sglang/srt/model_loader/weight_utils.py
-@@ -1079,6 +1079,71 @@ def _drop_file_cache_after_load(path: str) -> None:
+@@ -1143,6 +1143,76 @@ def _drop_file_cache_after_load(path: str) -> None:
              os.close(fd)
  
  
-+
 +_KT_SKIP_CPU_EXPERTS = os.environ.get("KT_LOAD_SKIP_CPU_EXPERTS", "1") == "1"
 +_KT_SKIP_CPU_EXPERTS_RE = re.compile(
-+    os.environ.get("KT_LOAD_SKIP_CPU_EXPERTS_RE", r"(?:^|\.)layers\.(\d+)\..*\.experts\.(\d+)\.")
++    os.environ.get(
++        "KT_LOAD_SKIP_CPU_EXPERTS_RE", r"(?:^|\.)layers\.(\d+)\..*\.experts\.(\d+)\."
++    )
 +)
 +_kt_skip_state = {}
 +
@@ -184,28 +185,25 @@ index fd659e7c..d250f1aa 100644
 +        return False
 +    st["skipped"] += 1
 +    if st["skipped"] % 50000 == 0:
-+        print(f"[kt-load] {st['skipped']} CPU-expert tensors skipped unread (GPU experts per layer: {n})", flush=True)
++        print(
++            f"[kt-load] {st['skipped']} CPU-expert tensors skipped unread (GPU experts per layer: {n})",
++            flush=True,
++        )
 +    return True
++
 +
  def safetensors_weights_iterator(
      hf_weights_files: List[str],
      disable_mmap: bool = False,
-@@ -1193,7 +1258,7 @@ def multi_thread_safetensors_weights_iterator(
-                 result = safetensors.torch.load(f.read())
-         else:
-             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
--                result = {k: f.get_tensor(k) for k in f.keys()}
-+                result = {k: f.get_tensor(k) for k in f.keys() if not _kt_cpu_expert_key(k)}
- 
-         return st_file, result
- 
-@@ -1220,6 +1285,76 @@ def multi_thread_safetensors_weights_iterator(
-                 _drop_file_cache_after_load(st_file)
+@@ -1323,6 +1393,81 @@ def fastsafetensors_weights_iterator(
+                 _drop_file_cache_after_load(loaded_file)
  
  
 +_DENSE_PREFETCH_THREADS = int(os.environ.get("KT_LOAD_PREFETCH", "0") or 0)
 +_DENSE_PREFETCH_PIECE = int(os.environ.get("KT_LOAD_PREFETCH_PIECE_MB", "16")) << 20
-+_DENSE_PREFETCH_SKIP = re.compile(os.environ.get("KT_LOAD_PREFETCH_SKIP", r"\.experts\.|\.engram\.embed\."))
++_DENSE_PREFETCH_SKIP = re.compile(
++    os.environ.get("KT_LOAD_PREFETCH_SKIP", r"\.experts\.|\.engram\.embed\.")
++)
 +
 +
 +def _prefetch_dense_tensors(st_file: str) -> None:
@@ -269,29 +267,34 @@ index fd659e7c..d250f1aa 100644
 +        os.close(fd)
 +    logger.info(
 +        "[dense prefetch] %s: %.2f GiB in %.2f s (%d tensors)",
-+        os.path.basename(st_file), done / 2**30, time.time() - t0, len(ranges),
++        os.path.basename(st_file),
++        done / 2**30,
++        time.time() - t0,
++        len(ranges),
 +    )
 +
 +
  def buffered_multi_thread_safetensors_weights_iterator(
      hf_weights_files: List[str],
      max_workers: int,
-@@ -1247,8 +1382,9 @@ def buffered_multi_thread_safetensors_weights_iterator(
+@@ -1351,8 +1496,11 @@ def buffered_multi_thread_safetensors_weights_iterator(
              with open(st_file, "rb") as f:
                  result = safetensors.torch.load(f.read())
          else:
 +            _prefetch_dense_tensors(st_file)
              with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
 -                result = {k: f.get_tensor(k) for k in f.keys()}
-+                result = {k: f.get_tensor(k) for k in f.keys() if not _kt_cpu_expert_key(k)}
++                result = {
++                    k: f.get_tensor(k) for k in f.keys() if not _kt_cpu_expert_key(k)
++                }
          return result
  
      # Sliding window: max_workers loading + 1 prefetched.
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 692242ea..a546b3a9 100644
+index 9618ed3c32..e44d0663b8 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -20,6 +20,7 @@ from typing import (
+@@ -21,6 +21,7 @@ from typing import (
      Union,
  )
  
@@ -299,12 +302,10 @@ index 692242ea..a546b3a9 100644
  import torch
  import torch.nn as nn
  import torch.nn.functional as F
-@@ -49,6 +50,45 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
- from sglang.srt.environ import envs
- from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
- from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-+
-+
+@@ -456,6 +457,46 @@ def _fused_wo_a_arch_supported() -> bool:
+     return _is_cuda and torch.cuda.get_device_capability()[0] == 10
+ 
+ 
 +_KT_EXPERT_NAME = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.")
 +
 +
@@ -335,17 +336,20 @@ index 692242ea..a546b3a9 100644
 +                local = module._map_global_expert_id_to_local_expert_id(phys)
 +                # kt_kv_hot_lend: the shadow's experts load too
 +                if 0 <= local < module.num_local_experts and local < getattr(
-+                        qm, "load_gpu_experts", qm.num_gpu_experts):
++                    qm, "load_gpu_experts", qm.num_gpu_experts
++                ):
 +                    on_gpu = True
 +                    break
 +            if not on_gpu:
 +                cpu_only.add(logical)
 +        out[module.layer_id] = frozenset(cpu_only)
 +    return out
- from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
- from sglang.srt.layers.attention.dsa.utils import (
-     can_dsa_cp_split,
-@@ -4833,6 +4873,8 @@ class DeepseekV4ForCausalLM(nn.Module):
++
++
+ def _o_fp8_qdq_block() -> int:
+     """SGLANG_DSV4_O_FP8_QDQ_BLOCK (sglang-dsv4-o-fp8-qdq.py): FP8 quant-dequant of the
+     attention output before a bf16 wo_a, in blocks of this many; 0 = off."""
+@@ -5239,6 +5280,8 @@ class DeepseekV4ForCausalLM(nn.Module):
  
          cache_compressor_weight = {}
          COMPRESSOR_PART = ".compressor.w"
@@ -354,15 +358,17 @@ index 692242ea..a546b3a9 100644
  
          fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
          cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
-@@ -4892,6 +4934,11 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -5292,6 +5335,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                          is_nextn=is_nextn,
                          num_hidden_layers=self.config.num_hidden_layers,
                      )
 +                    if kt_cpu_only:
 +                        m = _KT_EXPERT_NAME.match(name)
-+                        if m and int(m.group(2)) in kt_cpu_only.get(int(m.group(1)), ()):
++                        if m and int(m.group(2)) in kt_cpu_only.get(
++                            int(m.group(1)), ()
++                        ):
 +                            kt_skipped += 1
 +                            continue
  
-                     # V4.1 checkpoint tensors with no module in the text model yet;
-                     # the per-group count is logged after loading.
+                     # V4.1 checkpoint tensors with no module in the text model yet.
+                     skip_group = None

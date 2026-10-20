@@ -1,4 +1,4 @@
-From ea7ecdda93e2f963aca4954b4e13e90728af00c2 Mon Sep 17 00:00:00 2001
+From 3f099d2e956b16afef35f2666c44809c7df1f621 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:33 +0900
 Subject: [PATCH] [tier 0] kt: run with zero GPU experts (--kt-num-gpu-experts
@@ -11,14 +11,24 @@ call is skipped and the CPU output is the result.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
- python/sglang/srt/layers/moe/kt_ep_wrapper.py | 10 +++++++---
- 1 file changed, 7 insertions(+), 3 deletions(-)
+ python/sglang/srt/layers/moe/kt_ep_wrapper.py | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 168f277b..97982532 100644
+index 168f277b9b..d2396afa94 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-@@ -403,11 +403,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -324,7 +324,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+ 
+         x = dispatch_output.hidden_states
+         topk_output = dispatch_output.topk_output
+-        topk_weights, topk_ids, _ = topk_output
++        # attributes, not unpacking: the packed variant carries a fourth field
++        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+ 
+         # Submit forward task to CPU (non-blocking)
+         self.wrapper.submit_forward(
+@@ -403,11 +404,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          )
  
          # Step 3: Execute GPU expert computation (any quantization method)

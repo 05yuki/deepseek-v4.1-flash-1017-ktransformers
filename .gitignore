@@ -5,3 +5,4 @@
 /logs/
 engram-adapter/librow_store.so
 __pycache__/
+/.cache/

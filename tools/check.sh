@@ -30,10 +30,19 @@ stop() {  # and wait for it to go, so the GPUs are free when this returns
 }
 trap stop EXIT
 
+# up, failed (the process gone, a scheduler exception, an argument error), or stalled:
+# its log silent for CHECK_STALL_S (900 s; the first launch compiles kernels in long
+# quiet spells). A Traceback alone is not a failure: the warmup logs one on a healthy start.
+stall="${CHECK_STALL_S:-900}"
 for _ in $(seq 1 720); do
   grep -a -q "The server is fired up" "$log" 2>/dev/null && break
-  if ! kill -0 "$pid" 2>/dev/null || grep -a -q "Traceback" "$log" 2>/dev/null; then
+  if ! kill -0 "$pid" 2>/dev/null ||
+    grep -a -q "Scheduler hit an exception\|error: unrecognized arguments\|error: argument" "$log" 2>/dev/null; then
     echo "the server stopped before it was up; see $log" >&2
+    exit 1
+  fi
+  if (( $(date +%s) - $(stat -c %Y "$log" 2>/dev/null || date +%s) > stall )); then
+    echo "the server log has been silent for over $stall s; stopping it. See $log" >&2
     exit 1
   fi
   sleep 5

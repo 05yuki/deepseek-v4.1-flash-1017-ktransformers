@@ -1,4 +1,4 @@
-From 57f821511f127e32e761ab76bae4461e4ee0ebb2 Mon Sep 17 00:00:00 2001
+From e944d18de6d9fe8f9c6e484ab8fa7cf839442010 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 2] stream-prefill: stream the CPU experts to the GPU
@@ -29,14 +29,14 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
  python/sglang/srt/layers/moe/kt_ep_wrapper.py |   83 +-
- .../srt/layers/moe/kt_stream_prefill.py       | 1637 +++++++++++++++++
- .../moe/moe_runner/flashinfer_cutlass.py      |  143 ++
+ .../srt/layers/moe/kt_stream_prefill.py       | 1661 +++++++++++++++++
+ .../moe/moe_runner/flashinfer_cutlass.py      |  191 ++
  .../mxfp4_flashinfer_cutlass_moe.py           |   41 +
- 4 files changed, 1890 insertions(+), 14 deletions(-)
+ 4 files changed, 1962 insertions(+), 14 deletions(-)
  create mode 100644 python/sglang/srt/layers/moe/kt_stream_prefill.py
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index ba0e35ed..5e5cdd9b 100644
+index 5aef8bf7ac..a088c8c0e0 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Optional
@@ -108,7 +108,7 @@ index ba0e35ed..5e5cdd9b 100644
  
      def create_moe_runner(
          self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
-@@ -476,9 +492,37 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -477,9 +493,37 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          if _routing_dump_prefix and self.tp_rank == 0:
              _routing_count(x.device, self.kt_config.layer_idx, topk_output.topk_ids, self.tp_rank)
  
@@ -147,7 +147,7 @@ index ba0e35ed..5e5cdd9b 100644
              self.submit(layer, dispatch_output)
  
          # Step 2: Prepare GPU computation by masking CPU expert IDs
-@@ -490,10 +534,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -491,10 +535,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          if _gpu_mask_zero:
              # KT_GPU_MASK_ZERO=1: the Marlin MoE path cannot take -1 ids (its
              # alignment kernels index weights with them: illegal address at
@@ -163,7 +163,7 @@ index ba0e35ed..5e5cdd9b 100644
              m = masked_topk_ids < 0
              masked_topk_output = topk_output._replace(
                  topk_ids=torch.where(m, torch.zeros_like(masked_topk_ids), masked_topk_ids).to(torch.int64),
-@@ -507,15 +552,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -508,15 +553,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
  
          # Step 3: Execute GPU expert computation (any quantization method)
          # This runs in parallel with CPU computation. With no resident GPU
@@ -195,10 +195,10 @@ index ba0e35ed..5e5cdd9b 100644
  
 diff --git a/python/sglang/srt/layers/moe/kt_stream_prefill.py b/python/sglang/srt/layers/moe/kt_stream_prefill.py
 new file mode 100644
-index 00000000..101e588b
+index 0000000000..659b924428
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_stream_prefill.py
-@@ -0,0 +1,1637 @@
+@@ -0,0 +1,1661 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""GPU-streamed prefill for the KT EP wrapper: expert groups over PCIe.
 +
@@ -233,15 +233,15 @@ index 00000000..101e588b
 +# KT_STREAM_GRAPH_KEEP: CUDA graphs kept for row counts other than the
 +# largest (a prompt's last chunk has its own; sglang-kt-stream-graph-keep.py)
 +GRAPH_KEEP = int(os.environ.get("KT_STREAM_GRAPH_KEEP", "8"))
++# KT_STREAM_GIN_STEP: under the prefill lend the graphs' shared input and output
++# buffers grow in steps of this many rows (0: sized for the launch chunk at once)
++GIN_STEP = int(os.environ.get("KT_STREAM_GIN_STEP", "4096") or 0)
 +from multiprocessing import shared_memory
 +from typing import Dict, List, Optional
 +
 +import torch
 +
-+from sglang.srt.distributed import (
-+    get_tensor_model_parallel_rank,
-+    get_tensor_model_parallel_world_size,
-+)
++from sglang.srt.runtime_context import get_parallel
 +
 +logger = logging.getLogger(__name__)
 +
@@ -539,8 +539,8 @@ index 00000000..101e588b
 +    """Process-wide (per rank) streaming state, shared by every MoE layer."""
 +
 +    def __init__(self, method, layer):
-+        self.rank = get_tensor_model_parallel_rank()
-+        self.world = get_tensor_model_parallel_world_size()
++        self.rank = get_parallel().tp_rank
++        self.world = get_parallel().tp_size
 +        self.device = layer.w13_weight.device
 +        self.N = layer.intermediate_size_per_partition
 +        self.K = layer.hidden_size
@@ -1403,16 +1403,26 @@ index 00000000..101e588b
 +        need = numel * esize
 +        base = self._gin_base.get(name)
 +        if base is None or base.numel() < need:
-+            rows = max(T, 2048)
 +            from sglang.srt.layers.moe import kt_lend
 +
-+            if kt_lend.ENABLED:  # kt_lend: the whole chunk
-+                rows = max(rows, kt_lend._chunk())
++            rows = max(T, 2048)
++            if kt_lend.ENABLED:
++                # in whole steps of GIN_STEP rows, not the launch chunk: with the
++                # prefill plan that is its cap (36,864), far above any chunk the
++                # memory allows, and these buffers sit in every window's scratch
++                # (1,081 MiB at the cap; 131K planned in 4,096-row chunks for it)
++                rows = -(-rows // GIN_STEP) * GIN_STEP if GIN_STEP > 0 else max(rows, kt_lend._chunk())
 +            nbytes = max(need, -(-need * rows // T))
 +            nbytes = -(-nbytes // 256) * 256
-+            # Views made from an older base keep it (and their graphs) alive.
-+            from sglang.srt.layers.moe import kt_lend
-+
++            if base is not None:
++                # views of the older base, and the graphs captured on them, keep it
++                # alive: drop them all so it goes back to the scratch
++                torch.cuda.synchronize(device)
++                self._gin.clear()
++                self._graphs.clear()
++                self._graph_use.clear()
++                del base
++                self._gin_base.pop(name, None)
 +            with kt_lend.scratch_region():
 +                base = torch.zeros(nbytes, dtype=torch.uint8, device=device)
 +            self._gin_base[name] = base
@@ -1664,7 +1674,7 @@ index 00000000..101e588b
 +    import threading
 +
 +    main_id = threading.main_thread().ident
-+    rank = get_tensor_model_parallel_rank()
++    rank = get_parallel().tp_rank
 +
 +    def loop():
 +        while True:
@@ -1687,9 +1697,9 @@ index 00000000..101e588b
 +    import json
 +    from safetensors import safe_open
 +
-+    from sglang.srt.server_args import get_global_server_args
++    from sglang.srt.runtime_context import get_server_args
 +
-+    model = get_global_server_args().model_path
++    model = get_server_args().model_path
 +    idx = _ckpt_cache.get("index")
 +    if idx is None:
 +        idx = json.load(open(os.path.join(model, "model.safetensors.index.json")))["weight_map"]
@@ -1784,7 +1794,7 @@ index 00000000..101e588b
 +    global _instance, _failed
 +    if not EARLY_INIT or STREAM_THRESHOLD <= 0 or _failed or _instance is not None:
 +        return
-+    rank = get_tensor_model_parallel_rank()
++    rank = get_parallel().tp_rank
 +    t0 = time.time()
 +    try:
 +        _instance = KTStreamPrefill(method, layer)
@@ -1800,20 +1810,34 @@ index 00000000..101e588b
 +         f"at load time in {time.time() - t0:.0f} s")
 +
 +
++# KT_GPU_STREAM_IN_WINDOW=1: inside a prefill lend window (a forward of at least
++# KT_GPU_STREAM_PREFILL rows) every MoE call streams, also those of fewer rows
++# (V4.1's bounded replay runs its late layers over each chunk's last 128 rows)
++IN_WINDOW = os.environ.get("KT_GPU_STREAM_IN_WINDOW", "0") == "1"
++
++
++def _in_lend_window() -> bool:
++    try:
++        from sglang.srt.layers.moe import kt_lend
++    except ImportError:
++        return False
++    return kt_lend.phase() == "prefill"
++
++
 +def stream_prefill_for(method, layer, num_tokens: int) -> Optional[KTStreamPrefill]:
 +    """The per-rank streamer when this call qualifies, else None."""
 +    global _instance, _failed
 +    if STREAM_THRESHOLD <= 0 or _failed:
 +        return None
-+    if num_tokens < STREAM_THRESHOLD:
++    if num_tokens < STREAM_THRESHOLD and not (IN_WINDOW and _in_lend_window()):
 +        if TIMING and _instance is not None and num_tokens > 1:
-+            _log(f"rank{get_tensor_model_parallel_rank()} layer{method.kt_config.layer_idx} tokens={num_tokens} below threshold, CPU path")
++            _log(f"rank{get_parallel().tp_rank} layer{method.kt_config.layer_idx} tokens={num_tokens} below threshold, CPU path")
 +        return None
 +    if torch.cuda.is_current_stream_capturing():
 +        return None
 +    if _instance is None:
 +        _log(
-+            f"rank {get_tensor_model_parallel_rank()}: first qualifying call, "
++            f"rank {get_parallel().tp_rank}: first qualifying call, "
 +            f"layer {method.kt_config.layer_idx}, tokens={num_tokens}"
 +        )
 +        try:
@@ -1837,7 +1861,7 @@ index 00000000..101e588b
 +    kept = max(1, n_groups - CPU_GROUPS)
 +    return min(last, first + kept * streamer.G)
 diff --git a/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py b/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
-index 950591ca..8115cb70 100644
+index 453247fb21..b1640edb13 100644
 --- a/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
 +++ b/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
 @@ -11,6 +11,8 @@ from __future__ import annotations
@@ -1849,7 +1873,7 @@ index 950591ca..8115cb70 100644
  import torch
  
  from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
-@@ -112,6 +114,111 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
+@@ -146,6 +148,139 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
      padded_hidden: Optional[int] = None
  
  
@@ -1881,7 +1905,9 @@ index 950591ca..8115cb70 100644
 +    return kt_lend.ENABLED and kt_lend.phase() == "prefill"
 +
 +
-+def get_shared_cutlass_workspace(nbytes: int, device: torch.device) -> Optional[torch.Tensor]:
++def get_shared_cutlass_workspace(
++    nbytes: int, device: torch.device
++) -> Optional[torch.Tensor]:
 +    """The preallocated buffer if it is large enough, else None (the caller
 +    lets FlashInfer allocate for that call) with a loud warning."""
 +    key = device.index if device.index is not None else torch.cuda.current_device()
@@ -1897,7 +1923,9 @@ index 950591ca..8115cb70 100644
 +    return ws
 +
 +
-+def preallocate_shared_cutlass_workspace(nbytes: int, device: torch.device) -> torch.Tensor:
++def preallocate_shared_cutlass_workspace(
++    nbytes: int, device: torch.device
++) -> torch.Tensor:
 +    assert not torch.cuda.is_current_stream_capturing()
 +    key = device.index if device.index is not None else torch.cuda.current_device()
 +    ws = _shared_cutlass_workspace.get(key)
@@ -1912,9 +1940,9 @@ index 950591ca..8115cb70 100644
 +    """Size the shared workspace for the prefill chunk on the first call so it
 +    is not re-allocated (and the old one retired) on the first real prefill."""
 +    try:
-+        from sglang.srt.server_args import get_global_server_args
++        from sglang.srt.runtime_context import get_schedule
 +
-+        chunk = get_global_server_args().chunked_prefill_size or 0
++        chunk = get_schedule().chunked_prefill_size or 0
 +    except Exception:
 +        chunk = 0
 +    # sglang-kt-stream-row-block-dsv41.py: a streamed prefill's calls see a block at most
@@ -1923,9 +1951,22 @@ index 950591ca..8115cb70 100644
 +    return max(num_tokens, _block_rows(chunk))
 +
 +
-+def mxfp4_workspace_nbytes(num_tokens, hidden, inter, num_experts_total, topk, x_dtype,
-+                           activation_type, tp_size, tp_rank, ep_size, ep_rank,
-+                           use_mxfp8_act_scaling, device, weight_dtype=torch.int64):
++def mxfp4_workspace_nbytes(
++    num_tokens,
++    hidden,
++    inter,
++    num_experts_total,
++    topk,
++    x_dtype,
++    activation_type,
++    tp_size,
++    tp_rank,
++    ep_size,
++    ep_rank,
++    use_mxfp8_act_scaling,
++    device,
++    weight_dtype=torch.int64,
++):
 +    from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
 +
 +    return cutlass_fused_moe_workspace_size(
@@ -1952,65 +1993,96 @@ index 950591ca..8115cb70 100644
 +def _mxfp4_workspace(x, quant_info, topk, activation_type, use_mxfp8_act_scaling):
 +    w2 = quant_info.w2_weight
 +    nbytes = mxfp4_workspace_nbytes(
-+        x.shape[0], w2.shape[1], w2.shape[2] * 2, w2.shape[0] * quant_info.moe_ep_size, topk,
-+        x.dtype, activation_type, quant_info.moe_tp_size, quant_info.moe_tp_rank,
-+        quant_info.moe_ep_size, quant_info.moe_ep_rank, use_mxfp8_act_scaling, x.device)
++        x.shape[0],
++        w2.shape[1],
++        w2.shape[2] * 2,
++        w2.shape[0] * quant_info.moe_ep_size,
++        topk,
++        x.dtype,
++        activation_type,
++        quant_info.moe_tp_size,
++        quant_info.moe_tp_rank,
++        quant_info.moe_ep_size,
++        quant_info.moe_ep_rank,
++        use_mxfp8_act_scaling,
++        x.device,
++    )
 +    return get_shared_cutlass_workspace(nbytes, x.device)
 +
 +
  def _flashinfer_cutlass_fused_moe():
      if not is_flashinfer_available():
          raise RuntimeError(
-@@ -320,6 +427,33 @@ def fused_experts_none_to_flashinfer_mxfp4(
-         f"Unexpected quant_info type for flashinfer_mxfp4: {type(quant_info)}"
-     )
+@@ -465,6 +600,49 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
+     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+     from sglang.srt.layers.moe.topk import TopKOutputChecker
  
-+    # sglang-kt-stream-row-block-dsv41.py: during a KT streamed prefill the
++    # During a KT streamed prefill the
 +    # resident experts run over blocks of rows (KT_GPU_STREAM_ROW_BLOCK), each
 +    # quantizing its own activations, so the workspace is a block's
 +    from sglang.srt.layers.moe.kt_stream_prefill import _block_rows
 +
 +    rows = dispatch_output.hidden_states.shape[0]
 +    step = _block_rows(rows)
-+    if (step < rows and dispatch_output.hidden_states_scale is None
-+            and getattr(dispatch_output, "hidden_states_pre_quant", None) is None
-+            and _kt_streamed_prefill()):
++    if (
++        step < rows
++        and dispatch_output.hidden_states_scale is None
++        and getattr(dispatch_output, "hidden_states_pre_quant", None) is None
++        and _kt_streamed_prefill()
++    ):
 +        topk = dispatch_output.topk_output
 +        if TopKOutputChecker.format_is_bypassed(topk):
 +            topk = topk.to_standard()
 +        out = None
 +        for r0 in range(0, rows, step):
 +            r1 = min(rows, r0 + step)
-+            part_topk = type(topk)(*[
-+                f[r0:r1] if isinstance(f, torch.Tensor) and f.dim() > 0 and f.shape[0] == rows else f
-+                for f in topk])
++            part_topk = type(topk)(
++                *[
++                    f[r0:r1]
++                    if isinstance(f, torch.Tensor)
++                    and f.dim() > 0
++                    and f.shape[0] == rows
++                    else f
++                    for f in topk
++                ]
++            )
 +            part = dispatch_output._replace(
-+                hidden_states=dispatch_output.hidden_states[r0:r1], topk_output=part_topk)
-+            y = fused_experts_none_to_flashinfer_mxfp4(part, quant_info, runner_config).hidden_states
++                hidden_states=dispatch_output.hidden_states[r0:r1],
++                topk_output=part_topk,
++            )
++            y = _fused_experts_flashinfer_mxfp4_cutlass(
++                part, quant_info, runner_config
++            ).hidden_states
 +            if out is None:
-+                out = torch.empty((rows,) + tuple(y.shape[1:]), dtype=y.dtype, device=y.device)
++                out = torch.empty(
++                    (rows,) + tuple(y.shape[1:]), dtype=y.dtype, device=y.device
++                )
 +            out[r0:r1].copy_(y)
 +        return StandardCombineInput(hidden_states=out)
 +
-     flashinfer_cutlass_fused_moe, ActivationType = _flashinfer_cutlass_fused_moe()
- 
      x = dispatch_output.hidden_states
-@@ -408,6 +542,14 @@ def fused_experts_none_to_flashinfer_mxfp4(
-     humming_kwargs = {"use_wfp4afp8_humming": True} if use_wfp4afp8_humming else {}
-     with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+     if x.shape[0] == 0:
+         return StandardCombineInput(hidden_states=x)
+@@ -558,6 +736,18 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
+         get_parallel().tp_group, disabled=not is_allocation_symmetric()
+     ):
          out = torch.empty(x.shape[0], out_hidden, dtype=output_dtype, device=x.device)
 +    activation_type = (
-+        ActivationType.SwigluStep if quant_info.use_swiglu_step else ActivationType.Swiglu
++        ActivationType.SwigluStep
++        if quant_info.use_swiglu_step
++        else ActivationType.Swiglu
 +    )
 +    workspace_kwargs = {}
 +    if use_mxfp8_act_scaling and not use_wfp4afp8_humming:
-+        ws = _mxfp4_workspace(x, quant_info, topk_ids.shape[1], activation_type, use_mxfp8_act_scaling)
++        ws = _mxfp4_workspace(
++            x, quant_info, topk_ids.shape[1], activation_type, use_mxfp8_act_scaling
++        )
 +        if ws is not None:
 +            workspace_kwargs = {"workspace_buffer": ws}
  
      flashinfer_cutlass_fused_moe(
          input=x,
-@@ -438,6 +580,7 @@ def fused_experts_none_to_flashinfer_mxfp4(
+@@ -588,6 +778,7 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
          output=out,
          use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
          **humming_kwargs,
@@ -2019,10 +2091,10 @@ index 950591ca..8115cb70 100644
  
      if do_pad:
 diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
-index a453d4aa..f17d3b2b 100644
+index b2acc510c7..dc5a34bb81 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 +++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
-@@ -113,6 +113,9 @@ class Mxfp4FlashinferCutlassMoEMethod:
+@@ -116,6 +116,9 @@ class Mxfp4FlashinferCutlassMoEMethod:
          clamp_limit = (
              gemm1_clamp_limit if gemm1_clamp_limit is not None else swiglu_limit
          )
@@ -2032,7 +2104,7 @@ index a453d4aa..f17d3b2b 100644
          if clamp_limit is not None:
              self._swiglu_limit_tensor = torch.full(
                  (E,), float(clamp_limit), dtype=torch.float32, device=device
-@@ -126,6 +129,44 @@ class Mxfp4FlashinferCutlassMoEMethod:
+@@ -129,6 +132,44 @@ class Mxfp4FlashinferCutlassMoEMethod:
  
          self.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, moe_runner_config)
  

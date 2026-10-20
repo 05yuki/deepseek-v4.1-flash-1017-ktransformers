@@ -17,8 +17,9 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1]) / "python/sglang/srt/models"
-shutil.copyfile(Path(__file__).with_name("dsv4_o_fp8_qdq.py"), root / "deepseek_common/o_fp8_qdq.py")
-print(f"copied {root / 'deepseek_common/o_fp8_qdq.py'}")
+# every edit is checked first and the files are written only when all of them fit,
+# so a tree it does not fit is left as it was
+pending = []
 
 
 def patch(path, edits):
@@ -28,10 +29,9 @@ def patch(path, edits):
         return
     for old, new in edits:
         if s.count(old) != 1:
-            raise SystemExit(f"{path}: anchor found {s.count(old)} times:\n{old}")
+            raise SystemExit(f"{path}: anchor found {s.count(old)} times, nothing changed:\n{old}")
         s = s.replace(old, new)
-    path.write_text(s)
-    print(f"patched {path}")
+    pending.append((path, s))
 
 
 helper = '''
@@ -70,7 +70,6 @@ patch(root / "deepseek_v4_dspark.py", [
     (
         """        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         if self._use_fast_kernel:
-            o = torch.einsum("bgd,grd->bgr", o, wo_a)
 """,
         """        import os
 
@@ -82,7 +81,12 @@ patch(root / "deepseek_v4_dspark.py", [
             o = o_fp8_qdq_(o, _qdq)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         if self._use_fast_kernel:
-            o = torch.einsum("bgd,grd->bgr", o, wo_a)
 """,
     ),
 ])
+
+shutil.copyfile(Path(__file__).with_name("dsv4_o_fp8_qdq.py"), root / "deepseek_common/o_fp8_qdq.py")
+print(f"copied {root / 'deepseek_common/o_fp8_qdq.py'}")
+for path, s in pending:
+    path.write_text(s)
+    print(f"patched {path}")

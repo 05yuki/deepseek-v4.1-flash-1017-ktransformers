@@ -4,9 +4,9 @@
 
 | tier | file | applies to |
 |---|---|---|
-| 0 | `patches/sglang-tier0/NN-*.patch` | sgl-project/sglang `1aa0e962` (formerly the `dsv4.1` branch), one concern each |
-| 1 | `patches/sglang-tier1-long-prompts.patch` | the same, after tier 0 |
-| 2 | `patches/sglang-tier2/NN-*.patch` | the same, after tier 1: one patch per feature ([tier2.md](tier2.md)) |
+| 0 | `patches/sglang-tier0/NN-*.patch` | sgl-project/sglang main at `ed0b8f43`, one concern each |
+| 1 | none | empty on this SGLang (below) |
+| 2 | `patches/sglang-tier2/NN-*.patch` | the same, after tier 0: one patch per feature ([tier2.md](tier2.md)) |
 | 3 | `patches/sglang-tier3-no-p2p.patch` | the same, after tier 2 |
 | 2 | `patches/kt-kernel-tree.patch` | kvcache-ai/ktransformers `95009ea` (below tier 2 it is built as pinned) |
 | 2 | `patches/kt-kernel-llama-cpp.patch` | ktransformers' `third_party/llama.cpp` submodule |
@@ -16,177 +16,61 @@
 - **Tier 0** is what DeepSeek-V4.1-Flash-1017 needs to run correctly on the KTransformers
   hybrid MoE, on any GPU, and nothing else. KTransformers `95009ea` needs no change for it: its AVX2
   MXFP4 experts, the SwiGLU clamp and the loader are there.
-- **Tier 1** keeps the indexer's memory flat on long prompts.
+- **Tier 1** is empty: SGLang main scores the V4.1 indexer in row chunks itself, which is
+  what this tier did on the earlier base; a 48K-token prefill runs without it. The number
+  stays so `TIER` means the same as before.
 - **Tier 2** is speed and memory on any GPU this SGLang runs DeepSeek-V4 on; the streamed
   prefill computes through FlashInfer's bf16 CUTLASS MoE (SM89 or newer). It needs the
   kt-kernel patch (shared expert memory). `serve.sh` turns its features on from tier 2.
 - **Tier 3** is what depends on the machine: two GPUs without peer access.
 
-The SGLang patches are the commits of branch `dsv41-1017` of
-[05yuki/sglang-upstream](https://github.com/05yuki/sglang-upstream/tree/dsv41-1017) on `1aa0e962`, one
+The SGLang patches are the commits of branch `dsv41-1017-main` of
+[05yuki/sglang-upstream](https://github.com/05yuki/sglang-upstream/tree/dsv41-1017-main) on `ed0b8f43`, one
 concern a commit, in `git format-patch` form: each file carries its commit message (what the change
 is for, its switch, how it was checked). `git log` on the branch reads as the list below.
 
-Each section below says its tier.
+A switch marked "on" is on in `serve.sh`.
 
-Most features have an environment variable. The defaults are the ones `serve.sh` sets. A
-switch marked "on" is on in `serve.sh`.
+## SGLang tier 0
 
-## SGLang patches
+What 1017 needs to run correctly. Each patch is one concern; its commit message says how
+it was checked.
 
-### CPU/GPU hybrid MoE (KTransformers wrapper)
+### KTransformers wrapper
 
-`layers/moe/kt_ep_wrapper.py`. Tier 0: the clamp, the `-1` ids, the expert mask and zero GPU
-experts. Tier 2: the rest.
+`layers/moe/kt_ep_wrapper.py`. SGLang's wrapper runs physical experts `0..N-1` of each layer on
+the GPU (`--kt-num-gpu-experts`) and the rest on the CPU through kt-kernel, in parallel, and
+adds the two results. Tier 0:
 
-- Runs physical experts `0..N-1` of each layer on the GPU (`--kt-num-gpu-experts`) and the
-  rest on the CPU through kt-kernel, in parallel, and adds the two results.
-- Maps the router's logical expert ids to physical ones, so a hot-expert placement
-  (`--init-expert-location`, `placements/`) actually puts the hot experts on the GPU.
+- Passes the checkpoint's SwiGLU clamp to the CPU experts (`KT_SWIGLU_CLAMP`, on).
+- Passes kt-kernel the boolean mask of GPU experts its inference API takes.
 - Sends the CPU's routes to GPU expert 0 at weight 0 instead of `-1`, which the Marlin MoE
   kernels need (`KT_GPU_MASK_ZERO`, set by `serve.sh` with Marlin).
-- Passes kt-kernel the boolean mask of GPU experts its inference API takes, and runs with
-  zero GPU experts (`--kt-num-gpu-experts 0`).
-- Passes the checkpoint's SwiGLU clamp to the CPU experts (`KT_SWIGLU_CLAMP`, on).
-- `KT_ROUTING_DUMP=<prefix>`: saves a per-layer histogram of the routed experts, to build
-  a placement from your own workload.
+- Runs with zero GPU experts (`--kt-num-gpu-experts 0`).
 
-### GPU MoE kernels
+### 1017's FP8 step
 
-Tier 2.
+`models/deepseek_v4.py`, `models/deepseek_common/o_fp8_qdq.py`, `models/deepseek_v4_dspark.py`
 
-`layers/moe/mxfp4_fp32_moe.py`, `layers/quantization/mxfp4_marlin_moe.py`, `layers/quantization/fp8.py`
+The attention output in FP8 before `wo_a`, bit-exact against the reference code
+(`SGLANG_DSV4_O_FP8_QDQ_BLOCK`, set from the checkpoint by `tools/o-fp8-qdq-block.sh`). See
+the README.
 
-- `SGLANG_MXFP4_MOE_FP32` (on): the GPU experts (resident and hot) stay in the
-  checkpoint's MXFP4 layout and run through Triton kernels that round to bf16 once, at
-  the weighted sum. Decode uses a per-route GEMV; larger batches compute only the routes
-  with a weight, on the tensor cores. Outputs repeat exactly from launch to launch.
-- With `SGLANG_MXFP4_MOE_FP32=0` the experts run through Marlin instead.
-  `SGLANG_MARLIN_MOE_FP32_GLUE` (on) then keeps the steps around Marlin's two GEMMs in fp32
-  (`layers/moe/fused_moe_triton/fused_marlin_moe.py`).
+### V4.1 indexer on SM12x
 
-### Streamed prefill
+`layers/attention/dsv4/v41_indexer/__init__.py`; only GPUs of compute capability 12.x (RTX
+50, RTX PRO Blackwell, DGX Spark) are affected.
 
-Tier 2.
-
-`layers/moe/kt_stream_prefill.py`, `layers/moe/moe_runner/flashinfer_cutlass.py`,
-`layers/quantization/mxfp4_flashinfer_cutlass_moe.py`
-
-- Above `KT_GPU_STREAM_PREFILL` tokens (512), the CPU experts are not computed on the
-  CPU. Their weights are copied to the GPU in groups over PCIe and computed there, the
-  copy of the next group overlapping the compute of the current one.
-- `KT_GPU_STREAM_W16` (on) dequantizes each group to bf16 on the GPU and runs it through
-  FlashInfer's bf16 CUTLASS MoE, which FlashInfer builds for SM89, SM90, SM100, SM103 and
-  SM120. With `KT_GPU_STREAM_W16=0` the groups stay MXFP4 and run through the SM120
-  MXFP8 x MXFP4 kernel instead (SM120 only).
-  `KT_GPU_STREAM_ZEROCOPY` and `KT_GPU_STREAM_GRAPH` (on) read straight from kt-kernel's
-  shared expert memory and launch each group as one CUDA graph.
-- One persistent CUTLASS MoE workspace per GPU, allocated before the decode graphs are
-  captured.
-
-### Prefill lend: GPU memory for long prompts
-
-Tier 2.
-
-`layers/moe/kt_lend.py`, `layers/moe/kt_lend_probe.py`, `layers/moe/kt_pinned.py`,
-`model_executor/model_runner.py`, `model_loader/loader.py`, `utils/torch_memory_saver_adapter.py`
-
-- `KT_PREFILL_LEND` (on): during a streamed prefill, the GPU-resident weights give their
-  memory to the prefill and are brought back layer by layer, at the same addresses,
-  just before each layer runs. Decode sees them as before.
-- The first launch of a setup measures how large a prefill chunk fits and keeps it as a
-  hint (`lib/kt-lend-auto.sh`).
-
-### KV pool on remappable memory
-
-Tier 2.
-
-`layers/moe/kt_kv_vmm.py`, `layers/moe/kt_kv_prefill_lend.py`, `layers/moe/kt_prefill_plan.py`,
-`mem_cache/kv_cache_configurator.py`, `model_executor/pool_configurator.py`,
-`managers/scheduler.py`, `managers/schedule_batch.py`; the library is `kv-vmm/kv_vmm.c`
-
-- `KT_KV_VMM` (on): the KV pool sits on memory whose physical pages can be unmapped and
-  mapped again while its addresses, and the CUDA graphs that read it, stay the same.
-- `KT_PREFILL_KV_LEND` (on): during a prefill, the pool's free pages lend their memory to
-  the prefill. The KV pool never shrinks: pages in use are never lent.
-- `KT_PREFILL_PLAN` (on): each request's chunk size is planned from the memory free at
-  that moment, so a long prompt takes fewer, larger chunks.
-- `KT_PREFILL_SWA_LEND` (on): the sliding-window pool is sized for the largest planned
-  chunk, and its free pages are released outside prefill.
-
-### Hot lend: more GPU experts in decode
-
-Tier 2.
-
-`layers/moe/kt_kv_hot_lend.py`, `layers/moe/fused_moe_triton/layer.py`, `model_loader/weight_utils.py`
-
-- `KT_KV_HOT_LEND` (on): outside prefill, the KV pool's free pages hold up to
-  `KT_KV_HOT_EXTRA` (16) more experts a layer on the GPU, the next-hottest after the
-  resident ones. They leave whenever the KV pool needs the pages or a prefill starts.
-- `KT_KV_HOT_SPARE_FLOOR_MB` (1024): the slots also use the GPU memory the driver has
-  idle in decode, above this floor.
-- `KT_KV_HOT_SLOTS_MAX`: caps the slots a GPU (for measurements).
-
-### DeepSeek-V4.1-Flash-1017 model changes
-
-Tier 0: the FP8 step. Tier 2: the rest.
-
-`models/deepseek_v4.py`, `models/deepseek_common/o_fp8_qdq.py`, `models/deepseek_common/wo_a_fp8_gemv.py`,
-`models/deepseek_v4_dspark.py`
-
-- 1017's FP8 quantize-dequantize of the attention output before `wo_a`, bit-exact against
-  the reference code (`SGLANG_DSV4_O_FP8_QDQ_BLOCK`, set from the checkpoint by
-  `tools/o-fp8-qdq-block.sh`). See the README.
-- `SGLANG_DSV4_WO_A_FP8_NATIVE` (on): `wo_a` stays in the checkpoint's FP8 instead of a bf16
-  copy. Decode reads the FP8 directly; prefill dequantizes into one shared buffer.
-- `SGLANG_DSV4_VISION_ON_DEMAND` (on): the vision tower waits in pinned host memory and
-  is on the GPU only while a batch's images are encoded. The prefill plan accounts for it
-  in requests with images.
-- `SGLANG_DSV41_ENGRAM_PREFETCH_ROWS` (on): in decode, each engram layer's row lookup starts
-  with the token on a side stream instead of when its layer comes. The all-reduce, `wkv` and
-  the gate stay in place, so the values are unchanged.
-- The padded query buffer of a prefill is part of the prefill's scratch memory.
-
-### SM12x sparse attention
-
-Tier 0. `kernels/ops/attention/flash_mla_sm120.py`, which only GPUs of compute capability 12.x
-run (RTX 50, RTX PRO Blackwell, DGX Spark); other GPUs are unaffected.
-
-- The page-split scratch converts the extra KV source (128-token pages) to 64-token pages
-  as well, in its own buffer; without it the first prefill stops with "Unsupported
-  sparse-MLA prefill configuration".
-- Index lanes past `topk_length` are masked (a FlashInfer 0.6.18 bug corrupts prompts over
-  64 tokens otherwise); the reserved padding page is zeroed on every conversion
-  (dsv41-flash-dual-epyc#3 by f-wunderlich).
-
-### Indexer on long prompts
-
-Tier 1. `layers/attention/deepseek_v4_backend.py`, `layers/attention/dsv4/indexer.py`
-
-- The dense low-ratio indexer scores a long prefill's rows in slices, so its logits never
-  hold the whole chunk at once (a long prefill otherwise runs out of memory).
-
-### Dense layers and all-reduce
-
-Tier 2: the GEMMs. Tier 3: the all-reduces.
-
-`kernels/ops/quantization/fp8_kernel.py`, `layers/quantization/fp8_utils.py`,
-`distributed/device_communicators/ll_allreduce.py`, `distributed/device_communicators/host_staged_allreduce.py`,
-`distributed/parallel_state.py`
-
-- Block-FP8 GEMMs with up to four rows (decode) run through a GEMV kernel that steps K by
-  several scale groups at a time (`kernels/ops/quantization/fp8_block_gemv.py`,
-  `SGLANG_FP8_GEMV`, on). Same arithmetic up to the fp32 summation order.
-- Otherwise, block-FP8 GEMMs with a few rows use a split-K tiling (`SGLANG_FP8_SKINNY`, on by
-  default in the code).
-- Two GPUs without peer access: small all-reduces (decode) through pinned host memory in
-  NCCL's LL form (`SGLANG_LL_ALLREDUCE`), large ones (prefill) staged through pinned host
-  memory with the copy engines (`SGLANG_HOST_STAGED_ALLREDUCE`). `serve.sh` turns both on
-  for two GPUs.
+- `is_sm100_or_newer()` leaves out compute capability 12: DeepGEMM has no SM12x build, and the
+  candidate indexer otherwise stops at startup ("the candidate indexer needs DeepGEMM's paged
+  sparse MQA logits"). SM12x takes Hopper's torch indexer.
+- The sparse attention fixes this tier carried on the earlier base (the extra KV source
+  page-split, lanes past `topk_length` masked, the padding page zeroed) are not needed with
+  FlashInfer 0.7.2: a 48K-token prefill runs without them, with the same NLL.
 
 ### Chat encoding
 
-Tier 0. `entrypoints/openai/encoding_dsv41.py`, `entrypoints/openai/protocol.py`,
+`entrypoints/openai/encoding_dsv41.py`, `entrypoints/openai/protocol.py`,
 `entrypoints/openai/serving_chat.py`, `function_call/deepseekv41_detector.py`,
 `function_call/core_types.py`
 
@@ -196,21 +80,39 @@ The prompt format of the checkpoint's current `encoding/encoding.py`
 - Tool namespaces: a tool may carry `namespace`; the prompt shows `namespace::name`, and a
   parsed call returns the bare name in `function.name` and the namespace in an added
   `namespace` field of the tool call (absent when there is none).
-- Without a tools declaration, reasoning is dropped only before the latest real user
-  request; tool results do not start a new turn. Tool-result images keep prompt order.
-- Reasoning effort `low` / `high` / `max` render as 50 / 75 / 100, the reference's budgets
-  (the pinned commit had 25 / 50; sgl-project/sglang#39929). The default is `high`.
 
-### Smaller fixes
+The reference's other later changes are in SGLang main already: reasoning dropped only before
+the latest real user request, tool-result images in prompt order (sgl-project/sglang#44751),
+and the reasoning-effort budgets 50 / 75 / 100 (#39929).
 
-Tier 0: the load barrier's timeout. Tier 2: the rest.
+### Load barrier
 
-- `model_loader/weight_utils.py`: the GPU side's loader skips reading the experts that only
-  the CPU runs (`KT_LOAD_SKIP_CPU_EXPERTS`, on), and reads the hot lend's experts too.
-- `model_executor/model_runner_components/load_model_utils.py`: the wait for the other
-  rank's weight loading is set by `SGLANG_UNBALANCED_LOAD_TIMEOUT_S` (`serve.sh`: 1800 s).
-- `layers/moe/kt_launch_timing.py` (`KT_LAUNCH_TIMING=1`): a timeline of the weight load,
-  for diagnosis only.
+`model_executor/model_runner_components/load_model_utils.py`: the wait for the other rank's
+weight loading is set by `SGLANG_UNBALANCED_LOAD_TIMEOUT_S` (`serve.sh`: 1800 s).
+
+## SGLang tier 2
+
+One patch per feature. What each does, its switches and their defaults, its numerics, and
+what it was measured to change are in [tier2.md](tier2.md), one section a patch. By what they
+are for:
+
+| for | patches |
+|---|---|
+| decode | [`fp8-decode`](tier2.md#01-fp8-decode), [`engram-row-prefetch`](tier2.md#04-engram-row-prefetch), [`wo-a-fp8`](tier2.md#05-wo-a-fp8), [`placement`](tier2.md#11-placement), [`hot-lend`](tier2.md#16-hot-lend) |
+| long prompts | [`stream-prefill`](tier2.md#14-stream-prefill), [`prefill-lend`](tier2.md#13-prefill-lend), [`kv-vmm`](tier2.md#12-kv-vmm), [`kv-lend-plan`](tier2.md#15-kv-lend-plan) |
+| GPU memory | [`wo-a-fp8`](tier2.md#05-wo-a-fp8), [`vision-on-demand`](tier2.md#06-vision-on-demand) |
+| numerics | [`gpu-moe-fp32`](tier2.md#02-gpu-moe-fp32) |
+| startup | [`loading`](tier2.md#08-loading), [`launch-timing`](tier2.md#09-launch-timing), [`pool-swa-guard`](tier2.md#10-pool-swa-guard) |
+| fixes | [`cutlass-kt-expert-count`](tier2.md#03-cutlass-kt-expert-count), [`thinking-default-parser`](tier2.md#07-thinking-default-parser) |
+
+## SGLang tier 3
+
+`distributed/device_communicators/ll_allreduce.py`,
+`distributed/device_communicators/host_staged_allreduce.py`, `distributed/parallel_state.py`
+
+Two GPUs without peer access: small all-reduces (decode) through pinned host memory in NCCL's
+LL form (`SGLANG_LL_ALLREDUCE`), large ones (prefill) staged through pinned host memory with
+the copy engines (`SGLANG_HOST_STAGED_ALLREDUCE`). `serve.sh` turns both on for two GPUs.
 
 ## kt-kernel tree patch
 

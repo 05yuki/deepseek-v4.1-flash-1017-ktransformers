@@ -1,4 +1,4 @@
-From b8fb035750c0f3dfcc6f9e53ef8b38b88b720249 Mon Sep 17 00:00:00 2001
+From 09736901dade54046f8e0c67c0122490c1cf0d5b Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 2] kv-lend-plan: lend the KV pool's free pages to
@@ -25,18 +25,18 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
  .../sglang/srt/layers/moe/kt_kv_hot_lend.py   | 550 +++++++++++
  .../srt/layers/moe/kt_kv_prefill_lend.py      | 914 ++++++++++++++++++
- .../sglang/srt/layers/moe/kt_prefill_plan.py  | 238 +++++
+ .../sglang/srt/layers/moe/kt_prefill_plan.py  | 248 +++++
  python/sglang/srt/managers/schedule_batch.py  |  11 +-
  python/sglang/srt/managers/scheduler.py       |   9 +
  .../srt/mem_cache/kv_cache_configurator.py    |  19 +-
- 6 files changed, 1736 insertions(+), 5 deletions(-)
+ 6 files changed, 1746 insertions(+), 5 deletions(-)
  create mode 100644 python/sglang/srt/layers/moe/kt_kv_hot_lend.py
  create mode 100644 python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
  create mode 100644 python/sglang/srt/layers/moe/kt_prefill_plan.py
 
 diff --git a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
 new file mode 100644
-index 00000000..8a7aa149
+index 0000000000..8a7aa14962
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
 @@ -0,0 +1,550 @@
@@ -592,7 +592,7 @@ index 00000000..8a7aa149
 +    STATE["spare_held"] = 0
 diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 new file mode 100644
-index 00000000..9846efd0
+index 0000000000..ea5ba22626
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 @@ -0,0 +1,914 @@
@@ -1098,9 +1098,9 @@ index 00000000..9846efd0
 +    if env:
 +        return max(1, int(env))
 +    try:
-+        from sglang.srt.server_args import get_global_server_args
++        from sglang.srt.runtime_context import get_server_args
 +
-+        return 1 if get_global_server_args().disable_overlap_schedule else 2
++        return 1 if get_server_args().disable_overlap_schedule else 2
 +    except Exception:
 +        return 2
 +
@@ -1512,10 +1512,10 @@ index 00000000..9846efd0
 +            setattr(a, k, fn)
 diff --git a/python/sglang/srt/layers/moe/kt_prefill_plan.py b/python/sglang/srt/layers/moe/kt_prefill_plan.py
 new file mode 100644
-index 00000000..3bec7ca6
+index 0000000000..305d292e92
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_prefill_plan.py
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,248 @@
 +"""The prefill chunk planned per request (KT_PREFILL_PLAN=1, with the prefill lend
 +and, for the room of the free KV pages, KT_PREFILL_KV_LEND=1).
 +
@@ -1625,11 +1625,9 @@ index 00000000..3bec7ca6
 +
 +
 +def _remaining(req):
-+    """(tokens to prefill, tokens already in the cache) for the request; lengths only:
-+    prefix_indices is a tensor (its truth value is an error)."""
++    """(tokens to prefill, tokens already in the cache) for the request."""
 +    total = len(getattr(req, "origin_input_ids", None) or []) + len(getattr(req, "output_ids", None) or [])
-+    pre = getattr(req, "prefix_indices", None)
-+    done = 0 if pre is None else len(pre)
++    done = int(getattr(req, "prefix_len", 0) or 0)
 +    return max(0, total - done), done
 +
 +
@@ -1645,8 +1643,20 @@ index 00000000..3bec7ca6
 +    if delta is None and DELTA:
 +        # before this launch's first window: the step an earlier launch measured
 +        delta = DELTA
-+    mine = torch.cuda.mem_get_info()[0] + delta if delta is not None else -1
-+    if mine >= 0:
++    if kt_lend.STATE.get("phase") == "prefill":
++        # a request taken while the window is still open (long prompts back to back,
++        # no decode between): the device is already in the window's state, so decode
++        # free + step reads low by torch's cached blocks of the last chunk (35K then
++        # 131K: 5,575 MiB planned against 7,390 at the window's start). What the next
++        # chunks have is the device's free memory now plus those blocks; not the
++        # window's start, which misses what the window has kept since (the stream's
++        # buffers grown to a larger chunk: 131K planned at 13,312 rows ran out)
++        mine = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
++    elif delta is not None:
++        mine = torch.cuda.mem_get_info()[0] + delta
++    else:
++        mine = -1
++    if mine >= 0 and kt_lend.STATE.get("phase") != "prefill":
 +        # the hot lend's share of the driver's free memory comes back at the window's
 +        # start (sglang-kt-kv-hot-spare-plan.py)
 +        from sglang.srt.layers.moe import kt_kv_hot_lend
@@ -1681,9 +1691,9 @@ index 00000000..3bec7ca6
 +        # (the same read-only match the scheduling policy makes; the adder
 +        # matches again when it takes the request)
 +        try:
-+            from sglang.srt.managers.schedule_policy import match_prefix_for_req
++            from sglang.srt.mem_cache.common import match_kv_cache
 +
-+            match_prefix_for_req(scheduler.tree_cache, req)
++            match_kv_cache(req, scheduler.tree_cache)
 +        except Exception:
 +            pass
 +    rem, done = _remaining(req)
@@ -1755,10 +1765,10 @@ index 00000000..3bec7ca6
 +              + f", cap {chunk})", flush=True)
 +    return c
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index 5894208e..a5763981 100755
+index 8ef50abfd7..9e52886df5 100755
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -3699,11 +3699,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -4031,11 +4031,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                          if req.extend_batch_idx < 2:
                              continue
                          else:
@@ -1778,21 +1788,21 @@ index 5894208e..a5763981 100755
                      else:
                          self._evict_swa(req, pre_len)
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 43860865..c87d34d1 100644
+index 71d331d8c4..05ffe00840 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -3089,6 +3089,10 @@ class Scheduler(
-     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
-         if not self._set_or_validate_priority(req):
-             return
-+        # the prompt length for the prefill's loan of free KV pages (sglang-kt-kv-vmm.py)
+@@ -3420,6 +3420,10 @@ class Scheduler(
+             req.storage_prefetch_retry_attempts = 0
+             req.storage_prefetch_last_match_len = None
+             req.staged_prefetch_plan = None
++        # the prompt length for the prefill's loan of free KV pages
 +        from sglang.srt.layers.moe import kt_kv_prefill_lend
 +
 +        kt_kv_prefill_lend.note_request(req.rid, len(req.origin_input_ids))
          if self.disaggregation_mode == DisaggregationMode.NULL:
              if self._abort_on_queued_limit(req):
-                 return
-@@ -3680,6 +3684,11 @@ class Scheduler(
+                 self._release_aborted_request(req)
+@@ -4084,6 +4088,11 @@ class Scheduler(
              dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
              if dynamic_size is not None:
                  chunked_prefill_size = dynamic_size
@@ -1805,10 +1815,10 @@ index 43860865..c87d34d1 100644
          # Prefill policy
          # Get BLOCK_M from the backend for tile-budget admission logic
 diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
-index bc6f3f2a..3db5bdc8 100644
+index 67fe450dc7..8d4d026179 100644
 --- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
 +++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
-@@ -324,7 +324,11 @@ class KVCacheConfigurator:
+@@ -448,7 +448,11 @@ class KVCacheConfigurator:
              )
              config = self.memory_pool_config
          else:
@@ -1821,7 +1831,7 @@ index bc6f3f2a..3db5bdc8 100644
  
          sizes = self._derive_pool_sizes(config=config)
  
-@@ -333,6 +337,10 @@ class KVCacheConfigurator:
+@@ -457,6 +461,10 @@ class KVCacheConfigurator:
              req_to_token_pool=self.req_to_token_pool,
              token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
          )
@@ -1830,9 +1840,9 @@ index bc6f3f2a..3db5bdc8 100644
 +
 +            kt_kv_prefill_lend.swa_init(pools.token_to_kv_pool_allocator, pools.token_to_kv_pool)
  
-         logger.info(
-             f"Memory pool end. "
-@@ -403,6 +411,15 @@ class KVCacheConfigurator:
+         swa_max_total_num_tokens = sizes.swa_max_total_num_tokens
+         alloc = pools.token_to_kv_pool_allocator
+@@ -539,6 +547,15 @@ class KVCacheConfigurator:
          if is_deepseek_v4(self.model_config.hf_config):
              c4_state_dtype, c128_state_dtype = _get_dsv4_compress_state_dtypes()
  

@@ -1,4 +1,4 @@
-From b2e79aa1ed178685b192eab413a56c178feb8922 Mon Sep 17 00:00:00 2001
+From f1152bc8be03bfa88a9d58a31fc916bfe037313c Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] [tier 2] pool-swa-guard: fail at startup when the SWA pool
@@ -22,10 +22,10 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  1 file changed, 17 insertions(+)
 
 diff --git a/python/sglang/srt/model_executor/pool_configurator.py b/python/sglang/srt/model_executor/pool_configurator.py
-index 95803724..c6684a37 100644
+index c993fef11b..ec6358fc9a 100644
 --- a/python/sglang/srt/model_executor/pool_configurator.py
 +++ b/python/sglang/srt/model_executor/pool_configurator.py
-@@ -1152,6 +1152,23 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
+@@ -1431,6 +1431,23 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                  f"request_cap+headroom={self.swa_cap_tokens}, "
                  f"prefix_tails={self.swa_prefix_tails}"
              )

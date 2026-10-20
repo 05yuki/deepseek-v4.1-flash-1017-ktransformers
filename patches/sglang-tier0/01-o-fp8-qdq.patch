@@ -1,4 +1,4 @@
-From 0ed2082ef584b395a6f767ec869dc4dbcdfe10a3 Mon Sep 17 00:00:00 2001
+From de8c33ea933e9de502cff498be3d9118402bb257 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:32 +0900
 Subject: [PATCH] [tier 0] deepseek-v4: FP8 quantize-dequantize of the
@@ -27,7 +27,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 
 diff --git a/python/sglang/srt/models/deepseek_common/o_fp8_qdq.py b/python/sglang/srt/models/deepseek_common/o_fp8_qdq.py
 new file mode 100644
-index 00000000..3a062ae8
+index 0000000000..3a062ae805
 --- /dev/null
 +++ b/python/sglang/srt/models/deepseek_common/o_fp8_qdq.py
 @@ -0,0 +1,100 @@
@@ -132,11 +132,11 @@ index 00000000..3a062ae8
 +    v = (f / s).clamp(-448.0, 448.0)
 +    return (v.to(torch.float8_e4m3fn).float() * s).to(x.dtype).reshape(shape)
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 228af858..8d4f076d 100644
+index bdb56a1bc1..0d3f8ffcc5 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -453,6 +453,17 @@ if _is_hip:
-             _wo_a_fp8_mxscale_fused_invrope = apply_wo_a_fp8_mxscale_fused_invrope
+@@ -455,6 +455,17 @@ def _fused_wo_a_arch_supported() -> bool:
+     return _is_cuda and torch.cuda.get_device_capability()[0] == 10
  
  
 +def _o_fp8_qdq_block() -> int:
@@ -151,11 +151,11 @@ index 228af858..8d4f076d 100644
 +
 +
  def _apply_wo_a_bf16_matmul(
-     o: torch.Tensor, wo_a: torch.Tensor, is_decode: bool
- ) -> torch.Tensor:
-@@ -2061,6 +2072,10 @@ class MQALayer(MqaAttentionBase):
+     o: torch.Tensor,
+     wo_a: torch.Tensor,
+@@ -2825,6 +2836,10 @@ class MQALayer(MqaAttentionBase):
+                     recipe=recipe,
                  )
-                 o = output
              else:
 +                if _O_FP8_QDQ_BLOCK:
 +                    from sglang.srt.models.deepseek_common.o_fp8_qdq import o_fp8_qdq_
@@ -163,12 +163,12 @@ index 228af858..8d4f076d 100644
 +                    o = o_fp8_qdq_(o, _O_FP8_QDQ_BLOCK)
                  wo_a_weight = getattr(self.wo_a, "weight", None)
                  if wo_a_weight is not None:
-                     wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
+                     if (
 diff --git a/python/sglang/srt/models/deepseek_v4_dspark.py b/python/sglang/srt/models/deepseek_v4_dspark.py
-index ad8d59e3..1e6c0236 100644
+index b1c0248806..2d55d07916 100644
 --- a/python/sglang/srt/models/deepseek_v4_dspark.py
 +++ b/python/sglang/srt/models/deepseek_v4_dspark.py
-@@ -351,6 +351,14 @@ class DSparkAttention(MqaAttentionBase):
+@@ -368,6 +368,14 @@ class DSparkAttention(MqaAttentionBase):
              self.n_local_groups,
              o.shape[1] * o.shape[2] // self.n_local_groups,
          )
@@ -182,4 +182,4 @@ index ad8d59e3..1e6c0236 100644
 +            o = o_fp8_qdq_(o, _qdq)
          wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
          if self._use_fast_kernel:
-             o = torch.einsum("bgd,grd->bgr", o, wo_a)
+             o = _apply_wo_a_bf16_matmul(

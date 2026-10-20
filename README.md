@@ -10,9 +10,9 @@ to 1M tokens.
 
 This repository is everything needed: patches against two public upstream commits, a
 setup script that builds them, a launcher that reads the machine it runs on, and tests.
-It is a snapshot against those commits as of October 2026 (SGLang `1aa0e962`,
-KTransformers `95009ea`, torch 2.13 with CUDA 13 wheels, CUDA toolkit 13.1); later upstream
-versions are not tracked.
+It is a snapshot against those commits as of October 2026 (SGLang main at `ed0b8f43`,
+KTransformers `95009ea`, torch 2.14.1 with CUDA 13 wheels, FlashInfer 0.7.2, CUDA toolkit
+13.1); later upstream versions are not tracked.
 
 ```
 hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir /models/dsv41-1017
@@ -29,6 +29,27 @@ time. To serve other machines, set `SGLANG_HOST=0.0.0.0` and `SGLANG_API_KEY=<ke
 DeepSeek-V4.1-Flash release: point `MODEL` at it.
 
 ## What it needs
+
+RAM and VRAM play different parts here. RAM holds every routed expert and has to be
+large enough: nothing in this setup makes the experts smaller, and with too little RAM
+the server does not start. VRAM is different. Only the dense layers and the KV pool
+have to fit on the GPUs; the rest of the GPU memory is working room, measured at
+launch, and each use of it shrinks when there is less:
+
+- the prefill chunk is calibrated on the first launch to the memory that is left, so a
+  smaller card runs smaller chunks. Every chunk streams the experts to the GPU again,
+  so the prefill takes longer;
+- during a long prefill, the memory of the GPU-resident weights and the KV pool's free
+  pages is lent to it, and given back before decode;
+- in decode, extra hot experts go into the KV pool's free pages and the driver's idle
+  memory, as many as fit (`KT_KV_HOT_SPARE_FLOOR_MB` keeps a margin free); with less
+  room fewer are kept, and decode is slower;
+- the resident experts per layer (`KT_GPU_EXPERTS`, 5) can go down to 0.
+
+The KV pool itself is never made smaller to gain speed: the lends take only its free
+pages. On these 16 GB cards, with no resident experts, the weights take 7.9 GB a card
+and 4.6 GB is still free after the 1M-token KV pool. A shorter context
+(`SGLANG_CONTEXT_LENGTH`) makes the pool smaller. Smaller cards were not tested.
 
 - **RAM: a 512 GB class machine.** The server uses about 420 GiB, most of it the MXFP4
   CPU experts on 2 MB pages. 384 GB does not fit.
@@ -51,7 +72,7 @@ DeepSeek-V4.1-Flash release: point `MODEL` at it.
     inference, so a 1 TB NVMe drive is the practical choice.
 - **Software.** Linux, bash 4.4 or newer, the CUDA toolkit (built and run with 13.1), git,
   gcc/g++, the libnuma and hwloc headers (`libnuma-dev libhwloc-dev`), and `uv` or Python 3.12.
-  The Python packages are pinned in `requirements.txt` (torch 2.13 + cu130).
+  The Python packages are pinned in `requirements.txt` (torch 2.14.1 + cu130).
 - **Host settings.** Set these as root, persistently:
   - `echo advise > /sys/kernel/mm/transparent_hugepage/shmem_enabled`. The expert
     arenas want 2 MB pages; on 4 KB pages, pinning them takes most of an hour.
@@ -61,14 +82,13 @@ DeepSeek-V4.1-Flash release: point `MODEL` at it.
 
 ## What setup.sh does
 
-1. Clones sgl-project/sglang at `1aa0e962` (from its former `dsv4.1` branch, also tagged
-   `dsv41-1aa0e962` in 05yuki/sglang-upstream) and applies the SGLang patches up to `TIER`
-   (default 3), each tier on top of the ones below it:
+1. Clones sgl-project/sglang at `ed0b8f43` on its main branch and applies the SGLang patches
+   up to `TIER` (default 3), each tier on top of the ones below it:
 
    | `TIER` | patch | what it adds |
    |---|---|---|
-   | 0 | `sglang-tier0/` (nine patches, one concern each) | what 1017 needs to run correctly on the KTransformers hybrid MoE: the FP8 step below, the SwiGLU clamp passed to the CPU experts, the expert mask kt-kernel takes, `-1` ids kept out of the Marlin MoE, a configurable load barrier, the chat encoding of the current reference (tool namespaces, the `drop_thinking` turn boundary, the reasoning-effort budgets), and the SM12x sparse attention fixes (RTX 50, RTX PRO Blackwell, DGX Spark; the code runs on nothing else) |
-   | 1 | `sglang-tier1-long-prompts.patch` | the indexer's memory on long prompts |
+   | 0 | `sglang-tier0/` (eight patches, one concern each) | what 1017 needs to run correctly on the KTransformers hybrid MoE: the FP8 step below, the SwiGLU clamp passed to the CPU experts, the expert mask kt-kernel takes, `-1` ids kept out of the Marlin MoE, zero GPU experts, a configurable load barrier, the tool namespaces of the current reference's chat encoding, and the V4.1 indexer on its torch path on SM12x (RTX 50, RTX PRO Blackwell, DGX Spark), which has no DeepGEMM build |
+   | 1 | none | empty: SGLang main scores the indexer in row chunks itself; the number is kept so `TIER` means the same as before |
    | 2 | `sglang-tier2/` (one patch per feature, [docs/tier2.md](docs/tier2.md); `SGLANG_FEATURES` picks some) | streamed prefill, the lends, hot experts and placement, the KV pool on remappable memory, the GPU MoE and FP8 kernels (the streamed prefill needs SM89 or newer) |
    | 3 | `sglang-tier3-no-p2p.patch` | all-reduce through pinned host memory, for two GPUs without peer access |
 
@@ -99,31 +119,41 @@ cores, and sets tensor parallelism, the CPU pools and the CUDA arch from them. T
 defaults are listed in the script. Each one can be overridden by the environment
 variable named next to it. Among them:
 
-- the prefill experts streamed to the GPU, in bf16
-- a "hot lend": more hot experts a layer kept on the GPU in decode, in the KV pool's free
-  pages and the driver's idle memory, without taking any of the pool
-  (`KT_KV_HOT_LEND`, `KT_KV_HOT_SPARE_FLOOR_MB`)
-- `wo_a` kept in the checkpoint's FP8 instead of a bf16 copy (`SGLANG_DSV4_WO_A_FP8_NATIVE`)
-- the vision tower in host memory, on the GPU only while images are encoded
-  (`SGLANG_DSV4_VISION_ON_DEMAND`)
-- the GPU experts (resident and hot) in the checkpoint's MXFP4 layout through Triton
-  kernels that round once, at the weighted sum (`SGLANG_MXFP4_MOE_FP32`; `0` runs them
-  through Marlin)
+- the tier-2 features that were applied, each with its switch and default in
+  [docs/tier2.md](docs/tier2.md): the prefill experts streamed to the GPU, the hot lend
+  (more hot experts in decode, in memory nothing else is using), `wo_a` in FP8, the vision
+  tower in host memory and the rest
 - a prefill chunk calibrated once, on the first launch of a setup (the server starts
   one extra time for this)
 - FlashInfer autotune off, so outputs reproduce across launches
+- V4.1's tool-call and reasoning parsers (below)
 
 Logs go to `logs/<model>/<timestamp>/`. `serve.sh --background` returns once the
 server process is started.
 
 The first launch in a new environment compiles SGLang's and FlashInfer's kernels. Here
 that took about 15 minutes, before the one-time chunk calibration. Later launches
-reuse the cache (`~/.cache/sglang-dsv41-1017`) and are ready in about 4 minutes, with
+reuse the cache (`.cache/` in the checkout) and are ready in about 3 minutes, with
 the checkpoint on NVMe and loaded once before.
 
-What each patch changes, feature by feature, with its switch: [docs/patches.md](docs/patches.md).
+What each patch changes: [docs/patches.md](docs/patches.md) (tiers 0 and 3, kt-kernel) and
+[docs/tier2.md](docs/tier2.md) (tier 2, one section a feature, with its switch and measured effect).
 What made it this fast, measured change by change, and what was tried and dropped:
 [docs/optimizations.md](docs/optimizations.md).
+
+## Tool calls and thinking
+
+`serve.sh` starts the server with V4.1's tool-call parser and reasoning parser
+(`--tool-call-parser deepseekv41 --reasoning-parser deepseek-v41`), so the OpenAI API returns
+a tool call in `message.tool_calls` and the model's thinking in `reasoning_content`, streamed
+or not. `SGLANG_TOOL_CALL_PARSER=` or `SGLANG_REASONING_PARSER=` (empty) leaves one out.
+
+- Thinking is off unless a request turns it on:
+  `"chat_template_kwargs": {"thinking": true}`.
+- A tool may carry a `namespace` (tier 0): the prompt shows `namespace::name`, and the call
+  comes back with the bare name in `function.name` and the namespace in `namespace`.
+- `tools/tool-call-check.py [URL]` checks a running server: a call, the same call streamed,
+  the answer after the tool's result, a namespaced tool, and a call with thinking on.
 
 ## The 1017 change: o in FP8 before `wo_a`
 
@@ -145,7 +175,7 @@ The earlier release did not have this step; 1017's weights were made with it.
   checkpoint's own `inference/model.py`. The step therefore turns on for 1017 (block
   32) and stays off for the earlier release.
 - `patches/sglang-dsv4-o-fp8-qdq.py` installs the same step in another SGLang tree on
-  its own. It applies to `dsv4.1` at `1aa0e962` unmodified.
+  its own. It applies to SGLang main at `ed0b8f43` unmodified.
 
 It works the same at any tensor-parallel size. Its 32-value blocks lie inside a head
 (512 values), so splitting heads across GPUs never cuts a block.
@@ -167,11 +197,11 @@ one request at a time), measured with `tools/bench.py`:
 
 | | |
 |---|---|
-| decode, Japanese prose | 45 tok/s |
-| prefill, 35,000-token prompt | 636 tok/s |
-| prefill, 131,072-token prompt | 647 tok/s |
-| prefill, 524,288-token prompt | 611 tok/s |
-| prefill, 1,000,000-token prompt | 504 tok/s (33 minutes) |
+| decode, Japanese prose | 43.5 tok/s |
+| prefill, 35,000-token prompt | 780 tok/s |
+| prefill, 131,072-token prompt | 764 tok/s |
+| prefill, 524,288-token prompt | 659 tok/s |
+| prefill, 1,000,000-token prompt | 558 tok/s (30 minutes) |
 
 Longer prompts run in smaller chunks: the prompt's own KV and the attention's working
 memory grow with its length, leaving less GPU memory for a chunk, and every chunk streams
@@ -180,10 +210,10 @@ experts than real text, so these figures are lower than with text.
 
 ## Fixes from dsv41-flash-dual-epyc
 
-Two fixes by f-wunderlich, from the earlier release's repo, are in the patches: SM120
-attention no longer reads an uninitialized padding page (#3, tier 0), and
-`--kt-num-gpu-experts 0` starts with Marlin (#2, tier 0 for the MoE call and tier 2's `loading`
-for the loader).
+Two fixes by f-wunderlich, from the earlier release's repo: `--kt-num-gpu-experts 0` starts
+with Marlin (#2, tier 0 for the MoE call and tier 2's `loading` for the loader). The SM120
+padding-page fix (#3) is no longer carried: SGLang main's sparse attention with FlashInfer
+0.7.2 runs a 48K-token prefill without it, with the same NLL.
 
 ## Not done
 

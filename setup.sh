@@ -12,7 +12,7 @@
 # TIER picks how much of this repository's SGLang changes go in, each tier on top of the ones
 # below it (docs/patches.md):
 #   0  run DeepSeek-V4.1-Flash-1017 correctly on the hybrid MoE, on any GPU; KTransformers as pinned
-#   1  + the indexer's memory on long prompts
+#   1  (empty: this SGLang scores the indexer in row chunks itself; kept so the numbers stay)
 #   2  + speed and memory: streamed prefill, lends, hot experts, the CPU kernels
 #   3  + all-reduce through host memory, for two GPUs without peer access (default)
 # Changing TIER re-applies the patches and rebuilds kt-kernel.
@@ -29,8 +29,7 @@
 set -Eeuo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$here"
-SGLANG_COMMIT=1aa0e962b206102b7c439a4a0c4981cfec6e87bc
-SGLANG_TAG=dsv41-1aa0e962  # the same commit, tagged in 05yuki/sglang-upstream
+SGLANG_COMMIT=ed0b8f433f887995b1ce361b15aaf9f6ca93483f
 KT_COMMIT=95009ea6856c0799e517e93cb12be5e8494bc7ce
 TIER="${TIER:-3}"
 [[ "$TIER" =~ ^[0123]$ ]] || { echo "TIER must be 0, 1, 2 or 3" >&2; exit 2; }
@@ -38,7 +37,6 @@ SGLANG_FEATURES="${SGLANG_FEATURES:-all}"
 # the SGLang patches up to TIER, in order (paths under patches/)
 sglang_patches=()
 for f in "$here"/patches/sglang-tier0/[0-9][0-9]-*.patch; do sglang_patches+=("sglang-tier0/$(basename "$f")"); done
-(( TIER >= 1 )) && sglang_patches+=(sglang-tier1-long-prompts.patch)
 features=()
 if (( TIER >= 2 )); then
   for f in "$here"/patches/sglang-tier2/[0-9][0-9]-*.patch; do
@@ -85,10 +83,8 @@ if [[ ! -d third_party/sglang/.git ]]; then
   git clone --filter=blob:none https://github.com/sgl-project/sglang.git third_party/sglang
 fi
 if ! built_as third_party/sglang/.dsv41-1017-patched "$sglang_state"; then
-  # the dsv4.1 branch this commit came from is gone from sgl-project/sglang; the commit is
-  # still fetchable there, and tagged in a fork as a fallback
-  git -C third_party/sglang fetch --quiet origin "$SGLANG_COMMIT" 2>/dev/null \
-    || git -C third_party/sglang fetch --quiet https://github.com/05yuki/sglang-upstream.git "refs/tags/$SGLANG_TAG"
+  # a commit on sgl-project/sglang's main branch
+  git -C third_party/sglang fetch --quiet origin "$SGLANG_COMMIT"
   git -C third_party/sglang checkout --quiet --force "$SGLANG_COMMIT"
   git -C third_party/sglang clean -fdq
   for p in "${sglang_patches[@]}"; do
@@ -172,7 +168,7 @@ if (( TIER >= 2 )) && [[ " ${features[*]} " == *" stream-prefill "* ]] && comman
   fi_backend="${cap/./}"
   case "$cap" in 9.0|10.0|10.3|12.0|12.1) fi_arch="${cap}a" ;; *) fi_arch="$cap" ;; esac
   step "FlashInfer CUTLASS MoE for sm $cap (streamed prefill)"
-  FLASHINFER_WORKSPACE_BASE="${SGLANG_CACHE_DIR:-$HOME/.cache/sglang-dsv41-1017}" \
+  FLASHINFER_WORKSPACE_BASE="${SGLANG_CACHE_DIR:-$here/.cache/sglang}" \
   FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-$fi_arch}" MAX_JOBS="${MAX_JOBS:-16}" \
   PATH="$CUDA_HOME/bin:$here/.venv/bin:$PATH" \
     "$py" -c "from flashinfer.fused_moe.core import get_cutlass_fused_moe_module as g; g('$fi_backend'); print('built (or cached)')"

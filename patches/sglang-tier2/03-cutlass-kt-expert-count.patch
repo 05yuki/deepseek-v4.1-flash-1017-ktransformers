@@ -1,4 +1,4 @@
-From 57d3820bc76d4a89c25c3deeb960cd27b8ac22a7 Mon Sep 17 00:00:00 2001
+From f77b32ae60c740e4c9112e30a234254484dc1ab8 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:34 +0900
 Subject: [PATCH] [tier 2] cutlass-kt-expert-count: CUTLASS MXFP4 MoE takes its
@@ -21,12 +21,12 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  1 file changed, 6 insertions(+), 1 deletion(-)
 
 diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
-index 62c9aa9e..a453d4aa 100644
+index b8e6ff0810..b2acc510c7 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 +++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
-@@ -88,7 +88,12 @@ class Mxfp4FlashinferCutlassMoEMethod:
- 
-         self.moe_runner_config = moe_runner_config
+@@ -91,7 +91,12 @@ class Mxfp4FlashinferCutlassMoEMethod:
+         if moe_runner_config.layer is None:
+             moe_runner_config.layer = layer
  
 -        E = layer.num_local_experts
 +        # Under the kt-kernel wrapper this method holds only the GPU-resident

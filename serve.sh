@@ -236,9 +236,13 @@ export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-$cap+PTX}"
 export FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-$arch_a}"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 export PATH="$CUDA_HOME/bin:$venv/bin:$PATH"
-# compiled-kernel caches kept per environment (another venv's builds do not match)
-export SGLANG_CACHE_DIR="${SGLANG_CACHE_DIR:-$HOME/.cache/sglang-dsv41-1017}"
-export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$HOME/.cache/torch_extensions-dsv41-1017}"
+# compiled-kernel caches kept in this checkout: another checkout's torch builds
+# do not match, and two of them sharing a directory wait on each other's locks
+export SGLANG_CACHE_DIR="${SGLANG_CACHE_DIR:-$here/.cache/sglang}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$here/.cache/torch_extensions}"
+# a build killed mid-way leaves its lock, and the next server waits on it for good:
+# nothing builds before this server starts, so a lock this old is a leftover
+find "$TORCH_EXTENSIONS_DIR" -name lock -mmin +30 -delete 2>/dev/null || true
 export OMP_NUM_THREADS="$cpu_threads"
 # SGLang's NUMA bind v2 is a hard membind that can OOM the CUDA JIT while the experts
 # fill the nodes; v1 prefers the local node and can spill
@@ -246,6 +250,14 @@ export SGLANG_NUMA_BIND_V2="${SGLANG_NUMA_BIND_V2:-0}"
 # the patched tree shadows any installed sglang; the adapter's sitecustomize.py
 # installs the engram hook in every worker
 export PYTHONPATH="$source_dir:$adapter_dir${PYTHONPATH:+:$PYTHONPATH}"
+
+# tool calls and reasoning come back as structured fields of the OpenAI API (tool_calls,
+# reasoning_content) through V4.1's own detector and reasoning parser; an empty
+# SGLANG_TOOL_CALL_PARSER= or SGLANG_REASONING_PARSER= leaves one out
+tool_parser="${SGLANG_TOOL_CALL_PARSER-deepseekv41}"
+reasoning_parser="${SGLANG_REASONING_PARSER-deepseek-v41}"
+[[ -n "$tool_parser" ]] && extra_args+=(--tool-call-parser "$tool_parser")
+[[ -n "$reasoning_parser" ]] && extra_args+=(--reasoning-parser "$reasoning_parser")
 
 # SGLANG_HOST=0.0.0.0 serves other machines too; then set SGLANG_API_KEY, which every
 # request must send as "Authorization: Bearer <key>"
