@@ -1,4 +1,4 @@
-From bf5f542c9abe5e851afa2ced8f101a0124ad0049 Mon Sep 17 00:00:00 2001
+From 0d148e1a2b6b4b6d1627ae46c984e57a2b959d09 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 1] kv-lend-plan: lend the KV pool's free pages to
@@ -1770,10 +1770,10 @@ index 0000000000..a2b878d9f2
 +              + f", cap {chunk})", flush=True)
 +    return c
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index 8ef50abfd7..9e52886df5 100755
+index c798104d6c..8cfc26ce01 100644
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -4031,11 +4031,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -4111,11 +4111,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                          if req.extend_batch_idx < 2:
                              continue
                          else:
@@ -1793,10 +1793,10 @@ index 8ef50abfd7..9e52886df5 100755
                      else:
                          self._evict_swa(req, pre_len)
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 71d331d8c4..05ffe00840 100644
+index 3375e8508a..4bc1318e37 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -3420,6 +3420,10 @@ class Scheduler(
+@@ -3421,6 +3421,10 @@ class Scheduler(
              req.storage_prefetch_retry_attempts = 0
              req.storage_prefetch_last_match_len = None
              req.staged_prefetch_plan = None
@@ -1807,7 +1807,7 @@ index 71d331d8c4..05ffe00840 100644
          if self.disaggregation_mode == DisaggregationMode.NULL:
              if self._abort_on_queued_limit(req):
                  self._release_aborted_request(req)
-@@ -4084,6 +4088,11 @@ class Scheduler(
+@@ -4085,6 +4089,11 @@ class Scheduler(
              dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
              if dynamic_size is not None:
                  chunked_prefill_size = dynamic_size
@@ -1820,7 +1820,7 @@ index 71d331d8c4..05ffe00840 100644
          # Prefill policy
          # Get BLOCK_M from the backend for tile-budget admission logic
 diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
-index 67fe450dc7..8d4d026179 100644
+index 660941cbc6..f526e570d7 100644
 --- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
 +++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
 @@ -448,7 +448,11 @@ class KVCacheConfigurator:

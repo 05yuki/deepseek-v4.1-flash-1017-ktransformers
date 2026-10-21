@@ -261,6 +261,13 @@ kt_prefill_plan_setup() {
       [[ "${pf_delta:-0}" != 0 ]] && export KT_PREFILL_PLAN_DELTA_MB="$pf_delta"
     fi
   fi
+  # measured a row but not fitted yet (a new setup's first launches): the model's prior,
+  # whose sequence term keeps a long prompt's chunks small (a row-only cost planned 13,312
+  # rows at 1M and the indexer's scores ran out of memory, 10-21)
+  if [[ "${KT_PREFILL_PLAN_ROW_KB:-0}" != 0 && -z "${KT_PREFILL_PLAN_COST:-}" && -n "${KT_PREFILL_PLAN_COST_PRIOR:-}" ]]; then
+    export KT_PREFILL_PLAN_COST="$KT_PREFILL_PLAN_COST_PRIOR"
+    echo "prefill plan: cost not fitted yet for this setup; the prior $KT_PREFILL_PLAN_COST until it is" >&2
+  fi
   if [[ "${KT_PREFILL_PLAN_ROW_KB:-0}" == 0 && -z "${KT_PREFILL_PLAN_COST:-}" ]]; then
     export KT_PREFILL_PLAN=0
     echo "prefill plan: no measurement of this setup yet, off for this launch (chunk $KT_LEND_CHUNK)" >&2

@@ -10,7 +10,7 @@ to 1M tokens.
 
 This repository is everything needed: patches against two public upstream commits, a
 setup script that builds them, a launcher that reads the machine it runs on, and tests.
-It is a snapshot against those commits as of October 2026 (SGLang main at `ed0b8f43`,
+It is a snapshot against those commits as of October 2026 (SGLang main at `da7e3f1c`,
 KTransformers `95009ea`, torch 2.14.1 with CUDA 13 wheels, FlashInfer 0.7.2, CUDA toolkit
 13.1); later upstream versions are not tracked.
 
@@ -81,7 +81,7 @@ pages. If the server runs out of memory at launch, a shorter context
 
 ## What setup.sh does
 
-1. Clones sgl-project/sglang at `ed0b8f43` on its main branch and applies the SGLang patches
+1. Clones sgl-project/sglang at `da7e3f1c` on its main branch and applies the SGLang patches
    up to `TIER` (default 2), each tier on top of the ones below it:
 
    | `TIER` | patch | what it adds |
@@ -173,7 +173,7 @@ The earlier release did not have this step; 1017's weights were made with it.
   checkpoint's own `inference/model.py`. The step therefore turns on for 1017 (block
   32) and stays off for the earlier release.
 - `patches/sglang-dsv4-o-fp8-qdq.py` installs the same step in another SGLang tree on
-  its own. It applies to SGLang main at `ed0b8f43` unmodified.
+  its own. It applies to SGLang main at `da7e3f1c` unmodified.
 
 It works the same at any tensor-parallel size. Its 32-value blocks lie inside a head
 (512 values), so splitting heads across GPUs never cuts a block.
@@ -191,19 +191,19 @@ None of it needs a server change:
 
 2 × AMD EPYC 7452 (Zen 2, AVX2), 512 GB DDR4, 2 × RTX 5070 Ti 16 GB, the checkpoint on
 NVMe; built from this repository and run with the `serve.sh` defaults (1M-token context,
-one request at a time), measured with `tools/bench.py` at tag `2026-10-21` (b5ad85e).
+one request at a time), measured with `tools/bench.py` at tag `2026-10-21-1904`, every row from one launch.
 
 Decode, 1,024 tokens a reply (`--other-text` for the rows below the first):
 
 | text | tok/s |
 |---|---|
-| Japanese prose (median of four prompts) | 44.3 |
-| Chinese prose | 39.4 |
-| English prose | 35.8 |
-| math | 36.8 |
-| JSON | 34.7 |
-| English technical prose | 33.7 |
-| Python code | 33.7 |
+| Japanese prose (median of four prompts) | 45.1 |
+| Chinese prose | 39.3 |
+| English prose | 37.0 |
+| math | 37.6 |
+| JSON | 35.7 |
+| English technical prose | 34.1 |
+| Python code | 33.8 |
 
 One expert a layer always stays on the GPU, and as many more as the free GPU memory holds
 sit in the KV pool's free pages and the driver's idle memory (14-15 a layer here). All of
@@ -218,10 +218,10 @@ Prefill, one prompt of random token ids:
 
 | prompt (tokens) | tok/s | time |
 |---|---|---|
-| 35,000 | 753 | 46 s |
-| 131,072 | 776 | 2.8 min |
-| 524,288 | 659 | 13 min |
-| 1,000,000 | 558 | 30 min |
+| 35,000 | 758 | 46 s |
+| 131,072 | 757 | 2.9 min |
+| 524,288 | 686 | 13 min |
+| 1,000,000 | 579 | 29 min |
 
 Longer prompts run in smaller chunks: the prompt's own KV and the attention's working
 memory grow with its length, leaving less GPU memory for a chunk, and every chunk streams

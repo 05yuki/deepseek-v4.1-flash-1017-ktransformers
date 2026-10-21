@@ -1,4 +1,4 @@
-From dfe7696d57cc2ccd7fb79eb46e00f59b7f1c8f59 Mon Sep 17 00:00:00 2001
+From 22548dc0a2e6a862a71ec9009b6c017bfca1d623 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 1] prefill-lend: lend the GPU-resident weights' memory
@@ -1677,10 +1677,10 @@ index 0000000000..776077ca55
 +        _bounce["n"] = nbytes
 +    return _bounce["buf"][:nbytes]
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 30d0506c1b..71d331d8c4 100644
+index ddec8b8686..3375e8508a 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -6076,6 +6076,11 @@ class Scheduler(
+@@ -6077,6 +6077,11 @@ class Scheduler(
  
  
  def dispatch_event_loop(scheduler: Scheduler):
@@ -1693,10 +1693,10 @@ index 30d0506c1b..71d331d8c4 100644
          return role_switch.run_event_loop_supervisor(
              scheduler,
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 5e4a7c1db0..53b2cf9065 100644
+index 261b9db8c4..b3e7ffa007 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -1848,6 +1848,11 @@ class ModelRunner:
+@@ -1857,6 +1857,11 @@ class ModelRunner:
                  forward_batch,
              ) as recorder_outputs,
          ):
@@ -1709,13 +1709,13 @@ index 5e4a7c1db0..53b2cf9065 100644
                  forward_batch,
                  pp_proxy_tensors,
 diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
-index 6d3a4183e3..b289839d75 100644
+index fdb3187567..62a35dd360 100644
 --- a/python/sglang/srt/model_loader/loader.py
 +++ b/python/sglang/srt/model_loader/loader.py
-@@ -307,6 +307,10 @@ def _initialize_model(
- 
-     model = model_class(**kwargs)
-     check_stage_producers(model)
+@@ -305,6 +305,10 @@ def _initialize_model(
+         model = model_class(**kwargs)
+         check_stage_producers(model)
+     model.shared_experts_config = shared_experts
 +    # before any weight loads: the prefill lend binds the model's layers
 +    from sglang.srt.layers.moe import kt_lend
 +
@@ -1723,7 +1723,7 @@ index 6d3a4183e3..b289839d75 100644
      return model
  
  
-@@ -1085,6 +1089,14 @@ class DefaultModelLoader(BaseModelLoader):
+@@ -1083,6 +1087,14 @@ class DefaultModelLoader(BaseModelLoader):
              # parameters onto device for processing and back off after.
              with device_loading_context(module, target_device):
                  quant_method.process_weights_after_loading(module)
@@ -1739,23 +1739,23 @@ index 6d3a4183e3..b289839d75 100644
      @staticmethod
      def restore_weights_before_loading(model, target_device):
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index e44d0663b8..98a9821c15 100644
+index 9e3ae1df9f..b19e9d07e7 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -2748,7 +2748,11 @@ class MQALayer(MqaAttentionBase):
-                         or tuple(q_padded.shape) != want
-                         or q_padded.dtype != x.dtype
-                     ):
--                        q_padded = x.new_zeros(*want)
-+                        # a prefill window's buffer goes with the lend's scratch
-+                        from sglang.srt.layers.moe import kt_lend
+@@ -1331,7 +1331,11 @@ class MqaAttentionBase(nn.Module):
+             assert not getattr(meta, "q_pad_captured", False), (
+                 "the padded query buffer grew after a CUDA graph captured it"
+             )
+-            buf = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
++            # a prefill window's buffer goes with the lend's scratch
++            from sglang.srt.layers.moe import kt_lend
 +
-+                        with kt_lend.scratch_region():
-+                            q_padded = x.new_zeros(*want)
-                         if meta is not None:
-                             try:
-                                 meta.q_pad_buffer = q_padded
-@@ -4146,6 +4150,10 @@ class DeepseekV4Model(nn.Module):
++            with kt_lend.scratch_region():
++                buf = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
+             if meta is not None:
+                 try:
+                     meta.q_pad_buffer = buf
+@@ -4193,6 +4197,10 @@ class DeepseekV4Model(nn.Module):
              if tail is not None and i == self.late_layer_start:
                  if self.tail_writes_source_kv:
                      source = self.layers[i]
@@ -1763,14 +1763,14 @@ index e44d0663b8..98a9821c15 100644
 +
 +                    # reads the layer's weights before it runs
 +                    kt_lend.enter(source)
-                     attn_backend.write_tail_source_kv(
-                         layer=source.self_attn,
-                         x=mhc.combine(source.attn_hc, state),
+                     if _is_hip and source.hc_boundary_fused:
+                         # The previous FFN hc_post has not run yet, so run it here too.
+                         source_x = fused_boundary_attn_input(source, state)
 diff --git a/python/sglang/srt/models/deepseek_v4_replay_tail.py b/python/sglang/srt/models/deepseek_v4_replay_tail.py
-index 1327615099..59b7084c8d 100644
+index 6b79e3efce..e653ef7c69 100644
 --- a/python/sglang/srt/models/deepseek_v4_replay_tail.py
 +++ b/python/sglang/srt/models/deepseek_v4_replay_tail.py
-@@ -111,6 +111,8 @@ class DecoderReplayTail:
+@@ -150,6 +150,8 @@ class DecoderReplayTail:
  
      @classmethod
      def maybe_create(cls, model: torch.nn.Module) -> Optional[DecoderReplayTail]:
@@ -1779,7 +1779,7 @@ index 1327615099..59b7084c8d 100644
          max_rows = envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.get()
          if not (
              model.tail_writes_source_kv
-@@ -118,6 +120,9 @@ class DecoderReplayTail:
+@@ -157,6 +159,9 @@ class DecoderReplayTail:
              and max_rows > 0
              # Borrowed graph-pool storage forbids capturing mid-serving.
              and not envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.get()

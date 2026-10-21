@@ -1,4 +1,4 @@
-From 76328405a33c1b1e82093c6d83dfddaeeb9087c8 Mon Sep 17 00:00:00 2001
+From 719888efa0e010236510d8356b5f3f57b3e145c8 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:33 +0900
 Subject: [PATCH] [tier 0] deepseek-v4.1: tool namespaces in the chat encoding
@@ -180,10 +180,10 @@ index 641ccde476..bd36e3460d 100644
      @model_validator(mode="after")
      def _propagate_defer_loading(self) -> Tool:
 diff --git a/python/sglang/srt/entrypoints/openai/serving_chat.py b/python/sglang/srt/entrypoints/openai/serving_chat.py
-index ec56b6f709..497ca2ca35 100644
+index c183edab23..abc9b199ab 100644
 --- a/python/sglang/srt/entrypoints/openai/serving_chat.py
 +++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
-@@ -2679,6 +2679,8 @@ class OpenAIServingChat(OpenAIServingBase):
+@@ -2712,6 +2712,8 @@ class OpenAIServingChat(OpenAIServingBase):
                                      name=call_info.name,
                                      arguments=call_info.parameters,
                                  ),
@@ -192,7 +192,7 @@ index ec56b6f709..497ca2ca35 100644
                              )
                          )
                      if finish_reason["type"] == "stop":
-@@ -3179,6 +3181,8 @@ class OpenAIServingChat(OpenAIServingBase):
+@@ -3212,6 +3214,8 @@ class OpenAIServingChat(OpenAIServingBase):
                      name=function_name,
                      arguments=call_item.parameters,
                  ),

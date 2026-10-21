@@ -1,4 +1,4 @@
-From c7e9bdca91b4617feabef822031cd93a3d1a6b7c Mon Sep 17 00:00:00 2001
+From c1ba234b698f86c568d55598722557a709f9931b Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 22:59:06 +0900
 Subject: [PATCH] [tier 1] vision-on-demand: keep the vision tower in host
@@ -23,10 +23,10 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  1 file changed, 87 insertions(+), 11 deletions(-)
 
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 75a5300757..9618ed3c32 100644
+index c56092836d..954dd9e367 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -467,6 +467,79 @@ def _o_fp8_qdq_block() -> int:
+@@ -473,6 +473,79 @@ def _o_fp8_qdq_block() -> int:
  _O_FP8_QDQ_BLOCK = _o_fp8_qdq_block()
  
  
@@ -106,7 +106,7 @@ index 75a5300757..9618ed3c32 100644
  def _wo_a_fp8_native() -> bool:
      """SGLANG_DSV4_WO_A_FP8_NATIVE=1: wo_a stays in the checkpoint's FP8 blocks (any block
      size), read by a GEMV in single-token decode and dequantized for other forwards."""
-@@ -4708,17 +4781,19 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4800,17 +4873,19 @@ class DeepseekV4ForCausalLM(nn.Module):
  
      def _prepare_mm_embeddings(self, input_ids, forward_batch):
          # Keep scheduler hash IDs intact: the shared embedder clamps its input in place.
@@ -137,7 +137,7 @@ index 75a5300757..9618ed3c32 100644
          forward_batch.mm_input_embeds = input_embeds
          return input_embeds
  
-@@ -4934,6 +5009,7 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -5025,6 +5100,7 @@ class DeepseekV4ForCausalLM(nn.Module):
  
      def post_load_weights(self, is_nextn=False, weight_names=None):
          if not is_nextn:

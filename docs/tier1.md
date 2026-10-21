@@ -1,7 +1,7 @@
 # Tier 1, one patch per feature
 
 Tier 1 is one patch per feature in `patches/sglang-tier1/`, applied in the order of their numbers on
-SGLang main at `ed0b8f43` after tier 0; tier 2 applies on top. `setup.sh` applies all of them by
+SGLang main at `da7e3f1c` after tier 0; tier 2 applies on top. `setup.sh` applies all of them by
 default; `SGLANG_FEATURES=a,b,...` picks some (the names below), and `serve.sh` turns on only what
 was applied.
 
@@ -27,9 +27,9 @@ the code" are on as soon as the patch is applied.
 | 08 | [`08-loading.patch`](#08-loading) | +234 / -3 | none |
 | 09 | [`09-launch-timing.patch`](#09-launch-timing) | +402 / -0 | none |
 | 10 | [`10-pool-swa-guard.patch`](#10-pool-swa-guard) | +17 / -0 | none |
-| 11 | [`11-placement.patch`](#11-placement) | +68 / -0 | none |
+| 11 | [`11-placement.patch`](#11-placement) | +45 / -0 | none |
 | 12 | [`12-kv-vmm.patch`](#12-kv-vmm) | +243 / -0 | none |
-| 13 | [`13-prefill-lend.patch`](#13-prefill-lend) | +1381 / -2 | none |
+| 13 | [`13-prefill-lend.patch`](#13-prefill-lend) | +1657 / -1 | none |
 | 14 | [`14-stream-prefill.patch`](#14-stream-prefill) | +2045 / -14 | `loading`, `placement`, `prefill-lend` |
 | 15 | [`15-kv-lend-plan.patch`](#15-kv-lend-plan) | +1736 / -5 | `kv-vmm`, `prefill-lend` |
 | 16 | [`16-hot-lend.patch`](#16-hot-lend) | +664 / -32 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan` |
@@ -269,16 +269,16 @@ Files (under `python/sglang/`):
 
 ## 11 placement
 
-Expert placement in the kt-kernel wrapper. The V4 router hands the wrapper logical expert ids; with a non-identity `--init-expert-location` they are mapped to physical ids once per layer, so a hot-expert placement (`placements/`) routes to the GPU slots. `KT_ROUTING_DUMP=<prefix>` saves a per-layer histogram of the routed ids every 30 s (a captured `index_add_`, so it counts under CUDA graph replay), to build a placement from a workload.
+A routing dump to build a placement from a workload: `KT_ROUTING_DUMP=<prefix>` saves a per-layer histogram of the routed physical ids every 30 s (a captured `index_add_`, so it counts under CUDA graph replay). A non-identity `--init-expert-location` (`placements/`) needs nothing more: SGLang's TopK resolves it for every router.
 
 Switches (code / serve.sh):
 
 - `--init-expert-location (existing CLI)`: identity / a file from placements/
 - `KT_ROUTING_DUMP`: unset (off) / unset
 
-Numerics: Changes outputs under a placement (without it the wrapper ran logical ids in physical slots, i.e. the wrong experts); identical without one. The dump does not change outputs.
+Numerics: The dump does not change outputs.
 
-Effect: decode 15.9 → 18.4 tok/s alone: the 5 resident experts a layer are the hottest ones instead of experts 0 to 4.
+Effect: none on its own now; the placement it records puts the hottest experts in the resident rows and the hot lend's first slots.
 
 Prerequisites: none; applies alone on tier 0.
 
@@ -373,6 +373,7 @@ Switches (code / serve.sh):
 
 - `KT_PREFILL_KV_LEND`: 0; KT_PREFILL_KV_LEND_* / 1 (lib/kt-kv-hot-default.sh)
 - `KT_PREFILL_PLAN`: 0; KT_PREFILL_PLAN_* / 1
+- `KT_PREFILL_PLAN_COST_PRIOR`: unset / 2600,471040,280,820 (the cost until this setup's own fit; lib/kt-lend-auto.sh)
 - `KT_PREFILL_SWA_LEND`: 0; KT_PREFILL_SWA_* / 1
 
 Numerics: The lend is bit-identical. The plan picks per-request chunk sizes, so the prefill chunking (and NLL) moves against a fixed chunk. The SWA lend changes memory only.

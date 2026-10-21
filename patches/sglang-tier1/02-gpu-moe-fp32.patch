@@ -1,4 +1,4 @@
-From d51343eaeff2225ee52fab19ba4b8867df756571 Mon Sep 17 00:00:00 2001
+From 87c8a237cadab18e184c522c73a7a02dcbdda98a Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:34 +0900
 Subject: [PATCH] [tier 1] gpu-moe-fp32: GPU MXFP4 experts in the checkpoint's
@@ -30,7 +30,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  create mode 100644 python/sglang/srt/layers/moe/mxfp4_fp32_moe.py
 
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py b/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
-index 3244e7e089..239e31fb7c 100644
+index 53ca979a39..82c22812ab 100644
 --- a/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
 +++ b/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
 @@ -108,6 +108,59 @@ def get_scalar_type(
@@ -93,7 +93,7 @@ index 3244e7e089..239e31fb7c 100644
  def swiglu_limit_func(
      output: torch.Tensor,
      input: torch.Tensor,  # first half is gate, second half is up
-@@ -356,6 +409,9 @@ def fused_marlin_moe(
+@@ -358,6 +411,9 @@ def fused_marlin_moe(
              gemm1_alpha,
              clamp_limit,
          )
@@ -103,7 +103,7 @@ index 3244e7e089..239e31fb7c 100644
      elif activation == "silu" and is_gated and clamp_limit is not None:
          swiglu_limit_func(
              intermediate_cache2,
-@@ -398,7 +454,8 @@ def fused_marlin_moe(
+@@ -400,7 +456,8 @@ def fused_marlin_moe(
          topk_weights,
          moe_block_size=block_size_m,
          top_k=1,
@@ -113,7 +113,7 @@ index 3244e7e089..239e31fb7c 100644
          is_ep=expert_map is not None,
          b_q_type=scalar_type2,
          size_m=M * topk,
-@@ -414,6 +471,13 @@ def fused_marlin_moe(
+@@ -419,6 +476,13 @@ def fused_marlin_moe(
      if output is None:
          output = hidden_states if inplace else torch.empty_like(hidden_states)
  
@@ -519,7 +519,7 @@ index 0000000000..02a118ed34
 +        out.index_add_(0, tok, y * topk_weights[tok, slot].double()[:, None])
 +    return out
 diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
-index 9d0c3e0116..8a47d462c8 100644
+index 916363a0e1..1398182cac 100644
 --- a/python/sglang/srt/layers/quantization/fp8.py
 +++ b/python/sglang/srt/layers/quantization/fp8.py
 @@ -5,6 +5,7 @@
@@ -530,7 +530,7 @@ index 9d0c3e0116..8a47d462c8 100644
  from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
  
  import torch
-@@ -441,9 +442,13 @@ class Fp8Config(QuantizationConfig):
+@@ -442,9 +443,13 @@ class Fp8Config(QuantizationConfig):
  
              if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
                  from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
@@ -545,10 +545,10 @@ index 9d0c3e0116..8a47d462c8 100644
  
              if self.is_fp4_experts and get_moe_runner_backend().is_humming():
 diff --git a/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py b/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
-index b66a2f465d..2a76d1ff0b 100644
+index 43450d96dc..561b4690b8 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
 +++ b/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
-@@ -202,3 +202,35 @@ class Mxfp4MarlinMoEMethod:
+@@ -205,3 +205,35 @@ class Mxfp4MarlinMoEMethod:
          )
  
          return StandardCombineInput(hidden_states=runner_output.hidden_states)

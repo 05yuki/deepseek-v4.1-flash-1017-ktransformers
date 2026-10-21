@@ -1,31 +1,29 @@
-From 3d5fb92c17a81c86b7f87ed4e4fd8d5ff23933f4 Mon Sep 17 00:00:00 2001
+From 7361490ecfd25258590df891b282100906faa7da Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
-Subject: [PATCH] [tier 1] placement: map logical to physical expert ids for a
- placement, and a routing dump
+Subject: [PATCH] [tier 1] placement: a routing dump to build a placement from
+ a workload
 
-Expert placement in the kt-kernel wrapper. The V4 router hands the
-wrapper logical expert ids; with a non-identity `--init-expert-location`
-they are mapped to physical ids once per layer, so a hot-expert
-placement (`placements/`) routes to the GPU slots.
-`KT_ROUTING_DUMP=<prefix>` saves a per-layer histogram of the routed ids
-every 30 s (a captured `index_add_`, so it counts under CUDA graph
-replay), to build a placement from a workload.
+`KT_ROUTING_DUMP=<prefix>` saves a per-layer histogram of the routed
+physical ids every 30 s (a captured `index_add_`, so it counts under
+CUDA graph replay), to build a placement (`placements/`) from a
+workload. A non-identity `--init-expert-location` needs nothing more
+here: TopK resolves the placement for every router (sglang #44994),
+and the wrapper's own logical-to-physical remap, which made that a
+second remap and the output garbage, is gone.
 
-Numerics: Changes outputs under a placement (without it the wrapper ran
-logical ids in physical slots, i.e. the wrong experts); identical
-without one. The dump does not change outputs.
+Numerics: The dump does not change outputs.
 
 Prerequisites: none; applies alone on tier 0.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
- python/sglang/srt/layers/moe/kt_ep_wrapper.py | 68 +++++++++++++++++++
- 1 file changed, 68 insertions(+)
+ python/sglang/srt/layers/moe/kt_ep_wrapper.py | 45 +++++++++++++++++++
+ 1 file changed, 45 insertions(+)
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index c16902d1a8..5aef8bf7ac 100644
+index e48a5cf824..ee135a2f77 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -151,7 +151,36 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
@@ -65,7 +63,7 @@ index c16902d1a8..5aef8bf7ac 100644
  
  
  def _kt_swiglu_kwargs(layer: torch.nn.Module) -> dict:
-@@ -377,6 +406,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -380,6 +409,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          # attributes, not unpacking: the packed variant carries a fourth field
          topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
  
@@ -77,21 +75,13 @@ index c16902d1a8..5aef8bf7ac 100644
          # Submit forward task to CPU (non-blocking)
          self.wrapper.submit_forward(
              x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
-@@ -424,6 +458,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -427,6 +461,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
  
          x = dispatch_output.hidden_states
          topk_output = dispatch_output.topk_output
-+        # --init-expert-location moves experts between the GPU slots (physical
-+        # 0..num_gpu_experts-1) and the CPU, and both weight loaders honour it,
-+        # but the V4 router hands this wrapper *logical* ids (the topk remap in
-+        # topk.py only runs with --enable-eplb). Remap here, once per layer,
-+        # so a hot-expert placement actually routes to the GPU slots.
-+        log2phy = self._logical_to_physical(x.device)
-+        if log2phy is not None:
-+            ids = topk_output.topk_ids
-+            remapped = torch.where(ids >= 0, log2phy[ids.clamp(min=0)], ids).to(ids.dtype)
-+            topk_output = topk_output._replace(topk_ids=remapped)
-+            dispatch_output = dispatch_output._replace(topk_output=topk_output)
++        # The ids are physical: --init-expert-location moves experts between the GPU
++        # slots (physical 0..num_gpu_experts-1) and the CPU, and TopK resolves the
++        # placement for every router (resolve_routing_inputs).
 +        # KT_ROUTING_DUMP=<prefix>: a [layers, experts] histogram of the routed physical ids
 +        # (a captured index_add_, so it keeps counting under CUDA graph replay), saved as
 +        # <prefix>-rank<r>.pt every 30 s. Counted here, before the hot lend and the
@@ -103,25 +93,3 @@ index c16902d1a8..5aef8bf7ac 100644
  
          # Step 1: Submit CPU expert computation (non-blocking)
          if self.tp_rank == 0:
-@@ -469,6 +522,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
- 
-         return StandardCombineInput(hidden_states=output)
- 
-+    def _logical_to_physical(self, device):
-+        cached = self.__dict__.get("_log2phy_cache", "unset")
-+        if cached != "unset":
-+            return cached
-+        from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-+
-+        meta = get_global_expert_location_metadata()
-+        table = None
-+        if meta is not None:
-+            m = meta.logical_to_all_physical_map[self.kt_config.layer_idx, :, 0].to(device)
-+            if not torch.equal(m.cpu(), torch.arange(m.numel(), dtype=m.dtype)):
-+                table = m.to(torch.int64)
-+        self.__dict__["_log2phy_cache"] = table
-+        return table
-+
-     def __getattr__(self, name: str):
-         """Delegate attribute access to the wrapped GPU method.
- 

@@ -226,6 +226,9 @@ if [[ "$KT_PREFILL_LEND" == 1 ]]; then
   lend_max_chunk="${DSV41_LEND_MAX_CHUNK:-6144}"
   export KT_PREFILL_LEND_MAX_CHUNK="$lend_max_chunk"
   export KT_PREFILL_LEND_PROBE_CONTEXT="${KT_PREFILL_LEND_PROBE_CONTEXT:-$max_total_tokens}"
+  # the prefill plan's cost before this setup's own fit (FIXED MiB, a row B, a sequence token
+  # B, CARRY MiB): V4.1-1017's measured on two 16 GB cards, rounded up
+  export KT_PREFILL_PLAN_COST_PRIOR="${KT_PREFILL_PLAN_COST_PRIOR:-2600,471040,280,820}"
   source "$here/lib/kt-lend-auto.sh"
   export KT_PREFILL_LEND_KV_CAP="${KT_PREFILL_LEND_KV_CAP:-$max_total_tokens}"
   # the first launch of a setup calibrates the chunk once (one more server start)

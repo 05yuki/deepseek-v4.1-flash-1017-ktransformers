@@ -1,4 +1,4 @@
-From de8c33ea933e9de502cff498be3d9118402bb257 Mon Sep 17 00:00:00 2001
+From fc3cdc1866aa87399493f126c09932712a0f974e Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:32 +0900
 Subject: [PATCH] [tier 0] deepseek-v4: FP8 quantize-dequantize of the
@@ -132,10 +132,10 @@ index 0000000000..3a062ae805
 +    v = (f / s).clamp(-448.0, 448.0)
 +    return (v.to(torch.float8_e4m3fn).float() * s).to(x.dtype).reshape(shape)
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index bdb56a1bc1..0d3f8ffcc5 100644
+index c558c512e7..b7ae299f85 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -455,6 +455,17 @@ def _fused_wo_a_arch_supported() -> bool:
+@@ -461,6 +461,17 @@ def _fused_wo_a_arch_supported() -> bool:
      return _is_cuda and torch.cuda.get_device_capability()[0] == 10
  
  
@@ -153,7 +153,7 @@ index bdb56a1bc1..0d3f8ffcc5 100644
  def _apply_wo_a_bf16_matmul(
      o: torch.Tensor,
      wo_a: torch.Tensor,
-@@ -2825,6 +2836,10 @@ class MQALayer(MqaAttentionBase):
+@@ -2865,6 +2876,10 @@ class MQALayer(MqaAttentionBase):
                      recipe=recipe,
                  )
              else:
@@ -165,7 +165,7 @@ index bdb56a1bc1..0d3f8ffcc5 100644
                  if wo_a_weight is not None:
                      if (
 diff --git a/python/sglang/srt/models/deepseek_v4_dspark.py b/python/sglang/srt/models/deepseek_v4_dspark.py
-index b1c0248806..2d55d07916 100644
+index bcebe99303..ba6f32d49c 100644
 --- a/python/sglang/srt/models/deepseek_v4_dspark.py
 +++ b/python/sglang/srt/models/deepseek_v4_dspark.py
 @@ -368,6 +368,14 @@ class DSparkAttention(MqaAttentionBase):

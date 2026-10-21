@@ -1,4 +1,4 @@
-From e343d66fdc9742046dabaf7ee9ae409657b16004 Mon Sep 17 00:00:00 2001
+From 8760c63b6ce8d063674f91673b15892840b35344 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 1] hot-lend: more hot experts in the KV pool's free
@@ -57,10 +57,10 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  3 files changed, 664 insertions(+), 32 deletions(-)
 
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-index a2d9fb1292..3baac7f676 100644
+index e8629f0895..4897247be7 100644
 --- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 +++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-@@ -1105,6 +1105,13 @@ class FusedMoE(torch.nn.Module):
+@@ -1154,6 +1154,13 @@ class FusedMoE(torch.nn.Module):
          ):
              if self.quant_method.num_gpu_experts != -1:
                  if expert_id >= self.quant_method.num_gpu_experts:
@@ -75,7 +75,7 @@ index a2d9fb1292..3baac7f676 100644
  
          self._weight_loader_impl(
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index a088c8c0e0..3a302f0cda 100644
+index c4dd1167e5..bcc8f41425 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -308,6 +308,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
@@ -114,7 +114,7 @@ index a088c8c0e0..3a302f0cda 100644
          # Last layer loaded on this rank: optionally build the streamer and
          # pin every layer's arenas now (KT_GPU_STREAM_EARLY_INIT).
          num_layers = getattr(self.kt_config, "num_layers", None)
-@@ -497,6 +510,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -492,6 +505,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          # experts are streamed to the GPU in groups instead of computed here
          # (kt_stream_prefill.py). The ids are taken before the mask below
          # mutates them in place.
@@ -125,7 +125,7 @@ index a088c8c0e0..3a302f0cda 100644
          streamer = stream_prefill_for(self, layer, x.shape[0])
          cpu_share = False
          if streamer is not None:
-@@ -510,9 +527,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -505,9 +522,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                  # Everything below the cutoff is streamed or resident: send it
                  # to GPU expert 0 at weight 0, which kt-kernel skips.
                  theirs = physical_ids < cutoff
@@ -138,7 +138,7 @@ index a088c8c0e0..3a302f0cda 100644
                          topk_weights=torch.where(
                              theirs, torch.zeros_like(topk_output.topk_weights), topk_output.topk_weights
                          ),
-@@ -521,15 +540,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -516,15 +535,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                  self.submit(layer, cpu_do)
                  cpu_share = True
  
@@ -163,7 +163,7 @@ index a088c8c0e0..3a302f0cda 100644
  
          # Create modified dispatch output for GPU computation
          if _gpu_mask_zero:
-@@ -565,6 +591,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -560,6 +586,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                  hot_reference_check(self, layer, x, physical_ids, topk_output.topk_weights, output, streamer)
          else:
              output = torch.zeros_like(x)
@@ -172,14 +172,14 @@ index a088c8c0e0..3a302f0cda 100644
  
          # Step 4: Synchronize CPU results and merge with GPU results
          if streamer is not None:
-@@ -575,6 +603,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -570,6 +598,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
              cpu_output = self.sync(x)
              output = output + cpu_output
  
 +        kt_kv_hot_lend.check(self, layer, dispatch_output, hot, output)
          return StandardCombineInput(hidden_states=output)
  
-     def _logical_to_physical(self, device):
+     def __getattr__(self, name: str):
 diff --git a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
 index 8a7aa14962..2adc994967 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
