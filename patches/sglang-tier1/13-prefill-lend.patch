@@ -1,4 +1,4 @@
-From 22548dc0a2e6a862a71ec9009b6c017bfca1d623 Mon Sep 17 00:00:00 2001
+From b95b2cb2699e9ec9e172d9de0c64d2a382114ab8 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 1] prefill-lend: lend the GPU-resident weights' memory
@@ -25,14 +25,14 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
  python/sglang/srt/layers/moe/kt_lend.py       | 1333 +++++++++++++++++
- python/sglang/srt/layers/moe/kt_lend_probe.py |  156 ++
+ python/sglang/srt/layers/moe/kt_lend_probe.py |  157 ++
  python/sglang/srt/layers/moe/kt_pinned.py     |  132 ++
  python/sglang/srt/managers/scheduler.py       |    5 +
  .../sglang/srt/model_executor/model_runner.py |    5 +
  python/sglang/srt/model_loader/loader.py      |   12 +
  python/sglang/srt/models/deepseek_v4.py       |   10 +-
  .../srt/models/deepseek_v4_replay_tail.py     |    5 +
- 8 files changed, 1657 insertions(+), 1 deletion(-)
+ 8 files changed, 1658 insertions(+), 1 deletion(-)
  create mode 100644 python/sglang/srt/layers/moe/kt_lend.py
  create mode 100644 python/sglang/srt/layers/moe/kt_lend_probe.py
  create mode 100644 python/sglang/srt/layers/moe/kt_pinned.py
@@ -1378,10 +1378,10 @@ index 0000000000..316bcc765b
 +        _point_back(i)
 diff --git a/python/sglang/srt/layers/moe/kt_lend_probe.py b/python/sglang/srt/layers/moe/kt_lend_probe.py
 new file mode 100644
-index 0000000000..1f02f2eddb
+index 0000000000..ed9fdea18a
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_lend_probe.py
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,157 @@
 +"""Prefill-lend probe: what a chunk costs at a long prefix, without the prefill.
 +
 +KT_PREFILL_LEND_PROBE="<chunks>@<prefixes>", e.g. "2048,6144@0,131072,524288,991232":
@@ -1460,7 +1460,8 @@ index 0000000000..1f02f2eddb
 +            )
 +            continue
 +        for C in chunks:
-+            P = P_point
++            # a point at a short prefix still runs STEPS chunks: from 0, not one alone
++            P = max(P_point, (STEPS - 1) * C // page * page) if can_tail else P_point
 +            t0 = time.perf_counter()
 +            # the window ends at P after STEPS chunks, as a real chunked prefill's
 +            # last chunks do: one forward alone misses what the growing

@@ -17,21 +17,21 @@ the code" are on as soon as the patch is applied.
 
 | # | patch | lines (+/-) | prerequisites |
 |---|---|---|---|
-| 01 | [`01-fp8-decode.patch`](#01-fp8-decode) | +241 / -1 | none |
+| 01 | [`01-fp8-decode.patch`](#01-fp8-decode) | +222 / -1 | none |
 | 02 | [`02-gpu-moe-fp32.patch`](#02-gpu-moe-fp32) | +487 / -1 | none |
 | 03 | [`03-cutlass-kt-expert-count.patch`](#03-cutlass-kt-expert-count) | +6 / -1 | none |
-| 04 | [`04-engram-row-prefetch.patch`](#04-engram-row-prefetch) | +47 / -0 | none |
-| 05 | [`05-wo-a-fp8.patch`](#05-wo-a-fp8) | +222 / -2 | none |
-| 06 | [`06-vision-on-demand.patch`](#06-vision-on-demand) | +90 / -12 | `wo-a-fp8` |
+| 04 | [`04-engram-row-prefetch.patch`](#04-engram-row-prefetch) | +56 / -6 | none |
+| 05 | [`05-wo-a-fp8.patch`](#05-wo-a-fp8) | +174 / -2 | none |
+| 06 | [`06-vision-on-demand.patch`](#06-vision-on-demand) | +87 / -11 | `wo-a-fp8` |
 | 07 | [`07-thinking-default-parser.patch`](#07-thinking-default-parser) | +6 / -4 | none |
-| 08 | [`08-loading.patch`](#08-loading) | +234 / -3 | none |
+| 08 | [`08-loading.patch`](#08-loading) | +250 / -2 | none |
 | 09 | [`09-launch-timing.patch`](#09-launch-timing) | +402 / -0 | none |
 | 10 | [`10-pool-swa-guard.patch`](#10-pool-swa-guard) | +17 / -0 | none |
 | 11 | [`11-placement.patch`](#11-placement) | +45 / -0 | none |
 | 12 | [`12-kv-vmm.patch`](#12-kv-vmm) | +243 / -0 | none |
-| 13 | [`13-prefill-lend.patch`](#13-prefill-lend) | +1657 / -1 | none |
+| 13 | [`13-prefill-lend.patch`](#13-prefill-lend) | +1658 / -1 | none |
 | 14 | [`14-stream-prefill.patch`](#14-stream-prefill) | +2045 / -14 | `loading`, `placement`, `prefill-lend` |
-| 15 | [`15-kv-lend-plan.patch`](#15-kv-lend-plan) | +1736 / -5 | `kv-vmm`, `prefill-lend` |
+| 15 | [`15-kv-lend-plan.patch`](#15-kv-lend-plan) | +1751 / -5 | `kv-vmm`, `prefill-lend` |
 | 16 | [`16-hot-lend.patch`](#16-hot-lend) | +664 / -32 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan` |
 
 ## Effect of each patch
@@ -307,7 +307,7 @@ Files (under `python/sglang/`):
 
 ## 13 prefill-lend
 
-`KT_PREFILL_LEND=1`: during a streamed prefill the GPU-resident weights give their memory to the prefill's scratch and come back layer by layer, at the same addresses, just before each layer runs (`kt_lend.py`, hooked into the loader and the model runner's forward). `KT_PREFILL_LEND_PROBE` measures how large a chunk fits before serving (`kt_lend_probe.py`, used by `lib/kt-lend-auto.sh`). `KT_FAST_PINNED=1` pins the lend's host buffers as huge-page memory registered with `cudaHostRegister` instead of `cudaHostAlloc` (`kt_pinned.py`). DeepSeek V4's padded query buffer is allocated in the prefill's scratch. V4's hc mixing weights stay resident, packed in one buffer (`KT_PREFILL_LEND_RESIDENT`, `hc_`): SGLang main's layer boundary reads the next layer's before that layer runs. The tail source KV write, which reads its layer's weights before the layer runs, enters the layer first, and the decoder replay tail's CUDA graphs are not used while the lend is on (they would keep the addresses of their capture). The lend calls into the streamed prefill, the KV lend and the hot lend only when those patches are applied and on.
+`KT_PREFILL_LEND=1`: during a streamed prefill the GPU-resident weights give their memory to the prefill's scratch and come back layer by layer, at the same addresses, just before each layer runs (`kt_lend.py`, hooked into the loader and the model runner's forward). `KT_PREFILL_LEND_PROBE=<chunks>@<prefixes>` measures how large a chunk fits before serving: for each chunk size, four chunks ending at each prefix, from prefix 0 when the prefix is shorter (`kt_lend_probe.py`, used by `lib/kt-lend-auto.sh`). `KT_FAST_PINNED=1` pins the lend's host buffers as huge-page memory registered with `cudaHostRegister` instead of `cudaHostAlloc` (`kt_pinned.py`). DeepSeek V4's padded query buffer is allocated in the prefill's scratch. V4's hc mixing weights stay resident, packed in one buffer (`KT_PREFILL_LEND_RESIDENT`, `hc_`): SGLang main's layer boundary reads the next layer's before that layer runs. The tail source KV write, which reads its layer's weights before the layer runs, enters the layer first, and the decoder replay tail's CUDA graphs are not used while the lend is on (they would keep the addresses of their capture). The lend calls into the streamed prefill, the KV lend and the hot lend only when those patches are applied and on.
 
 Switches (code / serve.sh):
 
@@ -378,7 +378,7 @@ Switches (code / serve.sh):
 
 Numerics: The lend is bit-identical. The plan picks per-request chunk sizes, so the prefill chunking (and NLL) moves against a fixed chunk. The SWA lend changes memory only.
 
-Effect: the 35K prompt on the streamed-prefill set goes 56.8 → 43.9 s (first) and 38.8 → 24.5 s (second), 4 chunks of 9,216 rows each time: each chunk streams the CPU experts to the GPU once, so fewer chunks take less time. The stream's buffers the first prompt grew (1.4 GB) stay mapped, and the plan counts them as free for the next prompt, whose chunks reuse them. Decode does not change (15.9 alone). The plan learns its cost a row from the setup's earlier launches, so this row and the next are measured after the setup has launched before.
+Effect: the 35K prompt on the streamed-prefill set goes 56.8 → 43.9 s (first) and 38.8 → 24.5 s (second), 4 chunks of 9,216 rows each time: each chunk streams the CPU experts to the GPU once, so fewer chunks take less time. The stream's buffers the first prompt grew (1.4 GB) stay mapped, and the plan counts them as free for the next prompt, whose chunks reuse them. Decode does not change (15.9 alone). These rows were measured with a cost learned from the setup's earlier launches. The plan's cost (a fixed part, a row, a sequence token, what a chunk leaves for the next) is now fitted on the setup's first launch, from the calibration probe's two chunk sizes at prefix 0, half the context and its end (lib/kt-prefill-plan-constants.py); until a fit is accepted the plan uses the prior. On two 16 GB cards the fit plans a 524K-token prompt in 22,528-row chunks and a 1M one in 19,456 (the prior: 11,264 and 10,240), and those prefills are 4.2-4.7% and 5.3% faster (fit and prior launches alternated, at the same inlet temperature).
 
 Prerequisites: `kv-vmm`, `prefill-lend`.
 

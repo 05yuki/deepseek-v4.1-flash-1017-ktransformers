@@ -77,17 +77,19 @@ _kt_lend_auto_core() {
   [[ -n "${KT_PREFILL_LEND_MAX_CHUNK:-}" ]] && (( cal_chunk > KT_PREFILL_LEND_MAX_CHUNK )) && \
     cal_chunk="$KT_PREFILL_LEND_MAX_CHUNK"
   # KT_PREFILL_LEND_PROBE_CONTEXT=<tokens> (a tree with sglang-kt-lend-probe.py):
-  # the calibration server measures the chunk with the lend probe at prefix 0,
-  # half the context and the context's end before it serves, instead of a
-  # ~50K-token prompt: what the chunk costs at the longest prompt the server
-  # will take, in a few minutes
+  # the calibration server measures the chunk and half of it with the lend probe at
+  # prefix 0, half the context and the context's end before it serves, instead of a
+  # ~50K-token prompt: what a chunk costs at the longest prompt the server will
+  # take, in a few minutes
   local probe=""
   if [[ -n "${KT_PREFILL_LEND_PROBE_CONTEXT:-}" ]]; then
     probe="@0,$(( KT_PREFILL_LEND_PROBE_CONTEXT / 2 )),$(( KT_PREFILL_LEND_PROBE_CONTEXT - 8 * cal_chunk ))"
   fi
   while (( cal_chunk >= 2048 )); do
     echo "no chunk hint for this setup yet: calibration launch at chunk $cal_chunk (${vram_mb} MiB cards; $cal_log)" >&2
-    [[ -n "$probe" ]] && probe="@${probe#*@}" && probe="$cal_chunk$probe"
+    # two chunk sizes at every prefix: the plan's cost (a fixed part, a row, a sequence
+    # token, the carry) separates on this first launch, not after a setup's long prompts
+    [[ -n "$probe" ]] && probe="@${probe#*@}" && probe="$(( cal_chunk / 2 )),$cal_chunk$probe"
     env KT_PREFILL_LEND_CALIBRATING=1 "$chunk_var=$cal_chunk" ${probe:+KT_PREFILL_LEND_PROBE="$probe"} \
       bash "$launcher" --background >>"$cal_log" 2>&1 || {
       echo "calibration launch failed to start; see $cal_log" >&2; return 5; }

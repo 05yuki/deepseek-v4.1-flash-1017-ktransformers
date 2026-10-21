@@ -43,6 +43,7 @@ patch goes and the pin moves past it.
 | `06-load-timeout` | [#45184](https://github.com/sgl-project/sglang/pull/45184) |
 | `07-chat-encoding` | not sent |
 | `08-sm12x-indexer` | not sent |
+| `09-indexer-score-in-place` | not sent |
 
 ### KTransformers wrapper
 
@@ -75,6 +76,16 @@ the README.
 - The sparse attention fixes this tier carried on the earlier base (the extra KV source
   page-split, lanes past `topk_length` masked, the padding page zeroed) are not needed with
   FlashInfer 0.7.2: a 48K-token prefill runs without them, with the same NLL.
+
+### Torch indexer scores in place
+
+`layers/attention/dsv4/dsv41_sparse.py`, `layers/attention/dsv4/v41_indexer/scoring.py`; the
+torch indexer only.
+
+The indexer scores a prefill chunk in pieces of a bf16 `[rows, 64 heads, keys]` product of
+at most 1 GiB. Its ReLU and head weights now run on that product in place: out of place they
+made about 3 GiB of transients, the largest allocation of a prefill on a small card. The
+output is bit-identical.
 
 ### Chat encoding
 

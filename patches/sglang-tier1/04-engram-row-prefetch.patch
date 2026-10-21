@@ -1,4 +1,4 @@
-From 7ba5a1f478c562c0088c0f280e10a9ab2598b6f0 Mon Sep 17 00:00:00 2001
+From e715d21a9501a2bb82bc7d6e6a65bf02f8a27015 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] [tier 1] engram-row-prefetch: start decode's engram row

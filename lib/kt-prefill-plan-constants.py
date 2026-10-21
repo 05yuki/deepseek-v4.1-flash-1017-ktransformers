@@ -24,8 +24,11 @@ or nothing when the setup has no measurement yet.
   CARRY is what a later chunk of the same window holds from the earlier ones
   (~250 MiB measured).
   Used only with 24 forwards or more over rows that at least double, a per-row
-  cost within 0.7-1.5 x the lend's measured allocated bytes a row, and a
-  sequence term under a quarter of the row term; else "-" (the per-row model).
+  cost at most 1.5 x the lend's measured allocated bytes a row (a smaller slope is
+  kept: the allocated bytes a row carry the fixed part), and a sequence term under
+  a quarter of the row term unless the windows reach half the KV pool (the
+  calibration probe measures there, so the term is not extrapolated); else "-"
+  (the per-row model).
 - The free memory is the fallback for the plan's first window only (the plan
   reads it live afterwards): the smallest recorded, less the chunk-sized scratch
   the cap adds over the chunk it was measured at.
@@ -122,9 +125,10 @@ if len(fws) >= 8 and len({w["rows"] for w in fws}) >= 2 and len({w["seq"] for w 
             why = f"{len(fws)} forwards"
         elif rows_seen[-1] < 2 * rows_seen[0]:
             why = f"rows only {rows_seen[0]}-{rows_seen[-1]}"
-        elif alloc_kb and not 0.7 * alloc_kb * 1024 / 1.10 <= b[1] <= 1.5 * alloc_kb * 1024:
+        elif alloc_kb and b[1] > 1.5 * alloc_kb * 1024:
             why = f"{b[1] / 1024:.0f} KiB a row against {alloc_kb / 1.10:.0f} measured"
-        elif b[2] * max(w["seq"] for w in fws) > 0.25 * b[1] * rows_seen[-1]:
+        elif (max(w["seq"] for w in fws) < 0.5 * max(r.get("full_tokens", 0) for r in recs)
+              and b[2] * max(w["seq"] for w in fws) > 0.25 * b[1] * rows_seen[-1]):
             why = f"sequence term {b[2]:.0f} B a token too large"
         if why is None:
             cost = f"{b[0] / 2**20:.0f},{b[1]:.0f},{b[2]:.0f},{b[3] / 2**20:.0f}"

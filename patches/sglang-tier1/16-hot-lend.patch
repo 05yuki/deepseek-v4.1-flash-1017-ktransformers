@@ -1,4 +1,4 @@
-From 8760c63b6ce8d063674f91673b15892840b35344 Mon Sep 17 00:00:00 2001
+From 396fcca8cc18bf0dfa685f7d36b16b7256ac3ac7 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 1] hot-lend: more hot experts in the KV pool's free

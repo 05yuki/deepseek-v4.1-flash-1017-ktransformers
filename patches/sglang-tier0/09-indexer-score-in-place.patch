@@ -1,0 +1,46 @@
+From 67d6188b1c3670fb212c55a30134e4cdbd582608 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Wed, 21 Oct 2026 22:34:00 +0900
+Subject: [PATCH] [tier 0] deepseek-v4.1: score the torch indexer chunk in
+ place
+
+The torch prefill indexer scores a request in chunks of rows whose bf16
+[rows, heads, lc] product is capped at 1 GiB. relu() and the multiply by the
+head weights each made a new tensor of that size, so a chunk briefly held
+about 3 GiB. On 12 GB cards that transient is what ran out of memory on an
+11.8K-token prompt. relu_() and mul_() work on the product itself; the
+output is bit-identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py      | 5 +++--
+ .../sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py  | 2 +-
+ 2 files changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py b/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py
+index 6b08bd9dbd..a98d98c974 100644
+--- a/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py
++++ b/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py
+@@ -287,5 +287,6 @@ class DeepseekV41Indexer(nn.Module):
+     ) -> torch.Tensor:
+         """q [t, H, d], k [n, d], weights [t, H] -> [t, n], summed over all heads."""
+         s = torch.einsum("bhd,nd->bhn", q, k)
+-        s = (s.relu() * weights.unsqueeze(-1)).sum(dim=1)
+-        return s.float()
++        # In place: the [t, H, n] product is the largest prefill transient on small cards.
++        s.relu_().mul_(weights.unsqueeze(-1))
++        return s.sum(dim=1).float()
+diff --git a/python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py b/python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py
+index 9b65fc25c3..a63360d318 100644
+--- a/python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py
++++ b/python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py
+@@ -280,7 +280,7 @@ def dense_prefill_topk(
+ # ---------- torch ----------
+ 
+ 
+-# Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
++# Arbitrary cap on one bf16 [rows, heads, lc] score chunk; scores() works on it in place.
+ _TORCH_SCORE_BUDGET_BYTES = 1 << 30
+ 
+ 
