@@ -121,8 +121,8 @@ variable named next to it. Among them:
   [docs/tier1.md](docs/tier1.md): the prefill experts streamed to the GPU, the hot lend
   (more hot experts in decode, in memory nothing else is using), `wo_a` in FP8, the vision
   tower in host memory and the rest
-- a prefill chunk and the prefill plan's cost calibrated once, on the first launch of a
-  setup (the server starts one extra time for this)
+- a prefill chunk calibrated once, on the first launch of a setup (the server starts
+  one extra time for this)
 - FlashInfer autotune off, so outputs reproduce across launches
 - V4.1's tool-call and reasoning parsers (below)
 
