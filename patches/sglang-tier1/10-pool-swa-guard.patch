@@ -1,7 +1,7 @@
-From f1152bc8be03bfa88a9d58a31fc916bfe037313c Mon Sep 17 00:00:00 2001
+From c1a8f8e7d9cbd2963a688a5e71d83b9d00ccbeaa Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
-Subject: [PATCH] [tier 2] pool-swa-guard: fail at startup when the SWA pool
+Subject: [PATCH] [tier 1] pool-swa-guard: fail at startup when the SWA pool
  cannot hold a prefill chunk
 
 A startup check in the pool configurator for DeepSeek V4: an SWA pool
@@ -13,7 +13,7 @@ that re-queues the request forever with the GPU idle.
 Numerics: No switch. No effect on outputs; a setup that used to hang now
 fails at startup.
 
-Prerequisites: none; applies alone on tier 1.
+Prerequisites: none; applies alone on tier 0.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g

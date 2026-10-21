@@ -1,7 +1,7 @@
-From 2182af20bafa74c4890d3dc0b54f06f9a7318970 Mon Sep 17 00:00:00 2001
+From ccf2777acf8859a85ef95952f8ef1050d9c77019 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 22:58:32 +0900
-Subject: [PATCH] [tier 2] wo-a-fp8: keep wo_a in the checkpoint's FP8, read by
+Subject: [PATCH] [tier 1] wo-a-fp8: keep wo_a in the checkpoint's FP8, read by
  a GEMV in decode
 
 DeepSeek V4 attention's `wo_a` in FP8

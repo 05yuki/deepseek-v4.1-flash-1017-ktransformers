@@ -1,5 +1,5 @@
 # Sourced by a launcher under KT_PREFILL_LEND=1 (sglang/srt/layers/moe/kt_lend.py in the
-# tier-2 prefill-lend patch): picks the prefill chunk from what the server measured,
+# tier-1 prefill-lend patch): picks the prefill chunk from what the server measured,
 # calibrating once when there is nothing to go on.
 #
 #   kt_lend_auto <launcher> <chunk env var> <port> <key part>...

@@ -1,7 +1,7 @@
-From 5b498376f02fac42a415402d95ca0d94d99954e3 Mon Sep 17 00:00:00 2001
+From a0b14e25716c10a3398a43cd75e76b57b6859ea6 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:37 +0900
-Subject: [PATCH] [tier 3] distributed: all-reduce through pinned host memory
+Subject: [PATCH] [tier 2] distributed: all-reduce through pinned host memory
  for GPUs without peer access
 
 Two GPUs without peer access (consumer cards on a board without P2P):

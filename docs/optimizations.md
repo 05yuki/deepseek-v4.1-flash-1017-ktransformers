@@ -2,7 +2,7 @@
 
 What made decode, prefill and the launch as fast as they are, one mechanism at a time,
 with what it was measured to change. What each patch does and its switch:
-[patches.md](patches.md) and [tier2.md](tier2.md).
+[patches.md](patches.md) and [tier1.md](tier1.md).
 
 All of it ran on the machine in the README (2 × EPYC 7452, 2 × RTX 5070 Ti 16 GB). Much of
 it was measured on the earlier DeepSeek-V4.1-Flash release, before 1017 existed; each item
@@ -98,7 +98,7 @@ without (`--no-enable-decoder-swa-bounded-replay`).
 ## Open
 
 - Launches that should give the same output differ in the long NLL by up to 0.013 (3.1405 to
-  3.1536 over ten single-patch launches in [tier2.md](tier2.md), none with the hot lend),
+  3.1536 over ten single-patch launches in [tier1.md](tier1.md), none with the hot lend),
   while the 2-token NLL is the same in all of them. Short prefills repeat; the difference
   comes in somewhere on the longer pieces' path. The cause is not found.
 - 9 ms of a decode token is the GPU waiting for the CPU experts.

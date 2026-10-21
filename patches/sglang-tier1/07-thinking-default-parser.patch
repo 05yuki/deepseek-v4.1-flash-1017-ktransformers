@@ -1,7 +1,7 @@
-From 56af106bc59786d517684bceb36ede36a79d582e Mon Sep 17 00:00:00 2001
+From 10c15f88ff6223e963529aa9f0eff969d2fdadf6 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
-Subject: [PATCH] [tier 2] thinking-default-parser: reasoning parser falls back
+Subject: [PATCH] [tier 1] thinking-default-parser: reasoning parser falls back
  to SGLANG_DEFAULT_THINKING
 
 When a request sends no thinking toggle in `chat_template_kwargs`, the
@@ -13,7 +13,7 @@ toggle always meant no thinking for the parser.
 Numerics: No switch of its own. Identical unless
 `SGLANG_DEFAULT_THINKING=1`.
 
-Prerequisites: none; applies alone on tier 1.
+Prerequisites: none; applies alone on tier 0.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g

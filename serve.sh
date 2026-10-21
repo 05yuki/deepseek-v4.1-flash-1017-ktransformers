@@ -38,11 +38,11 @@ alias_name="${SGLANG_SERVED_NAME:-$(basename "$model")}"
 [[ -f "$adapter_dir/librow_store.so" ]] || { echo "run ./setup.sh first (engram-adapter/librow_store.so missing)" >&2; exit 3; }
 # the tier setup.sh applied (an empty marker, from before tiers, is the full tree)
 tier="$(cut -d' ' -f1 "$here/third_party/sglang/.dsv41-1017-patched" 2>/dev/null || true)"
-tier="${tier:-3}"
-# the tier-2 features setup.sh applied (one per line; without the file, all of them)
+tier="${tier:-2}"
+# the tier-1 features setup.sh applied (one per line; without the file, all of them)
 features_file="$here/third_party/sglang/.dsv41-1017-features"
 has() {
-  (( tier >= 2 )) || return 1
+  (( tier >= 1 )) || return 1
   [[ ! -f "$features_file" ]] || grep -qx "$1" "$features_file"
 }
 if [[ ! -f "$engram_dir/engram-manifest.json" ]]; then
@@ -115,6 +115,10 @@ if has hot-lend; then
   # in decode the hot lend's slots also take the driver's idle memory above a 1 GiB floor
   # (-1: only the KV pool's free pages)
   export KT_KV_HOT_SPARE_FLOOR_MB="${KT_KV_HOT_SPARE_FLOOR_MB:-1024}"
+  # the slots follow what is routed: every 8 decode steps each layer swaps experts that
+  # lose for ones that are routed more, copied from kt-kernel's expert memory (0: the
+  # placement's next-hottest experts, recorded on Japanese prose)
+  export KT_KV_HOT_DYNAMIC_SLOTS="${KT_KV_HOT_DYNAMIC_SLOTS:-1}"
 else
   export KT_KV_HOT_LEND=0
   if has kv-lend-plan; then
@@ -299,8 +303,8 @@ command=(
 printf '%s\n' "DeepSeek-V4.1-Flash on SGLang + KTransformers: $model"
 printf '%s\n' "GPUs ${CUDA_VISIBLE_DEVICES} (sm $cap), TP $tp on NUMA nodes $numa_list; CPU experts: $cpu_threads threads in $threadpools pools; GPU experts $gpu_experts a layer"
 printf '%s\n' "patch tier $tier; context $context_length; attention output FP8 before wo_a: block ${SGLANG_DSV4_O_FP8_QDQ_BLOCK:-0}"
-(( tier >= 2 )) && printf '%s\n' "tier-2 features: $( [[ -f "$features_file" ]] && tr '\n' ' ' < "$features_file" || echo all)"
-(( tier >= 2 )) && printf '%s\n' "wo_a native FP8: $SGLANG_DSV4_WO_A_FP8_NATIVE; vision tower on demand: $SGLANG_DSV4_VISION_ON_DEMAND; MXFP4 MoE fp32: $SGLANG_MXFP4_MOE_FP32; Marlin MoE fp32 glue: $SGLANG_MARLIN_MOE_FP32_GLUE; CPU scale codes: $KT_MXFP4_SCALE_CODES; hot lend spare floor: ${KT_KV_HOT_SPARE_FLOOR_MB:-off} MiB"
+(( tier >= 1 )) && printf '%s\n' "tier-1 features: $( [[ -f "$features_file" ]] && tr '\n' ' ' < "$features_file" || echo all)"
+(( tier >= 1 )) && printf '%s\n' "wo_a native FP8: $SGLANG_DSV4_WO_A_FP8_NATIVE; vision tower on demand: $SGLANG_DSV4_VISION_ON_DEMAND; MXFP4 MoE fp32: $SGLANG_MXFP4_MOE_FP32; Marlin MoE fp32 glue: $SGLANG_MARLIN_MOE_FP32_GLUE; CPU scale codes: $KT_MXFP4_SCALE_CODES; hot lend spare floor: ${KT_KV_HOT_SPARE_FLOOR_MB:-off} MiB; dynamic hot slots: ${KT_KV_HOT_DYNAMIC_SLOTS:-0}"
 printf '%s\n' "Run directory: $run_dir"
 ln -sfn "$run_dir" "$log_root/$log_name/current"
 if [[ "$mode" == "--background" ]]; then

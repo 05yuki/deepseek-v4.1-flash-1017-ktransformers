@@ -1,7 +1,7 @@
-From f77b32ae60c740e4c9112e30a234254484dc1ab8 Mon Sep 17 00:00:00 2001
+From 49c40e1677794a157b24ef57d35bf3d30ac86813 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:34 +0900
-Subject: [PATCH] [tier 2] cutlass-kt-expert-count: CUTLASS MXFP4 MoE takes its
+Subject: [PATCH] [tier 1] cutlass-kt-expert-count: CUTLASS MXFP4 MoE takes its
  expert count from the weights under kt
 
 A fix in the FlashInfer CUTLASS MXFP4 MoE method: the expert count is
@@ -12,7 +12,7 @@ method holds only the GPU-resident experts.
 Numerics: No switch. Identical without KTransformers (both counts
 agree); under KTransformers the CUTLASS MXFP4 path used to fail.
 
-Prerequisites: none; applies alone on tier 1.
+Prerequisites: none; applies alone on tier 0.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g

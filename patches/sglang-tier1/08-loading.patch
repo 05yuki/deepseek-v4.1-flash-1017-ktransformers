@@ -1,7 +1,7 @@
-From e67d1f036bb864f596c0197534e26a5ae0678053 Mon Sep 17 00:00:00 2001
+From 5d13839077125ed5d1d4ac5e7b00da372382dc0d Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
-Subject: [PATCH] [tier 2] loading: skip the CPU-only experts in the GPU
+Subject: [PATCH] [tier 1] loading: skip the CPU-only experts in the GPU
  loader, read dense shards ahead
 
 Weight loading for the hybrid MoE. The GPU side's safetensors loader
@@ -19,7 +19,7 @@ with `--kt-num-gpu-experts 0` the empty GPU weights are not repacked
 Numerics: Bit-identical: the skipped tensors are ones the loader dropped
 anyway; the rest is I/O and placement.
 
-Prerequisites: none; applies alone on tier 1.
+Prerequisites: none; applies alone on tier 0.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g

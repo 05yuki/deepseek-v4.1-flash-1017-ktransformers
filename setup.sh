@@ -1,24 +1,23 @@
 #!/usr/bin/env bash
 # Build everything serve.sh needs, inside this directory:
-#   third_party/sglang         sgl-project/sglang dsv4.1 @ 1aa0e962 + patches/sglang-tier*.patch
+#   third_party/sglang         sgl-project/sglang main @ ed0b8f43 + patches/sglang-tier*
 #   third_party/ktransformers  kvcache-ai/ktransformers @ 95009ea (+ patches/kt-kernel-tree.patch
-#                              and patches/kt-kernel-llama-cpp.patch from tier 2)
+#                              and patches/kt-kernel-llama-cpp.patch from tier 1)
 #   .venv                      Python 3.12, requirements.txt, kt-kernel built for this CPU and GPU
 #   engram-adapter/librow_store.so, build/libkv_vmm.so
 #   state/engram-<model>/engram-manifest.json   when MODEL=<checkpoint dir> is given
 #
-# usage: [MODEL=<checkpoint dir>] [TIER=0|1|2|3] [SGLANG_FEATURES=a,b,...] ./setup.sh
+# usage: [MODEL=<checkpoint dir>] [TIER=0|1|2] [SGLANG_FEATURES=a,b,...] ./setup.sh
 #
 # TIER picks how much of this repository's SGLang changes go in, each tier on top of the ones
 # below it (docs/patches.md):
 #   0  run DeepSeek-V4.1-Flash-1017 correctly on the hybrid MoE, on any GPU; KTransformers as pinned
-#   1  (empty: this SGLang scores the indexer in row chunks itself; kept so the numbers stay)
-#   2  + speed and memory: streamed prefill, lends, hot experts, the CPU kernels
-#   3  + all-reduce through host memory, for two GPUs without peer access (default)
+#   1  + speed and memory: streamed prefill, lends, hot experts, the CPU kernels
+#   2  + all-reduce through host memory, for two GPUs without peer access (default)
 # Changing TIER re-applies the patches and rebuilds kt-kernel.
-# Tier 2 is one patch per feature (patches/sglang-tier2/, docs/tier2.md). SGLANG_FEATURES picks
+# Tier 1 is one patch per feature (patches/sglang-tier1/, docs/tier1.md). SGLANG_FEATURES picks
 # some of them, comma-separated (e.g. fp8-decode,engram-row-prefetch), or none; default all. A feature's
-# prerequisites (patches/sglang-tier2/requires.txt) must be picked too.
+# prerequisites (patches/sglang-tier1/requires.txt) must be picked too.
 # Needs: git, a C/C++ compiler, the CUDA toolkit (CUDA_HOME, default /usr/local/cuda;
 # built and run here with 13.1), libnuma and hwloc headers (Debian/Ubuntu: libnuma-dev
 # libhwloc-dev), and either uv or python3.12. Re-running skips the finished steps.
@@ -31,33 +30,33 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$here"
 SGLANG_COMMIT=ed0b8f433f887995b1ce361b15aaf9f6ca93483f
 KT_COMMIT=95009ea6856c0799e517e93cb12be5e8494bc7ce
-TIER="${TIER:-3}"
-[[ "$TIER" =~ ^[0123]$ ]] || { echo "TIER must be 0, 1, 2 or 3" >&2; exit 2; }
+TIER="${TIER:-2}"
+[[ "$TIER" =~ ^[012]$ ]] || { echo "TIER must be 0, 1 or 2 (tiers 2 and 3 of before 10-21 are 1 and 2)" >&2; exit 2; }
 SGLANG_FEATURES="${SGLANG_FEATURES:-all}"
 # the SGLang patches up to TIER, in order (paths under patches/)
 sglang_patches=()
 for f in "$here"/patches/sglang-tier0/[0-9][0-9]-*.patch; do sglang_patches+=("sglang-tier0/$(basename "$f")"); done
 features=()
-if (( TIER >= 2 )); then
-  for f in "$here"/patches/sglang-tier2/[0-9][0-9]-*.patch; do
+if (( TIER >= 1 )); then
+  for f in "$here"/patches/sglang-tier1/[0-9][0-9]-*.patch; do
     slug="$(basename "$f" .patch)"; slug="${slug#[0-9][0-9]-}"
     if [[ "$SGLANG_FEATURES" == all || ",$SGLANG_FEATURES," == *",$slug,"* ]]; then
       features+=("$slug")
-      sglang_patches+=("sglang-tier2/$(basename "$f")")
+      sglang_patches+=("sglang-tier1/$(basename "$f")")
     fi
   done
   for want in ${SGLANG_FEATURES//,/ }; do
-    [[ "$want" == all || "$want" == none || " ${features[*]} " == *" $want "* ]] || { echo "no tier-2 feature named $want (patches/sglang-tier2/)" >&2; exit 2; }
+    [[ "$want" == all || "$want" == none || " ${features[*]} " == *" $want "* ]] || { echo "no tier-1 feature named $want (patches/sglang-tier1/)" >&2; exit 2; }
   done
   while IFS=: read -r feat needs; do
     [[ -z "$feat" || "$feat" == \#* ]] && continue
     [[ " ${features[*]} " == *" $feat "* ]] || continue
     for n in $needs; do
-      [[ " ${features[*]} " == *" $n "* ]] || { echo "tier-2 feature $feat needs $n (add it to SGLANG_FEATURES)" >&2; exit 2; }
+      [[ " ${features[*]} " == *" $n "* ]] || { echo "tier-1 feature $feat needs $n (add it to SGLANG_FEATURES)" >&2; exit 2; }
     done
-  done < "$here/patches/sglang-tier2/requires.txt"
+  done < "$here/patches/sglang-tier1/requires.txt"
 fi
-(( TIER >= 3 )) && sglang_patches+=(sglang-tier3-no-p2p.patch)
+(( TIER >= 2 )) && sglang_patches+=(sglang-tier2-no-p2p.patch)
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 mkdir -p third_party build state
 step() { printf '\n== %s\n' "$*"; }
@@ -67,7 +66,7 @@ built_as() { [[ -f "$1" && "$(cat "$1")" == "$2" ]]; }
 patch_hash() { (cd "$here/patches" && cat "$@") | sha256sum | cut -c1-12; }
 sglang_state="$TIER $(patch_hash "${sglang_patches[@]}")"
 kt_variant=pinned
-(( TIER >= 2 )) && kt_variant="patched $(patch_hash kt-kernel-tree.patch kt-kernel-llama-cpp.patch kt-kernel-load-prefetch.py)"
+(( TIER >= 1 )) && kt_variant="patched $(patch_hash kt-kernel-tree.patch kt-kernel-llama-cpp.patch kt-kernel-load-prefetch.py)"
 # a patch is checked against the pinned tree first; nothing is applied when it does not fit
 apply_checked() {
   local tree="$1" patch="$2"
@@ -78,7 +77,7 @@ apply_checked() {
   git -C "$tree" apply --whitespace=nowarn "$patch"
 }
 
-step "SGLang @ ${SGLANG_COMMIT:0:8}, tier $TIER${features[*]:+ (tier 2: ${features[*]})}"
+step "SGLang @ ${SGLANG_COMMIT:0:8}, tier $TIER${features[*]:+ (tier 1: ${features[*]})}"
 if [[ ! -d third_party/sglang/.git ]]; then
   git clone --filter=blob:none https://github.com/sgl-project/sglang.git third_party/sglang
 fi
@@ -163,7 +162,7 @@ fi
 # compile on the first long prompt, while the expert arenas fill the NUMA nodes, and a node-local OOM
 # kills the scheduler before the build finishes; so it is built here, once per FlashInfer version and
 # GPU arch, into the cache serve.sh uses.
-if (( TIER >= 2 )) && [[ " ${features[*]} " == *" stream-prefill "* ]] && command -v nvidia-smi >/dev/null; then
+if (( TIER >= 1 )) && [[ " ${features[*]} " == *" stream-prefill "* ]] && command -v nvidia-smi >/dev/null; then
   cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1)"
   fi_backend="${cap/./}"
   case "$cap" in 9.0|10.0|10.3|12.0|12.1) fi_arch="${cap}a" ;; *) fi_arch="$cap" ;; esac

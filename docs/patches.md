@@ -1,28 +1,24 @@
 # What the patches do
 
-`setup.sh` applies the patches up to `TIER` (default 3), each tier on top of the ones below it:
+`setup.sh` applies the patches up to `TIER` (default 2), each tier on top of the ones below it:
 
 | tier | file | applies to |
 |---|---|---|
 | 0 | `patches/sglang-tier0/NN-*.patch` | sgl-project/sglang main at `ed0b8f43`, one concern each |
-| 1 | none | empty on this SGLang (below) |
-| 2 | `patches/sglang-tier2/NN-*.patch` | the same, after tier 0: one patch per feature ([tier2.md](tier2.md)) |
-| 3 | `patches/sglang-tier3-no-p2p.patch` | the same, after tier 2 |
-| 2 | `patches/kt-kernel-tree.patch` | kvcache-ai/ktransformers `95009ea` (below tier 2 it is built as pinned) |
-| 2 | `patches/kt-kernel-llama-cpp.patch` | ktransformers' `third_party/llama.cpp` submodule |
-| 2 | `patches/kt-kernel-load-prefetch.py` | the installed kt-kernel (parallel expert loading) |
+| 1 | `patches/sglang-tier1/NN-*.patch` | the same, after tier 0: one patch per feature ([tier1.md](tier1.md)) |
+| 2 | `patches/sglang-tier2-no-p2p.patch` | the same, after tier 1 |
+| 1 | `patches/kt-kernel-tree.patch` | kvcache-ai/ktransformers `95009ea` (below tier 1 it is built as pinned) |
+| 1 | `patches/kt-kernel-llama-cpp.patch` | ktransformers' `third_party/llama.cpp` submodule |
+| 1 | `patches/kt-kernel-load-prefetch.py` | the installed kt-kernel (parallel expert loading) |
 | - | `patches/sglang-dsv4-o-fp8-qdq.py`, `patches/dsv4_o_fp8_qdq.py` | another SGLang tree, on their own (tier 0 already has them) |
 
 - **Tier 0** is what DeepSeek-V4.1-Flash-1017 needs to run correctly on the KTransformers
   hybrid MoE, on any GPU, and nothing else. KTransformers `95009ea` needs no change for it: its AVX2
   MXFP4 experts, the SwiGLU clamp and the loader are there.
-- **Tier 1** is empty: SGLang main scores the V4.1 indexer in row chunks itself, which is
-  what this tier did on the earlier base; a 48K-token prefill runs without it. The number
-  stays so `TIER` means the same as before.
-- **Tier 2** is speed and memory on any GPU this SGLang runs DeepSeek-V4 on; the streamed
+- **Tier 1** is speed and memory on any GPU this SGLang runs DeepSeek-V4 on; the streamed
   prefill computes through FlashInfer's bf16 CUTLASS MoE (SM89 or newer). It needs the
-  kt-kernel patch (shared expert memory). `serve.sh` turns its features on from tier 2.
-- **Tier 3** is what depends on the machine: two GPUs without peer access.
+  kt-kernel patch (shared expert memory). `serve.sh` turns its features on from tier 1.
+- **Tier 2** is what depends on the machine: two GPUs without peer access.
 
 The SGLang patches are the commits of branch `dsv41-1017-main` of
 [05yuki/sglang-upstream](https://github.com/05yuki/sglang-upstream/tree/dsv41-1017-main) on `ed0b8f43`, one
@@ -90,22 +86,22 @@ and the reasoning-effort budgets 50 / 75 / 100 (#39929).
 `model_executor/model_runner_components/load_model_utils.py`: the wait for the other rank's
 weight loading is set by `SGLANG_UNBALANCED_LOAD_TIMEOUT_S` (`serve.sh`: 1800 s).
 
-## SGLang tier 2
+## SGLang tier 1
 
 One patch per feature. What each does, its switches and their defaults, its numerics, and
-what it was measured to change are in [tier2.md](tier2.md), one section a patch. By what they
+what it was measured to change are in [tier1.md](tier1.md), one section a patch. By what they
 are for:
 
 | for | patches |
 |---|---|
-| decode | [`fp8-decode`](tier2.md#01-fp8-decode), [`engram-row-prefetch`](tier2.md#04-engram-row-prefetch), [`wo-a-fp8`](tier2.md#05-wo-a-fp8), [`placement`](tier2.md#11-placement), [`hot-lend`](tier2.md#16-hot-lend) |
-| long prompts | [`stream-prefill`](tier2.md#14-stream-prefill), [`prefill-lend`](tier2.md#13-prefill-lend), [`kv-vmm`](tier2.md#12-kv-vmm), [`kv-lend-plan`](tier2.md#15-kv-lend-plan) |
-| GPU memory | [`wo-a-fp8`](tier2.md#05-wo-a-fp8), [`vision-on-demand`](tier2.md#06-vision-on-demand) |
-| numerics | [`gpu-moe-fp32`](tier2.md#02-gpu-moe-fp32) |
-| startup | [`loading`](tier2.md#08-loading), [`launch-timing`](tier2.md#09-launch-timing), [`pool-swa-guard`](tier2.md#10-pool-swa-guard) |
-| fixes | [`cutlass-kt-expert-count`](tier2.md#03-cutlass-kt-expert-count), [`thinking-default-parser`](tier2.md#07-thinking-default-parser) |
+| decode | [`fp8-decode`](tier1.md#01-fp8-decode), [`engram-row-prefetch`](tier1.md#04-engram-row-prefetch), [`wo-a-fp8`](tier1.md#05-wo-a-fp8), [`placement`](tier1.md#11-placement), [`hot-lend`](tier1.md#16-hot-lend) |
+| long prompts | [`stream-prefill`](tier1.md#14-stream-prefill), [`prefill-lend`](tier1.md#13-prefill-lend), [`kv-vmm`](tier1.md#12-kv-vmm), [`kv-lend-plan`](tier1.md#15-kv-lend-plan) |
+| GPU memory | [`wo-a-fp8`](tier1.md#05-wo-a-fp8), [`vision-on-demand`](tier1.md#06-vision-on-demand) |
+| numerics | [`gpu-moe-fp32`](tier1.md#02-gpu-moe-fp32) |
+| startup | [`loading`](tier1.md#08-loading), [`launch-timing`](tier1.md#09-launch-timing), [`pool-swa-guard`](tier1.md#10-pool-swa-guard) |
+| fixes | [`cutlass-kt-expert-count`](tier1.md#03-cutlass-kt-expert-count), [`thinking-default-parser`](tier1.md#07-thinking-default-parser) |
 
-## SGLang tier 3
+## SGLang tier 2
 
 `distributed/device_communicators/ll_allreduce.py`,
 `distributed/device_communicators/host_staged_allreduce.py`, `distributed/parallel_state.py`
@@ -116,7 +112,7 @@ the copy engines (`SGLANG_HOST_STAGED_ALLREDUCE`). `serve.sh` turns both on for 
 
 ## kt-kernel tree patch
 
-Tier 2.
+Tier 1.
 
 - **MXFP4 experts on AVX2** (`operators/avx2/mxfp4-moe.hpp`, `moe_base.hpp`): the CPU expert
   kernels for this model. Activations are reordered once per expert to match the weight

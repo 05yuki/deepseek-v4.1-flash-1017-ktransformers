@@ -1,7 +1,7 @@
-From 5a7fbb65cc57feacb89f7f055c264ac0c60ea958 Mon Sep 17 00:00:00 2001
+From 3d5fb92c17a81c86b7f87ed4e4fd8d5ff23933f4 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
-Subject: [PATCH] [tier 2] placement: map logical to physical expert ids for a
+Subject: [PATCH] [tier 1] placement: map logical to physical expert ids for a
  placement, and a routing dump
 
 Expert placement in the kt-kernel wrapper. The V4 router hands the
@@ -16,7 +16,7 @@ Numerics: Changes outputs under a placement (without it the wrapper ran
 logical ids in physical slots, i.e. the wrong experts); identical
 without one. The dump does not change outputs.
 
-Prerequisites: none; applies alone on tier 1.
+Prerequisites: none; applies alone on tier 0.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g

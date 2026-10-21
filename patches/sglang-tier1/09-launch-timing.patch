@@ -1,7 +1,7 @@
-From aef52a5040ae8b695a5c0b1967c1a2e01e4c4ab0 Mon Sep 17 00:00:00 2001
+From 833df73bfc7f13e7f1f941f9e065945549c936ad Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
-Subject: [PATCH] [tier 2] launch-timing: KT_LAUNCH_TIMING, a timeline of the
+Subject: [PATCH] [tier 1] launch-timing: KT_LAUNCH_TIMING, a timeline of the
  weight load
 
 `KT_LAUNCH_TIMING=1` prints a per-step timeline of the weight load on
@@ -13,7 +13,7 @@ that are not applied are skipped.
 
 Numerics: No effect on outputs.
 
-Prerequisites: none; applies alone on tier 1.
+Prerequisites: none; applies alone on tier 0.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g

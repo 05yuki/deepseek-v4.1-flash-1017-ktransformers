@@ -1,0 +1,517 @@
+From dece787dceff3c6472abd40df77cf46e8979f5d7 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 19 Oct 2026 16:44:36 +0900
+Subject: [PATCH] [tier 1] hot-lend: more hot experts in the KV pool's free
+ pages outside prefill
+
+`KT_KV_HOT_LEND=1`: outside prefill the KV pool's free pages hold up to
+`KT_KV_HOT_EXTRA` more experts a layer on the GPU on a shadow layer;
+their routes go to the GPU and to the CPU at weight 0. The experts
+leave whenever the pool needs the pages or a prefill starts.
+`KT_KV_HOT_SPARE_FLOOR_MB` lets the slots also use idle driver memory
+above the floor. Every rank holds the same slots (the CPU runs on rank
+0 with its routing).
+
+`KT_KV_HOT_DYNAMIC_SLOTS=1`: the slots follow what is routed. Route
+counts every routed expert on the device; every 8 decode forwards,
+outside the graph, each layer swaps held experts for better-scored ones
+(decayed counts, half-life 256 forwards): out of the slot table at
+once, copied in on a side stream from kt-kernel's zero-copy expert
+arenas, into the table on the next round. Without it the slots hold the
+placement's next-hottest experts, which a placement recorded on one kind
+of text serves poorly for another (3-6% of the routes of code, JSON or
+math for one recorded on Japanese prose).
+
+Numerics: Not bit-identical: the lent experts run in the GPU MoE kernel
+instead of kt-kernel, and which and how many are lent depends on the free
+KV pages and the routing so far, so decode output depends on load and
+history.
+
+Prerequisites: `kv-vmm`, `prefill-lend`, `stream-prefill` (zero-copy, for
+the dynamic slots), `kv-lend-plan`.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ .../srt/layers/moe/fused_moe_triton/layer.py  |   7 +
+ python/sglang/srt/layers/moe/kt_ep_wrapper.py |  20 +-
+ .../sglang/srt/layers/moe/kt_kv_hot_lend.py   | 298 +++++++++++++++++-
+ 3 files changed, 316 insertions(+), 9 deletions(-)
+
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+index a2d9fb1292..3baac7f676 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+@@ -1105,6 +1105,13 @@ class FusedMoE(torch.nn.Module):
+         ):
+             if self.quant_method.num_gpu_experts != -1:
+                 if expert_id >= self.quant_method.num_gpu_experts:
++                    # kt_kv_hot_lend: experts N..N+X-1 load into the layer's shadow
++                    from sglang.srt.layers.moe import kt_kv_hot_lend
++
++                    hot = kt_kv_hot_lend.shadow_param(self.quant_method, self, param, expert_id)
++                    if hot is not None:
++                        self._weight_loader_impl(param=hot[0], loaded_weight=loaded_weight,
++                                                 weight_name=weight_name, shard_id=shard_id, expert_id=hot[1])
+                     return
+ 
+         self._weight_loader_impl(
+diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+index a088c8c0e0..4c5a5b9afd 100644
+--- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
++++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+@@ -308,6 +308,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+             params_dtype=params_dtype,
+             **extra_weight_attrs,
+         )
++        # kt_kv_hot_lend: the next X experts' weights on a shadow layer, for the
++        # KV pool's free pages
++        from sglang.srt.layers.moe import kt_kv_hot_lend
++
++        kt_kv_hot_lend.make_shadow(self, layer, hidden_size, intermediate_size_per_partition,
++                                   params_dtype, extra_weight_attrs)
+ 
+         # 2. Initialize KT wrapper for CPU experts
+         # CPU experts: num_gpu_experts to num_experts-1
+@@ -373,6 +379,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+             )
+             _drop_checkpoint_cache(self.kt_config.layer_idx, getattr(self.kt_config, "num_layers", 0) or 0)
+             self.wrapper.load_weights(physical_to_logical_map_cpu)
++        # kt_kv_hot_lend: experts N..N+X-1 to pinned memory and the shadow slots
++        from sglang.srt.layers.moe import kt_kv_hot_lend
++
++        kt_kv_hot_lend.split(self, layer)
+         # Last layer loaded on this rank: optionally build the streamer and
+         # pin every layer's arenas now (KT_GPU_STREAM_EARLY_INIT).
+         num_layers = getattr(self.kt_config, "num_layers", None)
+@@ -521,10 +531,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+                 self.submit(layer, cpu_do)
+                 cpu_share = True
+ 
++        # kt_kv_hot_lend: routes to the experts lent the KV pool's free pages go to
++        # their slots, and to the CPU at weight 0
++        from sglang.srt.layers.moe import kt_kv_hot_lend
++
++        hot = kt_kv_hot_lend.route(self, dispatch_output) if streamer is None else None
+ 
+         # Step 1: Submit CPU expert computation (non-blocking)
+         if streamer is None and self.tp_rank == 0:
+-            self.submit(layer, dispatch_output)
++            self.submit(layer, hot[0] if hot is not None else dispatch_output)
+ 
+         # Step 2: Prepare GPU computation by masking CPU expert IDs
+         # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
+@@ -565,6 +580,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+                 hot_reference_check(self, layer, x, physical_ids, topk_output.topk_weights, output, streamer)
+         else:
+             output = torch.zeros_like(x)
++        if hot is not None:
++            output = output + kt_kv_hot_lend.apply(self, hot[1])
+ 
+         # Step 4: Synchronize CPU results and merge with GPU results
+         if streamer is not None:
+@@ -575,6 +592,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+             cpu_output = self.sync(x)
+             output = output + cpu_output
+ 
++        kt_kv_hot_lend.check(self, layer, dispatch_output, hot, output)
+         return StandardCombineInput(hidden_states=output)
+ 
+     def _logical_to_physical(self, device):
+diff --git a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
+index 8a7aa14962..f064703b1a 100644
+--- a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
++++ b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
+@@ -31,13 +31,34 @@ ones most worth adding. This module:
+ The pool never changes size and the lent pages count as available, as with the
+ prefill loan. k lives on the device and the slots never move, so the captured
+ decode graphs stay valid; a slot that holds nothing reads zeros. Every rank
+-lends the same: the decision depends only on the allocator's free page count.
++lends at the same forward (the allocator's free page count is the same on each),
++and every rank holds the same slots: the CPU runs on rank 0 with its routing, so
++a slot another rank lacked would leave its share of that route uncomputed.
++
++KT_KV_HOT_DYNAMIC_SLOTS=1: the slots follow what is routed, so whoever serves
++whatever gets their own hot experts without recording a placement (a writer
++placement's 21 a layer catch 3-6% of the routes of code, JSON or math, 10-21):
++- a device table, physical id -> slot or -1, replaces the [N, N + k) range in
++  route, and route counts every routed physical id on the device;
++- every KT_KV_HOT_DYN_EVERY decode forwards (8), outside the graph, the counts
++  come to the host as decayed scores (half-life KT_KV_HOT_DYN_HALF_LIFE forwards,
++  256), and each layer swaps up to KT_KV_HOT_DYN_SWAPS a forward (2) of its held
++  experts for better-scored ones; a swapped-out expert leaves the table at once
++  (its routes go to the CPU, which holds every non-resident expert), the new one
++  is copied into the slot on a side stream from kt-kernel's expert arenas (the
++  zero-copy mapping the streamed prefill registered: no host copy) and enters
++  the table on the next round, behind the copy;
++- the decisions use only the counts, the same on every rank, and the slot counts
++  are the smallest over the ranks: the CPU (rank 0's routing) skips exactly the
++  routes every rank's slots take;
++- a new lend loads what was held before the window, from the arenas.
+ """
+ import copy
+ import os
+ import time
+ from typing import List, Optional
+ 
++import numpy as np
+ import torch
+ 
+ from sglang.srt.layers.moe import kt_kv_vmm
+@@ -65,6 +86,12 @@ _MASK_ZERO = os.environ.get("KT_GPU_MASK_ZERO", "0") == "1"
+ _SLOT_REL = float(os.environ.get("KT_KV_HOT_CHECK_SLOT_REL", "0.05") or 0.05)
+ _DUMP_REL = float(os.environ.get("KT_KV_HOT_CHECK_DUMP_REL", "0.2") or 0.2)  # a call dumped past this
+ _CHECK_REPEAT = os.environ.get("KT_KV_HOT_CHECK_REPEAT", "0") == "1"
++DYNAMIC = os.environ.get("KT_KV_HOT_DYNAMIC_SLOTS", "0") == "1"
++DYN_EVERY = max(1, int(os.environ.get("KT_KV_HOT_DYN_EVERY", "8") or 8))
++DYN_SWAPS = int(os.environ.get("KT_KV_HOT_DYN_SWAPS", "2") or 2)
++DYN_HALF_LIFE = float(os.environ.get("KT_KV_HOT_DYN_HALF_LIFE", "256") or 256)
++DYN_HYST = float(os.environ.get("KT_KV_HOT_DYN_HYST", "1.0") or 1.0)  # replace when new > victim x this
++DYN_LOG = int(os.environ.get("KT_KV_HOT_DYN_LOG", "512") or 512)  # rounds between log lines
+ 
+ LAYERS: List["_Layer"] = []
+ STATE = {"k": None, "want": True, "since": 0, "lent_slots": 0, "lends": 0, "releases": 0, "hooked": False,
+@@ -157,6 +184,11 @@ class _Layer:
+         self.k = 0
+         self.names, self.slots, self.banks, self.sz = [], {}, {}, {}
+         self.shadow = self.method = None
++        self.layer_idx = int(wrapper.kt_config.layer_idx)
++        self.e = int(wrapper.global_num_experts)
++        # KT_KV_HOT_DYNAMIC_SLOTS: the physical expert each slot is to hold (-1: none);
++        # the placement's N..N+X-1 to start with, as the banks hold
++        self.held = [self.n + j for j in range(self.x)]
+ 
+ 
+ def split(wrapper, layer) -> None:
+@@ -244,6 +276,10 @@ def split(wrapper, layer) -> None:
+     LAYERS.append(L)
+     # the lent counts, made before any graph is captured (route reads them)
+     STATE["k"] = torch.zeros(len(LAYERS), dtype=torch.int64, device=dev)
++    if DYNAMIC:
++        # the slot table and the route counts, also made before any capture
++        STATE["tbl"] = torch.full((len(LAYERS), L.e), -1, dtype=torch.int64, device=dev)
++        STATE["cnt"] = torch.zeros((len(LAYERS), L.e), dtype=torch.float32, device=dev)
+     wrapper.__dict__["_kt_kv_hot"] = L
+     if L.idx == 0:
+         _log(f"N {L.n} + X {x}: per-expert tensors {[(nm, tuple(L.slots[nm].shape), L.sz[nm]) for _, nm in L.names]}, "
+@@ -272,18 +308,25 @@ def route(wrapper, dispatch_output):
+         return None  # a streamed prefill: nothing is lent, the streamer runs them
+     topk = dispatch_output.topk_output
+     ids, w = topk.topk_ids, topk.topk_weights
+-    k = _k_dev(ids.device)[L.idx]
+-    lent = (ids >= L.n) & (ids < L.n + k)
++    if DYNAMIC:
++        flat = ids.reshape(-1).long()
++        STATE["cnt"][L.idx].index_add_(0, flat.clamp(min=0), (flat >= 0).float())
++        slot = STATE["tbl"][L.idx][ids.long().clamp(min=0)].to(ids.dtype)
++        lent = (slot >= 0) & (ids >= 0)
++    else:
++        k = _k_dev(ids.device)[L.idx]
++        lent = (ids >= L.n) & (ids < L.n + k)
++        slot = ids - L.n
+     cpu = dispatch_output._replace(topk_output=topk._replace(
+         topk_ids=torch.where(lent, torch.zeros_like(ids), ids),
+         topk_weights=torch.where(lent, torch.zeros_like(w), w)))
+     if _MASK_ZERO:
+         # a runner that cannot take -1 (Marlin): slot 0 at weight 0, which reads
+         # zeros when nothing is lent
+-        sid = torch.where(lent, ids - L.n, torch.zeros_like(ids)).to(torch.int64)
++        sid = torch.where(lent, slot, torch.zeros_like(ids)).to(torch.int64)
+         sw = torch.where(lent, w, torch.zeros_like(w))
+     else:
+-        sid = torch.where(lent, ids - L.n, torch.full_like(ids, -1))
++        sid = torch.where(lent, slot, torch.full_like(ids, -1))
+         sw = w
+     slots = dispatch_output._replace(topk_output=topk._replace(topk_ids=sid, topk_weights=sw))
+     saved = (ids.clone(), w.clone(), lent) if CHECK else None
+@@ -378,8 +421,9 @@ def check(wrapper, layer, dispatch_output, hot, output) -> None:
+         # (a slot read through an unmapped or stale chunk differs from its bank)
+         STATE["slotdiag"] = STATE.get("slotdiag", 0) + 1
+         k = int(_k_dev(x.device)[L.idx])
+-        bad = [f"{nm}[{j}]" for _, nm in L.names for j in range(k)
+-               if not torch.equal(L.slots[nm][j].cpu(), L.banks[nm][j].cpu())]
++        # a dynamic slot holds its bank's expert only while it still holds N + j
++        bad = [f"{nm}[{j}]" for _, nm in L.names for j in range(k) if L.held[j] == L.n + j
++               and not torch.equal(L.slots[nm][j].cpu(), L.banks[nm][j].cpu())]
+         _log(f"slot diag rank {wrapper.tp_rank} layer {L.idx} (k {k}, slots vs CPU {rel_slots:.3e}): "
+              f"{len(bad)} of {k * len(L.names)} slot tensors differ from their bank: {bad[:16]}")
+     if n_lent and rel_slots > 0.5 and STATE.get("diag", 0) < 3:
+@@ -456,6 +500,220 @@ def _plan(budget: int) -> List[int]:
+     return ks
+ 
+ 
++# -- KT_KV_HOT_DYNAMIC_SLOTS ---------------------------------------------------------
++
++DYN = {"on": None, "order": -1, "roles": {}, "stage": None, "stream": None, "pending": None,
++       "ev_unmap": None, "ev_copy": None, "ev_cnt": None, "buf": None, "scores": None, "seen": None,
++       "calls": 0, "rounds": 0, "swaps": 0, "swaps_logged": 0}
++
++
++def _over_ranks(vals: List[int], op=torch.distributed.ReduceOp.MIN) -> List[int]:
++    """vals reduced with op over the TP ranks (the CPU group: every rank lends at the
++    same forward, the free page count being the same on each)."""
++    t = torch.tensor(vals, dtype=torch.int64)
++    from sglang.srt.distributed.parallel_state import get_tp_group
++
++    g = get_tp_group()
++    if g.world_size > 1:
++        torch.distributed.all_reduce(t, op=op, group=g.cpu_group)
++    return t.tolist()
++
++
++def _roles(L: _Layer):
++    """{(w13|w2, is scale): slot name} when the shadow holds exactly the packed
++    weights and the e8m0 scales of the two projections (bytes: uint8 or int8
++    weights, uint8 or float8_e8m0fnu scales), else None."""
++    r = {}
++    for _, nm in L.names:
++        key = ("w13" if nm.startswith("w13") else "w2" if nm.startswith("w2") else None, "scale" in nm)
++        if key[0] is None or key in r or L.slots[nm].element_size() != 1:
++            return None
++        r[key] = nm
++    return r if len(r) == 4 else None
++
++
++def _arena_load(L: _Layer, e: int, dst, order: int) -> None:
++    """Physical expert e of the layer from this rank's part of kt-kernel's arenas
++    (gate, up, down packed e2m1; their fp32 group scales) into dst, the slot
++    layout: w13 [2N, K/2] with gate rows first (order 0) or up rows first (1), w2
++    [K, N/2], e8m0 scale bytes. On the current stream."""
++    from sglang.srt.layers.moe import kt_stream_prefill
++
++    st = kt_stream_prefill._instance
++    st._register_arenas(L.layer_idx)
++    ar = st._arenas[L.layer_idx]
++    w13, s13, w2, s2 = (dst[k].view(torch.uint8) for k in (("w13", False), ("w13", True), ("w2", False), ("w2", True)))
++    n = w13.shape[0] // 2
++    ws, ss = ar[0][1], ar[3][1]
++    a, b = (0, 1) if order == 0 else (1, 0)
++    nb = w13[:n].numel()
++    w13[:n].view(-1).copy_(ar[a][0][e * ws:e * ws + nb], non_blocking=True)
++    w13[n:].view(-1).copy_(ar[b][0][e * ws:e * ws + nb], non_blocking=True)
++    w2.view(-1).copy_(ar[2][0][e * ws:e * ws + w2.numel()], non_blocking=True)
++    stage = DYN["stage"]
++    for src, out in ((ar[3 + a], s13[:n]), (ar[3 + b], s13[n:]), (ar[5], s2)):
++        c = out.numel()
++        stage[:c].view(torch.uint8).copy_(src[0][e * ss:e * ss + 4 * c], non_blocking=True)
++        out.view(-1).copy_(((stage[:c].view(torch.int32) >> 23) & 0xFF).to(torch.uint8))
++
++
++def _dyn_setup(dev) -> None:
++    """First lend: whether the arenas give the bytes the slots hold. Experts N, N+1
++    of the first layer loaded from the arenas against their banks (the method's
++    processed form), in both row orders; on only when every rank found the same."""
++    from sglang.srt.layers.moe import kt_stream_prefill
++
++    order, why = -1, ""
++    L = LAYERS[0]
++    roles = _roles(L)
++    st = getattr(kt_stream_prefill, "_instance", None)
++    if st is None or L.layer_idx not in getattr(st, "_arenas", {}):
++        why = "no zero-copy arenas (KT_GPU_STREAM_ZEROCOPY=1 with KT_EXPERT_SHM=1)"
++    elif roles is None:
++        why = f"slot tensors {[(nm, str(L.slots[nm].dtype)) for _, nm in L.names]} are not packed MXFP4 bytes"
++    else:
++        DYN["stage"] = torch.empty(max(L.slots[roles[("w13", True)]][0].numel() // 2 + 1,
++                                       L.slots[roles[("w2", True)]][0].numel()), dtype=torch.float32, device=dev)
++        diff = {}
++        for o in (0, 1):
++            good = True
++            for j in range(min(2, L.x)):
++                dst = {key: torch.empty_like(L.slots[nm][j]) for key, nm in roles.items()}
++                _arena_load(L, L.n + j, dst, o)
++                torch.cuda.synchronize(dev)
++                for key, nm in roles.items():
++                    bad = int((dst[key].view(torch.uint8).cpu() != L.banks[nm][j].view(torch.uint8)).sum())
++                    if bad:
++                        good = False
++                        diff[(o, nm)] = diff.get((o, nm), 0) + bad
++            if good:
++                order = o
++                break
++        if order < 0:
++            why = f"arena bytes differ from the banks (row order, slot name: bytes): {diff}"
++    lo, hi = _over_ranks([order, order], torch.distributed.ReduceOp.MIN)[0], \
++        _over_ranks([order], torch.distributed.ReduceOp.MAX)[0]
++    DYN["on"] = lo >= 0 and lo == hi
++    if DYN["on"]:
++        DYN["order"] = order
++        DYN["roles"] = {M.idx: _roles(M) for M in LAYERS}
++        DYN["stream"] = torch.cuda.Stream(device=dev)
++        DYN["ev_unmap"], DYN["ev_copy"], DYN["ev_cnt"] = torch.cuda.Event(), torch.cuda.Event(), None
++        DYN["buf"] = torch.zeros(tuple(STATE["cnt"].shape), dtype=torch.float32, pin_memory=True)
++        DYN["scores"] = np.zeros(tuple(STATE["cnt"].shape))
++        _log(f"dynamic slots on: arena experts match the banks ({'gate' if order == 0 else 'up'} rows first), "
++             f"a round every {DYN_EVERY} forwards, up to {DYN_SWAPS * DYN_EVERY} swaps a layer, "
++             f"half-life {DYN_HALF_LIFE:g}")
++    else:
++        for M in LAYERS:
++            M.held = [M.n + j for j in range(M.x)]
++        _log(f"dynamic slots off: {why or 'another rank could not load from its arenas'}; "
++             f"the slots hold the placement's experts")
++
++
++def _dyn_fill(L: _Layer, k: int) -> None:
++    """A lend's copy into a layer's k slots: what each held before the window, from
++    its bank when it is still the placement's expert, else from the arenas."""
++    for j in range(k):
++        e = L.held[j]
++        if e == L.n + j or not DYN["on"]:
++            L.held[j] = L.n + j
++            for _, nm in L.names:
++                L.slots[nm][j].copy_(L.banks[nm][j], non_blocking=True)
++        elif e >= 0:
++            _arena_load(L, e, {key: L.slots[nm][j] for key, nm in DYN["roles"][L.idx].items()}, DYN["order"])
++
++
++def _dyn_table(dev) -> None:
++    """The slot table from what each lent slot holds."""
++    tbl = STATE["tbl"]
++    tbl.fill_(-1)
++    rows = [(L.idx, L.held[j], j) for L in LAYERS for j in range(L.k) if L.held[j] >= 0]
++    if rows:
++        t = torch.tensor(rows, dtype=torch.int64).to(dev)
++        tbl[t[:, 0], t[:, 1]] = t[:, 2]
++
++
++def _dyn_round(dev) -> None:
++    """Every DYN_EVERY decode forwards, outside the graph: last round's copies enter
++    the table, last round's counts become scores, and each layer swaps held experts
++    for better-scored ones (out of the table now, copied in on the side stream)."""
++    DYN["calls"] += 1
++    if DYN["calls"] % DYN_EVERY:
++        return
++    cur = torch.cuda.current_stream(dev)
++    tbl = STATE["tbl"]
++    if DYN["pending"] is not None:
++        cur.wait_event(DYN["ev_copy"])
++        t = DYN["pending"]
++        tbl[t[:, 0], t[:, 1]] = t[:, 2]
++        DYN["pending"] = None
++    if DYN["ev_cnt"] is not None:
++        DYN["ev_cnt"].synchronize()
++        seen = DYN["buf"].numpy().astype(np.float64)
++        DYN["scores"] *= 0.5 ** (DYN_EVERY / DYN_HALF_LIFE)
++        DYN["scores"] += seen
++        DYN["seen"] = seen if DYN["seen"] is None else DYN["seen"] + seen
++    else:
++        DYN["ev_cnt"] = torch.cuda.Event()
++    DYN["buf"].copy_(STATE["cnt"], non_blocking=True)
++    STATE["cnt"].zero_()
++    DYN["ev_cnt"].record(cur)
++    DYN["rounds"] += 1
++    budget = DYN_SWAPS * DYN_EVERY
++    swaps = []
++    for L in LAYERS:
++        k = L.k
++        if not k:
++            continue
++        sc, held = DYN["scores"][L.idx], L.held
++        hs, changed, n = set(held[:k]), set(), 0
++        for e in np.argsort(-sc, kind="stable").tolist():
++            if n >= budget or sc[e] <= 0:
++                break
++            if e < L.n or e in hs:
++                continue
++            opts = [j for j in range(k) if j not in changed]
++            if not opts:
++                break
++            empty = [j for j in opts if held[j] < 0]
++            if empty:
++                j = empty[0]
++            else:
++                j = min(opts, key=lambda i: (sc[held[i]], i))
++                if not sc[e] > sc[held[j]] * DYN_HYST:
++                    break
++            swaps.append((L, j, held[j], e))
++            hs.discard(held[j])
++            hs.add(e)
++            held[j] = e
++            changed.add(j)
++            n += 1
++    if swaps:
++        out = [(L.idx, old) for L, _, old, _ in swaps if old >= 0]
++        if out:
++            t = torch.tensor(out, dtype=torch.int64).to(dev)
++            tbl[t[:, 0], t[:, 1]] = -1
++        DYN["ev_unmap"].record(cur)
++        side = DYN["stream"]
++        with torch.cuda.stream(side):
++            side.wait_event(DYN["ev_unmap"])
++            for L, j, _, e in swaps:
++                _arena_load(L, e, {key: L.slots[nm][j] for key, nm in DYN["roles"][L.idx].items()}, DYN["order"])
++            DYN["ev_copy"].record(side)
++        DYN["pending"] = torch.tensor([(L.idx, e, j) for L, j, _, e in swaps], dtype=torch.int64).to(dev)
++        DYN["swaps"] += len(swaps)
++    if DYN["rounds"] % DYN_LOG == 0 and DYN["seen"] is not None:
++        seen = DYN["seen"]
++        cpu = sum(float(seen[L.idx, L.n:].sum()) for L in LAYERS)
++        hit = sum(float(seen[L.idx, [e for e in L.held[:L.k] if e >= 0]].sum()) for L in LAYERS)
++        _log(f"dynamic round {DYN['rounds']}: the slots took {hit / max(cpu, 1):.1%} of the routes past the "
++             f"resident experts over the last {DYN_LOG} rounds, {DYN['swaps'] - DYN['swaps_logged']} swaps "
++             f"({(DYN['swaps'] - DYN['swaps_logged']) / (DYN_LOG * DYN_EVERY * max(len(LAYERS), 1)):.3f} "
++             f"a forward and layer)")
++        DYN["seen"], DYN["swaps_logged"] = None, DYN["swaps"]
++
++
+ def _hook() -> None:
+     if STATE["hooked"]:
+         return
+@@ -473,6 +731,8 @@ def tick(runner) -> None:
+     from sglang.srt.layers.moe import kt_kv_prefill_lend as m
+ 
+     if m.STATE["lent"] is not None:
++        if DYNAMIC and DYN["on"] and LAYERS[0].k:
++            _dyn_round(LAYERS[0].slots[LAYERS[0].names[0][1]].device)
+         return
+     if not STATE["want"]:
+         STATE["since"] += 1
+@@ -494,6 +754,12 @@ def tick(runner) -> None:
+         if free > budget:
+             spare, budget = free - budget, free
+     ks = _plan(budget)
++    # rank 0's routing decides what the CPU skips, so every rank's slots must take
++    # the same routes: the slot counts are the smallest over the ranks (the spare
++    # memory differs between the cards; the free pages do not)
++    ks = _over_ranks(ks)
++    if DYNAMIC and DYN["on"] is None:
++        _dyn_setup(dev)
+     for i, (L, k) in enumerate(zip(LAYERS, ks)):
+         if k and any(kt_kv_vmm.restore(L.slots[nm], 0, _span(L, nm, k)) < 0 for _, nm in L.names):
+             # no memory after all: this layer and the rest get nothing
+@@ -504,11 +770,22 @@ def tick(runner) -> None:
+                     kt_kv_vmm.release(M.slots[nm], 0, _span(M, nm, M.x))
+             ks = ks[:i] + [0] * (len(LAYERS) - i)
+             break
++    # a rank that could not map them all: the others give back what it lacks
++    agreed = _over_ranks(ks)
++    for L, k, a in zip(LAYERS, ks, agreed):
++        if a < k:
++            for _, nm in L.names:
++                kt_kv_vmm.release(L.slots[nm], _span(L, nm, a), _span(L, nm, k) - _span(L, nm, a))
++    ks = agreed
+     for L, k in zip(LAYERS, ks):
+-        if k:
++        if k and DYNAMIC:
++            _dyn_fill(L, k)
++        elif k:
+             for _, nm in L.names:
+                 L.slots[nm][:k].copy_(L.banks[nm][:k], non_blocking=True)
+         L.k = k
++    if DYNAMIC:
++        _dyn_table(dev)
+     kd = _k_dev(dev)
+     kd.copy_(torch.tensor(ks, dtype=torch.int64), non_blocking=True)
+     torch.cuda.synchronize(dev)
+@@ -534,6 +811,11 @@ def release(why: str) -> None:
+     dev = LAYERS[0].slots[LAYERS[0].names[0][1]].device
+     kd = _k_dev(dev)
+     kd.zero_()
++    if DYNAMIC:
++        # the slots leave the table; a round's copies in flight finish in the sync,
++        # and what they were for is in each layer's held list for the next lend
++        STATE["tbl"].fill_(-1)
++        DYN["pending"] = None
+     torch.cuda.synchronize(dev)
+     for L in LAYERS:
+         if L.k:

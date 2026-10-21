@@ -1,7 +1,7 @@
-From 2879f54e0c7c2548ed1b742ddc36db3c277de4d8 Mon Sep 17 00:00:00 2001
+From 580c5b0ec640061f05dd5a7457ceaf6f9c332332 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
-Subject: [PATCH] [tier 2] kv-vmm: the KV pool on remappable memory (CUDA VMM)
+Subject: [PATCH] [tier 1] kv-vmm: the KV pool on remappable memory (CUDA VMM)
 
 `KT_KV_VMM=1` puts the KV pool on memory whose physical pages can be
 unmapped and mapped again while the addresses, and the CUDA graphs that
@@ -11,7 +11,7 @@ torch_memory_saver adapter). Needs `libkv_vmm.so` from the repo's
 
 Numerics: Bit-identical.
 
-Prerequisites: none; applies alone on tier 1.
+Prerequisites: none; applies alone on tier 0.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g

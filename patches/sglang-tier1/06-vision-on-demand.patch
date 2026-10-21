@@ -1,7 +1,7 @@
-From f0060216a3b378e59601a8364b56932b8b2f946b Mon Sep 17 00:00:00 2001
+From c7e9bdca91b4617feabef822031cd93a3d1a6b7c Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 22:59:06 +0900
-Subject: [PATCH] [tier 2] vision-on-demand: keep the vision tower in host
+Subject: [PATCH] [tier 1] vision-on-demand: keep the vision tower in host
  memory between image batches
 
 The vision tower's GPU memory when serving text.

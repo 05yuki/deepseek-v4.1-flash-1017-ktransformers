@@ -3,11 +3,15 @@
 prompts, then the prefill of a 35,000-token prompt, twice.
 
   python tools/bench.py [--url http://127.0.0.1:8080] [--api-key KEY]
+  python tools/bench.py --other-text                (decode on six other kinds of text only)
   python tools/bench.py --prefill-only --lengths 35000,131072,524288,1000000   (about an hour)
 
 - decode: each prompt asks for a story of about 2,000 characters; 1,024 tokens are generated
   at temperature 1.0, top_p 0.95. The tok/s of a request is its completion tokens over its
   time, so it includes the short prompt's prefill; the median of the four is printed.
+- --other-text: decode on six prompts unlike the prose the hot-expert placement was recorded on
+  (Chinese and English prose, English technical prose, math, JSON, Python code), one request
+  each, the same settings; each rate is printed.
 - prefill: 35,000 token ids drawn at random (fixed seed) from the vocabulary, one token
   generated; then 35,000 other ids. The first long prompt of a launch can carry one-time
   setup, so both are printed. --lengths gives other prompt lengths, each its own random
@@ -22,6 +26,19 @@ import random
 import statistics
 import time
 import urllib.request
+
+OTHER = [
+    ("Chinese prose", "请写一篇约1500字的散文，描写江南小镇的秋天，要有具体的人物和场景。"),
+    ("English prose", "Write a 1500-word short story about a lighthouse keeper who finds a message in a bottle."),
+    ("English technical prose", "Explain in detail how TCP congestion control works: slow start, congestion avoidance, "
+                                "fast retransmit and fast recovery, and how CUBIC and BBR differ."),
+    ("math", "Prove that there are infinitely many primes of the form 4k+3. Then list the first 20 "
+             "such primes and compute their sum, showing your work."),
+    ("JSON", "Return a JSON array of 40 fictional customer records with the fields id, name, email, "
+             "city, country, signup_date, plan and monthly_spend. Output only the JSON."),
+    ("Python code", "Write a Python implementation of a thread-safe LRU cache with per-entry TTL expiry, "
+                    "then a pytest test module that covers eviction, expiry and concurrent access."),
+]
 
 PROMPTS = [
     "夜のダンジョンの野営地を舞台に、2000字の場面を書いて。",
@@ -46,18 +63,28 @@ def main():
     ap.add_argument("--prefill-tokens", type=int, default=35000)
     ap.add_argument("--lengths", default="", help="prompt lengths to prefill once each, comma-separated")
     ap.add_argument("--prefill-only", action="store_true")
+    ap.add_argument("--other-text", action="store_true", help="decode on six other kinds of text, nothing else")
     ap.add_argument("--vocab", type=int, default=129280, help="token ids are drawn from 1000..vocab")
     a = ap.parse_args()
 
-    rates = []
-    for i, p in enumerate([] if a.prefill_only else PROMPTS):
+    def decode(prompt):
         body = {"model": "x", "max_tokens": 1024, "temperature": 1.0, "top_p": 0.95,
                 "chat_template_kwargs": {"enable_thinking": False},
-                "messages": [{"role": "user", "content": p}]}
+                "messages": [{"role": "user", "content": prompt}]}
         t = time.time()
         r = post(a.url + "/v1/chat/completions", body, a.api_key)
         dt = time.time() - t
         n = r["usage"]["completion_tokens"]
+        return n, dt
+
+    if a.other_text:
+        for name, p in OTHER:
+            n, dt = decode(p)
+            print(f"decode, {name}: {n} tokens in {dt:.1f} s = {n / dt:.1f} tok/s", flush=True)
+        return
+    rates = []
+    for i, p in enumerate([] if a.prefill_only else PROMPTS):
+        n, dt = decode(p)
         rates.append(n / dt)
         print(f"decode p{i}: {n} tokens in {dt:.1f} s = {n / dt:.1f} tok/s", flush=True)
     if rates:

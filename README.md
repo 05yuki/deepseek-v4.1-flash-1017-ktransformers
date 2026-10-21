@@ -83,31 +83,30 @@ and 4.6 GB is still free after the 1M-token KV pool. A shorter context
 ## What setup.sh does
 
 1. Clones sgl-project/sglang at `ed0b8f43` on its main branch and applies the SGLang patches
-   up to `TIER` (default 3), each tier on top of the ones below it:
+   up to `TIER` (default 2), each tier on top of the ones below it:
 
    | `TIER` | patch | what it adds |
    |---|---|---|
    | 0 | `sglang-tier0/` (eight patches, one concern each) | what 1017 needs to run correctly on the KTransformers hybrid MoE: the FP8 step below, the SwiGLU clamp passed to the CPU experts, the expert mask kt-kernel takes, `-1` ids kept out of the Marlin MoE, zero GPU experts, a configurable load barrier, the tool namespaces of the current reference's chat encoding, and the V4.1 indexer on its torch path on SM12x (RTX 50, RTX PRO Blackwell, DGX Spark), which has no DeepGEMM build |
-   | 1 | none | empty: SGLang main scores the indexer in row chunks itself; the number is kept so `TIER` means the same as before |
-   | 2 | `sglang-tier2/` (one patch per feature, [docs/tier2.md](docs/tier2.md); `SGLANG_FEATURES` picks some) | streamed prefill, the lends, hot experts and placement, the KV pool on remappable memory, the GPU MoE and FP8 kernels (the streamed prefill needs SM89 or newer) |
-   | 3 | `sglang-tier3-no-p2p.patch` | all-reduce through pinned host memory, for two GPUs without peer access |
+   | 1 | `sglang-tier1/` (one patch per feature, [docs/tier1.md](docs/tier1.md); `SGLANG_FEATURES` picks some) | streamed prefill, the lends, hot experts and placement, the KV pool on remappable memory, the GPU MoE and FP8 kernels (the streamed prefill needs SM89 or newer) |
+   | 2 | `sglang-tier2-no-p2p.patch` | all-reduce through pinned host memory, for two GPUs without peer access |
 
-   Below tier 2 a long prompt's experts run on the CPU (about 40 tok/s of prefill here, decode
-   about 11 tok/s); the speed in Results is tier 3's.
+   Below tier 1 a long prompt's experts run on the CPU (about 40 tok/s of prefill here, decode
+   about 11 tok/s); the speed in Results is tier 2's.
 
 2. Clones kvcache-ai/ktransformers at `95009ea` with its llama.cpp and pybind11
-   submodules. From tier 2 it also applies `patches/kt-kernel-tree.patch` (the CPU kernels'
+   submodules. From tier 1 it also applies `patches/kt-kernel-tree.patch` (the CPU kernels'
    speed, shared expert memory, the stream hand-over) and `patches/kt-kernel-llama-cpp.patch`;
-   below tier 2 kt-kernel is built as pinned.
+   below tier 1 kt-kernel is built as pinned.
 3. Creates `.venv` from `requirements.txt` and installs the patched SGLang.
-4. Builds kt-kernel for this CPU and the visible GPUs' compute capability; at tier 2
+4. Builds kt-kernel for this CPU and the visible GPUs' compute capability; at tier 1
    with parallel expert loading (`patches/kt-kernel-load-prefetch.py`).
 5. Builds `engram-adapter/librow_store.so` and `build/libkv_vmm.so`.
 6. With `MODEL` set, writes the engram manifest from the checkpoint's headers
    (`tools/make-engram-manifest.py`). It then runs the 1017 kernel's test on this GPU.
 
 Re-running skips the finished steps; a different `TIER` re-applies the patches and
-rebuilds kt-kernel. `serve.sh` reads the tier and leaves out what needs tier 2. Each patch is checked against its pinned tree before it
+rebuilds kt-kernel. `serve.sh` reads the tier and leaves out what needs tier 1. Each patch is checked against its pinned tree before it
 is applied; one that does not fit stops the setup with nothing applied. If the libnuma or hwloc headers live outside the
 system paths, pass them in through `CPLUS_INCLUDE_PATH` and `LIBRARY_PATH`. CMake
 flags go in `CMAKE_ARGS`.
@@ -119,8 +118,8 @@ cores, and sets tensor parallelism, the CPU pools and the CUDA arch from them. T
 defaults are listed in the script. Each one can be overridden by the environment
 variable named next to it. Among them:
 
-- the tier-2 features that were applied, each with its switch and default in
-  [docs/tier2.md](docs/tier2.md): the prefill experts streamed to the GPU, the hot lend
+- the tier-1 features that were applied, each with its switch and default in
+  [docs/tier1.md](docs/tier1.md): the prefill experts streamed to the GPU, the hot lend
   (more hot experts in decode, in memory nothing else is using), `wo_a` in FP8, the vision
   tower in host memory and the rest
 - a prefill chunk calibrated once, on the first launch of a setup (the server starts
@@ -136,8 +135,8 @@ that took about 15 minutes, before the one-time chunk calibration. Later launche
 reuse the cache (`.cache/` in the checkout) and are ready in about 3 minutes, with
 the checkpoint on NVMe and loaded once before.
 
-What each patch changes: [docs/patches.md](docs/patches.md) (tiers 0 and 3, kt-kernel) and
-[docs/tier2.md](docs/tier2.md) (tier 2, one section a feature, with its switch and measured effect).
+What each patch changes: [docs/patches.md](docs/patches.md) (tiers 0 and 2, kt-kernel) and
+[docs/tier1.md](docs/tier1.md) (tier 1, one section a feature, with its switch and measured effect).
 What made it this fast, measured change by change, and what was tried and dropped:
 [docs/optimizations.md](docs/optimizations.md).
 
@@ -193,15 +192,35 @@ None of it needs a server change:
 
 2 × AMD EPYC 7452 (Zen 2, AVX2), 512 GB DDR4, 2 × RTX 5070 Ti 16 GB, the checkpoint on
 NVMe; built from this repository and run with the `serve.sh` defaults (1M-token context,
-one request at a time), measured with `tools/bench.py`:
+one request at a time), measured with `tools/bench.py`.
 
-| | |
+Decode, 1,024 tokens a reply (`--other-text` for the rows below the first):
+
+| text | tok/s |
 |---|---|
-| decode, Japanese prose | 43.6 tok/s |
-| prefill, 35,000-token prompt | 779 tok/s |
-| prefill, 131,072-token prompt | 776 tok/s |
-| prefill, 524,288-token prompt | 659 tok/s |
-| prefill, 1,000,000-token prompt | 558 tok/s (30 minutes) |
+| Japanese prose (median of four prompts) | 43.8 |
+| Chinese prose | 38.5 |
+| English prose | 35.4 |
+| math | 34.7 |
+| JSON | 32.8 |
+| English technical prose | 32.4 |
+| Python code | 32.0 |
+
+Five experts a layer stay on the GPU, and up to 16 more sit in the KV pool's free pages; the
+hot lend swaps those 16 for the ones the text being written routes to most, so no routing
+has to be recorded for a new kind of text. Code, JSON, math and English spread their routes over more experts than Japanese prose (a layer's 21 most
+used take about half of their routes, against 70-75% in Japanese prose), so the CPU computes
+more of them: a GPU with more memory can hold more of them with `KT_KV_HOT_EXTRA`
+([docs/tier1.md](docs/tier1.md#16-hot-lend)).
+
+Prefill, one prompt of random token ids:
+
+| prompt (tokens) | tok/s | time |
+|---|---|---|
+| 35,000 | 766 | 46 s |
+| 131,072 | 776 | 2.8 min |
+| 524,288 | 659 | 13 min |
+| 1,000,000 | 558 | 30 min |
 
 Longer prompts run in smaller chunks: the prompt's own KV and the attention's working
 memory grow with its length, leaving less GPU memory for a chunk, and every chunk streams
@@ -211,7 +230,7 @@ experts than real text, so these figures are lower than with text.
 ## Fixes from dsv41-flash-dual-epyc
 
 Two fixes by f-wunderlich, from the earlier release's repo: `--kt-num-gpu-experts 0` starts
-with Marlin (#2, tier 0 for the MoE call and tier 2's `loading` for the loader). The SM120
+with Marlin (#2, tier 0 for the MoE call and tier 1's `loading` for the loader). The SM120
 padding-page fix (#3) is no longer carried: SGLang main's sparse attention with FlashInfer
 0.7.2 runs a 48K-token prefill without it, with the same NLL.
 

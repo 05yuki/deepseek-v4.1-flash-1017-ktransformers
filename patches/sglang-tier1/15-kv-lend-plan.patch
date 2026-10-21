@@ -1,7 +1,7 @@
-From 111709bcbe227ab15ca7a1c362995af64af9d9f5 Mon Sep 17 00:00:00 2001
+From 57dae7b5aa59f3d46aebcaa6f3ef47d826451f7d Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
-Subject: [PATCH] [tier 2] kv-lend-plan: lend the KV pool's free pages to
+Subject: [PATCH] [tier 1] kv-lend-plan: lend the KV pool's free pages to
  prefill, plan the chunk per request
 
 The KV pool's free pages during prefill. `KT_PREFILL_KV_LEND=1` lends

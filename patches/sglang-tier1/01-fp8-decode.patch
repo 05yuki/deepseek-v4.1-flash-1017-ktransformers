@@ -1,7 +1,7 @@
-From a98eadda5b74c851a538019e42d04505d79f5a49 Mon Sep 17 00:00:00 2001
+From d8b6ee3d6f55c2c9495ec75d49b4b7e98daccf3a Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 22:56:28 +0900
-Subject: [PATCH] [tier 2] fp8-decode: block-FP8 GEMV and split-K for
+Subject: [PATCH] [tier 1] fp8-decode: block-FP8 GEMV and split-K for
  decode-sized dense GEMMs
 
 Faster block-FP8 dense GEMMs for decode-sized inputs. With up to four

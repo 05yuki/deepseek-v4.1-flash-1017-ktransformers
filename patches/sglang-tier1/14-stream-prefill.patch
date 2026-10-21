@@ -1,7 +1,7 @@
-From 47e8830d26d592a519129f57749ca3a3d7ae5344 Mon Sep 17 00:00:00 2001
+From b750e8ae03ae0150a29ed95031cacafa68a3f9f0 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
-Subject: [PATCH] [tier 2] stream-prefill: stream the CPU experts to the GPU
+Subject: [PATCH] [tier 1] stream-prefill: stream the CPU experts to the GPU
  for long prefills
 
 `KT_GPU_STREAM_PREFILL=<tokens>`: above that many tokens the CPU experts

@@ -1,7 +1,7 @@
-From c522f0bde007991facf2e39982e0ce4826d52735 Mon Sep 17 00:00:00 2001
+From c8c1489df128145fd42c94ee6dd919d9a5adf960 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
-Subject: [PATCH] [tier 2] engram-row-prefetch: start decode's engram row
+Subject: [PATCH] [tier 1] engram-row-prefetch: start decode's engram row
  lookups with the token, on a side stream
 
 In decode, each engram layer's rank-local row lookup starts at the
@@ -11,7 +11,7 @@ pipeline stage, no DP attention and engram tables that are not shared.
 
 Numerics: Bit-identical: only the lookup moves.
 
-Prerequisites: none; applies alone on tier 1.
+Prerequisites: none; applies alone on tier 0.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
