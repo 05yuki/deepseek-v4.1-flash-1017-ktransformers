@@ -57,10 +57,11 @@ and 4.6 GB is still free after the 1M-token KV pool. A shorter context
   The launcher makes one expert pool per NUMA node and uses every physical core.
   kt-kernel is built for the CPU it is built on (`CPUINFER_CPU_INSTRUCT=NATIVE`). Its
   MXFP4 kernels need AVX2.
-- **VRAM: two 16 GB cards, nearly full, with the defaults.** Per card (tensor
-  parallel 2): 8.3 GB of weights (half of attention and the other dense layers, plus 5
-  resident experts a layer), 1.9 GB for the 1M-token KV pool, and the rest for prefill
-  work and extra hot experts in decode.
+- **VRAM: the dense layers and the KV pool, then whatever room is left.** Tested on two
+  16 GB cards (tensor parallel 2). Per card: 8.3 GB of weights (half of attention and the
+  other dense layers, plus 5 resident experts a layer) and 1.9 GB for the 1M-token KV
+  pool. The prefill chunks and the extra hot experts take the rest, so the cards show
+  nearly full whatever their size; on a smaller card they get less room.
 
   One GPU holds all of the dense part and the whole KV pool itself, about 24 GB at a 1M
   context by estimate. `CUDA_VISIBLE_DEVICES` picks the GPUs, one tensor-parallel rank
@@ -198,26 +199,27 @@ Decode, 1,024 tokens a reply (`--other-text` for the rows below the first):
 
 | text | tok/s |
 |---|---|
-| Japanese prose (median of four prompts) | 43.8 |
-| Chinese prose | 38.5 |
-| English prose | 35.4 |
-| math | 34.7 |
-| JSON | 32.8 |
-| English technical prose | 32.4 |
-| Python code | 32.0 |
+| Japanese prose (median of four prompts) | 44.2 |
+| Chinese prose | 39.1 |
+| English prose | 36.0 |
+| math | 37.6 |
+| JSON | 35.1 |
+| English technical prose | 33.7 |
+| Python code | 33.7 |
 
-Five experts a layer stay on the GPU, and up to 16 more sit in the KV pool's free pages; the
-hot lend swaps those 16 for the ones the text being written routes to most, so no routing
-has to be recorded for a new kind of text. Code, JSON, math and English spread their routes over more experts than Japanese prose (a layer's 21 most
-used take about half of their routes, against 70-75% in Japanese prose), so the CPU computes
-more of them: a GPU with more memory can hold more of them with `KT_KV_HOT_EXTRA`
+Up to 21 experts a layer run on the GPU: 5 that always stay and 16 in the KV pool's free
+pages. All of them are swapped for the experts the text being written routes to most, so
+no routing has to be recorded for a new kind of text. Code, JSON, math and English spread
+their routes over more experts than Japanese prose (a layer's 21 most used take about half
+of their routes, against 70-75% in Japanese prose), so the CPU computes more of them: a GPU
+with more memory can hold more with `KT_KV_HOT_EXTRA`
 ([docs/tier1.md](docs/tier1.md#16-hot-lend)).
 
 Prefill, one prompt of random token ids:
 
 | prompt (tokens) | tok/s | time |
 |---|---|---|
-| 35,000 | 766 | 46 s |
+| 35,000 | 759 | 46 s |
 | 131,072 | 776 | 2.8 min |
 | 524,288 | 659 | 13 min |
 | 1,000,000 | 558 | 30 min |
@@ -236,12 +238,6 @@ padding-page fix (#3) is no longer carried: SGLang main's sparse attention with 
 
 ## Not done
 
-- The resident-expert placement (`placements/`) was recorded from the earlier
-  release's routing on Japanese prose. It loads and runs with 1017, but it is not
-  1017's hottest set, and it fits no other workload better. To record your own, use
-  `KT_ROUTING_DUMP` and SGLang's `--init-expert-location`.
-- A forced `tool_choice` (named or required) does not carry a tool's namespace: the
-  constrained decoding asks for the bare name.
 - Tested on 2 × RTX 5070 Ti (SM120) with Zen 2 CPUs only.
 - CPUs with AVX-512 should work: the experts run on the AVX2 kernels, which those CPUs
   also have.

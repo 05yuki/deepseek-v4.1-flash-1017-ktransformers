@@ -1,4 +1,4 @@
-From dece787dceff3c6472abd40df77cf46e8979f5d7 Mon Sep 17 00:00:00 2001
+From ff36af29c93ae63d76b6b89fe62f0afce3358ddf Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 1] hot-lend: more hot experts in the KV pool's free
@@ -22,10 +22,21 @@ placement's next-hottest experts, which a placement recorded on one kind
 of text serves poorly for another (3-6% of the routes of code, JSON or
 math for one recorded on Japanese prose).
 
+`KT_KV_HOT_DYNAMIC_RESIDENT=1` (with the dynamic slots): the resident
+rows swap too, from one pool with the slots. kt-kernel then loads every
+expert (no GPU mask), and the route sends it -1 for each route the GPU
+takes. In a prefill window the rows hold experts 0..N-1 again (the
+prefill lend reads every layer from its pinned mirror), and the next
+lend fills them again. The route runs as one Triton kernel a layer: as
+separate torch ops the resident rows' table cost 4% of decode.
+
 Numerics: Not bit-identical: the lent experts run in the GPU MoE kernel
 instead of kt-kernel, and which and how many are lent depends on the free
 KV pages and the routing so far, so decode output depends on load and
 history.
+
+KT_KV_HOT_CHECK with the resident rows compares each eager MoE call's
+output, summed over the ranks, with every route computed on the CPU.
 
 Prerequisites: `kv-vmm`, `prefill-lend`, `stream-prefill` (zero-copy, for
 the dynamic slots), `kv-lend-plan`.
@@ -34,9 +45,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
  .../srt/layers/moe/fused_moe_triton/layer.py  |   7 +
- python/sglang/srt/layers/moe/kt_ep_wrapper.py |  20 +-
- .../sglang/srt/layers/moe/kt_kv_hot_lend.py   | 298 +++++++++++++++++-
- 3 files changed, 316 insertions(+), 9 deletions(-)
+ python/sglang/srt/layers/moe/kt_ep_wrapper.py |  37 +-
+ .../sglang/srt/layers/moe/kt_kv_hot_lend.py   | 558 +++++++++++++++++-
+ 3 files changed, 582 insertions(+), 20 deletions(-)
 
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 index a2d9fb1292..3baac7f676 100644
@@ -57,7 +68,7 @@ index a2d9fb1292..3baac7f676 100644
  
          self._weight_loader_impl(
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index a088c8c0e0..4c5a5b9afd 100644
+index a088c8c0e0..3a302f0cda 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -308,6 +308,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
@@ -73,7 +84,19 @@ index a088c8c0e0..4c5a5b9afd 100644
  
          # 2. Initialize KT wrapper for CPU experts
          # CPU experts: num_gpu_experts to num_experts-1
-@@ -373,6 +379,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -316,7 +322,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+             # GPU-resident experts instead of num_gpu_experts (SFT-only).
+             # GPU experts occupy ordinals 0..num_gpu_experts-1 (see above).
+             gpu_mask = torch.zeros(num_experts, dtype=torch.bool)
+-            gpu_mask[: self.num_gpu_experts] = True
++            # kt_kv_hot_lend's dynamic resident rows: kt-kernel loads every expert, the
++            # routes say what it computes (-1 for what the GPU takes)
++            if not kt_kv_hot_lend.cpu_holds_all(self):
++                gpu_mask[: self.num_gpu_experts] = True
+             KT_LAYERS[self.kt_config.layer_idx] = self
+             self.wrapper = KTMoEWrapper(
+                 layer_idx=self.kt_config.layer_idx,
+@@ -373,6 +382,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
              )
              _drop_checkpoint_cache(self.kt_config.layer_idx, getattr(self.kt_config, "num_layers", 0) or 0)
              self.wrapper.load_weights(physical_to_logical_map_cpu)
@@ -84,14 +107,36 @@ index a088c8c0e0..4c5a5b9afd 100644
          # Last layer loaded on this rank: optionally build the streamer and
          # pin every layer's arenas now (KT_GPU_STREAM_EARLY_INIT).
          num_layers = getattr(self.kt_config, "num_layers", None)
-@@ -521,10 +531,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -497,6 +510,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         # experts are streamed to the GPU in groups instead of computed here
+         # (kt_stream_prefill.py). The ids are taken before the mask below
+         # mutates them in place.
++        # kt_kv_hot_lend: a prefill window finds the resident rows holding 0..N-1
++        from sglang.srt.layers.moe import kt_kv_hot_lend
++
++        kt_kv_hot_lend.res_guard()
+         streamer = stream_prefill_for(self, layer, x.shape[0])
+         cpu_share = False
+         if streamer is not None:
+@@ -510,9 +527,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+                 # Everything below the cutoff is streamed or resident: send it
+                 # to GPU expert 0 at weight 0, which kt-kernel skips.
+                 theirs = physical_ids < cutoff
++                # (-1 when kt-kernel holds every expert: it would compute expert 0)
++                skip = -1 if kt_kv_hot_lend.cpu_holds_all(self) else 0
+                 cpu_do = dispatch_output._replace(
+                     topk_output=topk_output._replace(
+-                        topk_ids=torch.where(theirs, torch.zeros_like(physical_ids), physical_ids),
++                        topk_ids=torch.where(theirs, torch.full_like(physical_ids, skip), physical_ids),
+                         topk_weights=torch.where(
+                             theirs, torch.zeros_like(topk_output.topk_weights), topk_output.topk_weights
+                         ),
+@@ -521,15 +540,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                  self.submit(layer, cpu_do)
                  cpu_share = True
  
 +        # kt_kv_hot_lend: routes to the experts lent the KV pool's free pages go to
 +        # their slots, and to the CPU at weight 0
-+        from sglang.srt.layers.moe import kt_kv_hot_lend
-+
 +        hot = kt_kv_hot_lend.route(self, dispatch_output) if streamer is None else None
  
          # Step 1: Submit CPU expert computation (non-blocking)
@@ -101,16 +146,26 @@ index a088c8c0e0..4c5a5b9afd 100644
  
          # Step 2: Prepare GPU computation by masking CPU expert IDs
          # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
-@@ -565,6 +580,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         topk_ids = topk_output.topk_ids
+-        masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
++        if hot is not None and hot[3] is not None:
++            # kt_kv_hot_lend's dynamic resident rows: the row each route's expert is in
++            masked_topk_ids = hot[3]
++        else:
++            masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
+ 
+         # Create modified dispatch output for GPU computation
+         if _gpu_mask_zero:
+@@ -565,6 +591,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                  hot_reference_check(self, layer, x, physical_ids, topk_output.topk_weights, output, streamer)
          else:
              output = torch.zeros_like(x)
-+        if hot is not None:
++        if hot is not None and hot[1] is not None:
 +            output = output + kt_kv_hot_lend.apply(self, hot[1])
  
          # Step 4: Synchronize CPU results and merge with GPU results
          if streamer is not None:
-@@ -575,6 +592,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -575,6 +603,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
              cpu_output = self.sync(x)
              output = output + cpu_output
  
@@ -119,7 +174,7 @@ index a088c8c0e0..4c5a5b9afd 100644
  
      def _logical_to_physical(self, device):
 diff --git a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
-index 8a7aa14962..f064703b1a 100644
+index 8a7aa14962..978706d011 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
 @@ -31,13 +31,34 @@ ones most worth adding. This module:
@@ -158,7 +213,7 @@ index 8a7aa14962..f064703b1a 100644
  import torch
  
  from sglang.srt.layers.moe import kt_kv_vmm
-@@ -65,6 +86,12 @@ _MASK_ZERO = os.environ.get("KT_GPU_MASK_ZERO", "0") == "1"
+@@ -65,6 +86,80 @@ _MASK_ZERO = os.environ.get("KT_GPU_MASK_ZERO", "0") == "1"
  _SLOT_REL = float(os.environ.get("KT_KV_HOT_CHECK_SLOT_REL", "0.05") or 0.05)
  _DUMP_REL = float(os.environ.get("KT_KV_HOT_CHECK_DUMP_REL", "0.2") or 0.2)  # a call dumped past this
  _CHECK_REPEAT = os.environ.get("KT_KV_HOT_CHECK_REPEAT", "0") == "1"
@@ -168,10 +223,93 @@ index 8a7aa14962..f064703b1a 100644
 +DYN_HALF_LIFE = float(os.environ.get("KT_KV_HOT_DYN_HALF_LIFE", "256") or 256)
 +DYN_HYST = float(os.environ.get("KT_KV_HOT_DYN_HYST", "1.0") or 1.0)  # replace when new > victim x this
 +DYN_LOG = int(os.environ.get("KT_KV_HOT_DYN_LOG", "512") or 512)  # rounds between log lines
++# KT_KV_HOT_DYNAMIC_RESIDENT=1 (with the dynamic slots): the N resident experts swap too.
++# kt-kernel then loads every expert (no GPU mask), so an expert that leaves a resident row
++# runs on the CPU; route sends the CPU -1 for every route the GPU takes. In a prefill
++# window the rows hold experts 0..N-1 again, as the streamer expects.
++DYN_RES = DYNAMIC and os.environ.get("KT_KV_HOT_DYNAMIC_RESIDENT", "0") == "1"
++
++# KT_KV_HOT_ROUTE_TORCH=1: the dynamic route as separate torch ops instead of one kernel
++ROUTE_TORCH = os.environ.get("KT_KV_HOT_ROUTE_TORCH", "0") == "1"
++
++try:
++    import triton
++    import triton.language as tl
++except ImportError:  # the torch ops serve
++    triton = None
++
++if triton is not None:
++
++    @triton.jit
++    def _route_kernel(ids_ptr, w_ptr, tbl_ptr, rtbl_ptr, cnt_ptr, cid_ptr, cw_ptr, sid_ptr, sw_ptr, row_ptr, n,
++                      HAS_RES: tl.constexpr, MASK_ZERO: tl.constexpr, CPU_SKIP: tl.constexpr,
++                      BLOCK: tl.constexpr):
++        """One layer's routes in one launch: count each routed expert, look it up in the
++        slot table (and the resident rows' table), and write the CPU's ids and weights
++        (CPU_SKIP at weight 0 for what the GPU takes), the slots' and the rows' ids."""
++        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++        m = offs < n
++        e = tl.load(ids_ptr + offs, mask=m, other=-1).to(tl.int64)
++        w = tl.load(w_ptr + offs, mask=m, other=0.0)
++        valid = m & (e >= 0)
++        ec = tl.where(valid, e, 0)
++        tl.atomic_add(cnt_ptr + ec, tl.where(valid, 1.0, 0.0), mask=valid)
++        s = tl.load(tbl_ptr + ec, mask=valid, other=-1)
++        if HAS_RES:
++            r = tl.load(rtbl_ptr + ec, mask=valid, other=-1)
++            res = valid & (r >= 0)
++            lent = valid & (s >= 0) & (r < 0)
++            tl.store(row_ptr + offs, tl.where(res, r, -1).to(row_ptr.dtype.element_ty), mask=m)
++        else:
++            res = valid & (s < -1)  # never
++            lent = valid & (s >= 0)
++        gpu = lent | res
++        tl.store(cid_ptr + offs, tl.where(gpu, CPU_SKIP, e).to(cid_ptr.dtype.element_ty), mask=m)
++        tl.store(cw_ptr + offs, tl.where(gpu, 0.0, w).to(cw_ptr.dtype.element_ty), mask=m)
++        if MASK_ZERO:
++            tl.store(sid_ptr + offs, tl.where(lent, s, 0).to(sid_ptr.dtype.element_ty), mask=m)
++            tl.store(sw_ptr + offs, tl.where(lent, w, 0.0).to(sw_ptr.dtype.element_ty), mask=m)
++        else:
++            tl.store(sid_ptr + offs, tl.where(lent, s, -1).to(sid_ptr.dtype.element_ty), mask=m)
++            tl.store(sw_ptr + offs, w.to(sw_ptr.dtype.element_ty), mask=m)
++else:
++    _route_kernel = None
++
++
++def _route_fused(L, ids, w):
++    """The dynamic route in one kernel launch (route lists what each output is)."""
++    ids, w = ids.contiguous(), w.contiguous()
++    cid, cw, sw = torch.empty_like(ids), torch.empty_like(w), torch.empty_like(w)
++    sid = torch.empty(ids.shape, dtype=torch.int64, device=ids.device) if _MASK_ZERO else torch.empty_like(ids)
++    rows = torch.empty_like(ids) if DYN_RES else None
++    n = ids.numel()
++    if n:
++        tbl, cnt = STATE["tbl"][L.idx], STATE["cnt"][L.idx]
++        _route_kernel[(triton.cdiv(n, 128),)](
++            ids, w, tbl, STATE["rtbl"][L.idx] if DYN_RES else tbl, cnt, cid, cw, sid, sw,
++            rows if DYN_RES else cid, n, HAS_RES=DYN_RES, MASK_ZERO=_MASK_ZERO,
++            CPU_SKIP=-1 if DYN_RES else 0, BLOCK=128)
++    return cid, cw, sid, sw, rows
++
  
  LAYERS: List["_Layer"] = []
  STATE = {"k": None, "want": True, "since": 0, "lent_slots": 0, "lends": 0, "releases": 0, "hooked": False,
-@@ -157,6 +184,11 @@ class _Layer:
+@@ -81,6 +176,14 @@ def load_count(n: int) -> int:
+     return n + EXTRA if ENABLED and EXTRA > 0 and n > 0 else n
+ 
+ 
++def cpu_holds_all(wrapper) -> bool:
++    """Whether kt-kernel is to load every expert, the resident ones too (no GPU mask):
++    the resident rows swap (KT_KV_HOT_DYNAMIC_RESIDENT), so route decides alone what
++    the CPU computes. Only where make_shadow makes a shadow, so route runs."""
++    return (DYN_RES and ENABLED and EXTRA > 0 and int(wrapper.num_gpu_experts) > 0
++            and os.environ.get("KT_HOT_DYNAMIC", "0") != "1")
++
++
+ def make_shadow(wrapper, layer, hidden_size: int, intermediate_size_per_partition: int,
+                 params_dtype, extra_weight_attrs) -> None:
+     """The wrapper's create_weights, after the GPU method made the layer's N
+@@ -157,6 +260,16 @@ class _Layer:
          self.k = 0
          self.names, self.slots, self.banks, self.sz = [], {}, {}, {}
          self.shadow = self.method = None
@@ -180,10 +318,15 @@ index 8a7aa14962..f064703b1a 100644
 +        # KT_KV_HOT_DYNAMIC_SLOTS: the physical expert each slot is to hold (-1: none);
 +        # the placement's N..N+X-1 to start with, as the banks hold
 +        self.held = [self.n + j for j in range(self.x)]
++        # KT_KV_HOT_DYNAMIC_RESIDENT: the expert each resident row is to hold, the one it
++        # holds now, and the layer's per-expert tensors by role
++        self.res_held = list(range(self.n))
++        self.res_now = list(range(self.n))
++        self.res_t = None
  
  
  def split(wrapper, layer) -> None:
-@@ -244,6 +276,10 @@ def split(wrapper, layer) -> None:
+@@ -244,6 +357,26 @@ def split(wrapper, layer) -> None:
      LAYERS.append(L)
      # the lent counts, made before any graph is captured (route reads them)
      STATE["k"] = torch.zeros(len(LAYERS), dtype=torch.int64, device=dev)
@@ -191,27 +334,86 @@ index 8a7aa14962..f064703b1a 100644
 +        # the slot table and the route counts, also made before any capture
 +        STATE["tbl"] = torch.full((len(LAYERS), L.e), -1, dtype=torch.int64, device=dev)
 +        STATE["cnt"] = torch.zeros((len(LAYERS), L.e), dtype=torch.float32, device=dev)
++    if DYN_RES:
++        # the resident rows by role (None: not the packed layout the arenas give, so they
++        # stay put) and their table, physical id -> row, the identity to start with
++        rows = {}
++        for _, name, t in _per_expert(layer, L.n):
++            key = ("w13" if name.startswith("w13") else "w2" if name.startswith("w2") else None, "scale" in name)
++            if key[0] is None or key in rows or t.element_size() != 1:
++                rows = None
++                break
++            rows[key] = t
++        L.res_t = rows if rows and len(rows) == 4 else None
++        rtbl = torch.full((len(LAYERS), L.e), -1, dtype=torch.int64, device=dev)
++        if "rtbl" in STATE:
++            rtbl[: STATE["rtbl"].shape[0]] = STATE["rtbl"]
++        rtbl[L.idx, : L.n] = torch.arange(L.n, device=dev)
++        STATE["rtbl"] = rtbl
      wrapper.__dict__["_kt_kv_hot"] = L
      if L.idx == 0:
          _log(f"N {L.n} + X {x}: per-expert tensors {[(nm, tuple(L.slots[nm].shape), L.sz[nm]) for _, nm in L.names]}, "
-@@ -272,18 +308,25 @@ def route(wrapper, dispatch_output):
-         return None  # a streamed prefill: nothing is lent, the streamer runs them
+@@ -264,30 +397,67 @@ def _in_window() -> bool:
+ 
+ def route(wrapper, dispatch_output):
+     """The wrapper's apply, after the logical -> physical remap, before the CPU
+-    submit: (dispatch for the CPU, dispatch for the slots) or None."""
++    submit: (dispatch for the CPU, dispatch for the slots or None, the check's
++    copy, the resident rows' ids or None: then the wrapper's own mask) or None."""
+     L = wrapper.__dict__.get("_kt_kv_hot")
+     if L is None:
+         return None
+-    if _in_window():
+-        return None  # a streamed prefill: nothing is lent, the streamer runs them
      topk = dispatch_output.topk_output
      ids, w = topk.topk_ids, topk.topk_weights
 -    k = _k_dev(ids.device)[L.idx]
 -    lent = (ids >= L.n) & (ids < L.n + k)
+-    cpu = dispatch_output._replace(topk_output=topk._replace(
+-        topk_ids=torch.where(lent, torch.zeros_like(ids), ids),
+-        topk_weights=torch.where(lent, torch.zeros_like(w), w)))
++    if _in_window():
++        # a streamed prefill: nothing is lent, the streamer runs them, and the resident
++        # rows hold 0..N-1 (res_guard); a CPU that holds every expert must skip those
++        if not DYN_RES:
++            return None
++        res = (ids >= 0) & (ids < L.n)
++        return dispatch_output._replace(topk_output=topk._replace(
++            topk_ids=torch.where(res, torch.full_like(ids, -1), ids),
++            topk_weights=torch.where(res, torch.zeros_like(w), w))), None, None, None
++    if DYNAMIC and _route_kernel is not None and not ROUTE_TORCH and not CHECK:
++        # ten-odd small kernels a layer cost 4% of decode with the resident rows' table
++        # (10-21): one launch instead
++        cid, cw, sid, sw, rows = _route_fused(L, ids, w)
++        return (dispatch_output._replace(topk_output=topk._replace(topk_ids=cid, topk_weights=cw)),
++                dispatch_output._replace(topk_output=topk._replace(topk_ids=sid, topk_weights=sw)),
++                None, rows)
++    rows = None
 +    if DYNAMIC:
 +        flat = ids.reshape(-1).long()
 +        STATE["cnt"][L.idx].index_add_(0, flat.clamp(min=0), (flat >= 0).float())
-+        slot = STATE["tbl"][L.idx][ids.long().clamp(min=0)].to(ids.dtype)
++        ic = ids.long().clamp(min=0)
++        slot = STATE["tbl"][L.idx][ic].to(ids.dtype)
 +        lent = (slot >= 0) & (ids >= 0)
++        if DYN_RES:
++            row = STATE["rtbl"][L.idx][ic].to(ids.dtype)
++            res = (row >= 0) & (ids >= 0)
++            lent = lent & ~res
++            rows = torch.where(res, row, torch.full_like(ids, -1))
 +    else:
 +        k = _k_dev(ids.device)[L.idx]
 +        lent = (ids >= L.n) & (ids < L.n + k)
 +        slot = ids - L.n
-     cpu = dispatch_output._replace(topk_output=topk._replace(
-         topk_ids=torch.where(lent, torch.zeros_like(ids), ids),
-         topk_weights=torch.where(lent, torch.zeros_like(w), w)))
++    if rows is not None:
++        # kt-kernel holds every expert: -1 (skipped) for each route the GPU takes
++        gpu = lent | (rows >= 0)
++        cpu = dispatch_output._replace(topk_output=topk._replace(
++            topk_ids=torch.where(gpu, torch.full_like(ids, -1), ids),
++            topk_weights=torch.where(gpu, torch.zeros_like(w), w)))
++    else:
++        cpu = dispatch_output._replace(topk_output=topk._replace(
++            topk_ids=torch.where(lent, torch.zeros_like(ids), ids),
++            topk_weights=torch.where(lent, torch.zeros_like(w), w)))
      if _MASK_ZERO:
          # a runner that cannot take -1 (Marlin): slot 0 at weight 0, which reads
          # zeros when nothing is lent
@@ -223,8 +425,43 @@ index 8a7aa14962..f064703b1a 100644
 +        sid = torch.where(lent, slot, torch.full_like(ids, -1))
          sw = w
      slots = dispatch_output._replace(topk_output=topk._replace(topk_ids=sid, topk_weights=sw))
-     saved = (ids.clone(), w.clone(), lent) if CHECK else None
-@@ -378,8 +421,9 @@ def check(wrapper, layer, dispatch_output, hot, output) -> None:
+-    saved = (ids.clone(), w.clone(), lent) if CHECK else None
+-    return cpu, slots, saved
++    # (the check's copy; with the resident rows' table it checks the whole layer: lent None)
++    saved = (ids.clone(), w.clone(), lent if rows is None else None) if CHECK else None
++    return cpu, slots, saved, rows
+ 
+ 
+ def check(wrapper, layer, dispatch_output, hot, output) -> None:
+@@ -304,6 +474,27 @@ def check(wrapper, layer, dispatch_output, hot, output) -> None:
+ 
+     ids, w, lent = hot[2]
+     L = wrapper.__dict__["_kt_kv_hot"]
++    if lent is None:
++        # KT_KV_HOT_DYNAMIC_RESIDENT: kt-kernel holds every expert, so the reference is the
++        # CPU with every route; the layer's output, summed over the ranks, against it
++        from sglang.srt.distributed import tensor_model_parallel_all_reduce as ar
++
++        x = dispatch_output.hidden_states
++        topk = dispatch_output.topk_output
++        torch.cuda.synchronize(x.device)
++        ref = torch.zeros_like(output, dtype=torch.float32)
++        if wrapper.tp_rank == 0 and wrapper.wrapper is not None:
++            wrapper.submit(layer, dispatch_output._replace(topk_output=topk._replace(topk_ids=ids, topk_weights=w)))
++            ref = wrapper.sync(x).float().clone()
++            torch.cuda.synchronize(x.device)
++        ref, out = ar(ref.contiguous()), ar(output.float().contiguous())
++        rel = float((out - ref).norm() / ref.norm().clamp(min=1e-30))
++        on = int(((hot[3] >= 0) | (hot[1].topk_output.topk_ids >= 0)).sum()) if hot[1] is not None else 0
++        STATE["checks"] += 1
++        if wrapper.tp_rank == 0:
++            _log(f"check {STATE['checks']}: layer {L.idx}, {x.shape[0]} rows, {on} of {ids.numel()} routes on the "
++                 f"GPU; |out - all on the CPU| / |all on the CPU| = {rel:.3e}")
++        return
+     x = dispatch_output.hidden_states
+     topk = dispatch_output.topk_output
+     cpu_id = ids >= L.n
+@@ -378,8 +569,9 @@ def check(wrapper, layer, dispatch_output, hot, output) -> None:
          # (a slot read through an unmapped or stale chunk differs from its bank)
          STATE["slotdiag"] = STATE.get("slotdiag", 0) + 1
          k = int(_k_dev(x.device)[L.idx])
@@ -236,7 +473,7 @@ index 8a7aa14962..f064703b1a 100644
          _log(f"slot diag rank {wrapper.tp_rank} layer {L.idx} (k {k}, slots vs CPU {rel_slots:.3e}): "
               f"{len(bad)} of {k * len(L.names)} slot tensors differ from their bank: {bad[:16]}")
      if n_lent and rel_slots > 0.5 and STATE.get("diag", 0) < 3:
-@@ -456,6 +500,220 @@ def _plan(budget: int) -> List[int]:
+@@ -456,6 +648,316 @@ def _plan(budget: int) -> List[int]:
      return ks
  
  
@@ -344,6 +581,30 @@ index 8a7aa14962..f064703b1a 100644
 +        _log(f"dynamic slots on: arena experts match the banks ({'gate' if order == 0 else 'up'} rows first), "
 +             f"a round every {DYN_EVERY} forwards, up to {DYN_SWAPS * DYN_EVERY} swaps a layer, "
 +             f"half-life {DYN_HALF_LIFE:g}")
++    if DYN_RES:
++        # the resident rows swap when experts 0, 1 from the arenas match what the rows hold
++        ok, why = 1, ""
++        L = LAYERS[0]
++        if not DYN["on"]:
++            ok, why = 0, "the dynamic slots are off"
++        elif L.res_t is None:
++            ok, why = 0, "the resident tensors are not the packed layout"
++        else:
++            for r in range(min(2, L.n)):
++                dst = {key: torch.empty_like(t[r]) for key, t in L.res_t.items()}
++                _arena_load(L, r, dst, order)
++                torch.cuda.synchronize(dev)
++                bad = {str(key): int((dst[key].view(torch.uint8) != t[r].view(torch.uint8)).sum())
++                       for key, t in L.res_t.items()}
++                if any(bad.values()):
++                    ok, why = 0, f"arena expert {r} differs from resident row {r} (bytes by role): {bad}"
++                    break
++        if os.environ.get("KT_KV_HOT_DYN_RES_SWAP", "1") == "0":
++            # (diagnosis: the CPU holds every expert and route sends it -1, but the rows stay)
++            ok, why = 0, "KT_KV_HOT_DYN_RES_SWAP=0"
++        DYN["res"] = bool(_over_ranks([ok], torch.distributed.ReduceOp.MIN)[0])
++        _log("dynamic resident rows " + ("on: experts 0, 1 from the arenas match their rows" if DYN["res"]
++                                          else f"off: {why or 'another rank could not'}; they hold 0..N-1"))
 +    else:
 +        for M in LAYERS:
 +            M.held = [M.n + j for j in range(M.x)]
@@ -354,6 +615,14 @@ index 8a7aa14962..f064703b1a 100644
 +def _dyn_fill(L: _Layer, k: int) -> None:
 +    """A lend's copy into a layer's k slots: what each held before the window, from
 +    its bank when it is still the placement's expert, else from the arenas."""
++    # an expert held twice (a slot past an earlier lend's k kept its expert while a
++    # round put it in a lower slot, 10-21) takes one slot; the other is left empty
++    seen = set(L.res_held) if DYN.get("res") and L.res_t is not None else set()
++    for j in range(k):
++        if L.held[j] in seen:
++            L.held[j] = -1
++        elif L.held[j] >= 0:
++            seen.add(L.held[j])
 +    for j in range(k):
 +        e = L.held[j]
 +        if e == L.n + j or not DYN["on"]:
@@ -362,16 +631,50 @@ index 8a7aa14962..f064703b1a 100644
 +                L.slots[nm][j].copy_(L.banks[nm][j], non_blocking=True)
 +        elif e >= 0:
 +            _arena_load(L, e, {key: L.slots[nm][j] for key, nm in DYN["roles"][L.idx].items()}, DYN["order"])
++    for j in range(k, L.x):
++        L.held[j] = -1  # unmapped: what it held is gone
++    if DYN.get("res") and L.res_t is not None:
++        # the resident rows back to what they held before the window (res_guard put
++        # 0..N-1 in them for the streamer)
++        for r in range(L.n):
++            if L.res_now[r] != L.res_held[r]:
++                _arena_load(L, L.res_held[r], {key: t[r] for key, t in L.res_t.items()}, DYN["order"])
++                L.res_now[r] = L.res_held[r]
 +
 +
 +def _dyn_table(dev) -> None:
-+    """The slot table from what each lent slot holds."""
++    """The slot table from what each lent slot holds, and the resident rows' table."""
 +    tbl = STATE["tbl"]
 +    tbl.fill_(-1)
 +    rows = [(L.idx, L.held[j], j) for L in LAYERS for j in range(L.k) if L.held[j] >= 0]
 +    if rows:
 +        t = torch.tensor(rows, dtype=torch.int64).to(dev)
 +        tbl[t[:, 0], t[:, 1]] = t[:, 2]
++    if DYN_RES:
++        rtbl = STATE["rtbl"]
++        rtbl.fill_(-1)
++        t = torch.tensor([(L.idx, L.res_now[r], r) for L in LAYERS for r in range(L.n)], dtype=torch.int64).to(dev)
++        rtbl[t[:, 0], t[:, 1]] = t[:, 2]
++
++
++def res_guard() -> None:
++    """The KT wrapper's apply, first thing: in a prefill window the resident rows hold
++    experts 0..N-1 again. The prefill lend reads every layer's weights from its pinned
++    mirror, made at load, and copies the mirror back when decode resumes, so no copy is
++    made here (writing the rows inside a window hits the lent memory: a segfault,
++    10-21); the table says so, and the next lend fills the rows again (_dyn_fill). A
++    round's copies finished before the window paused the weights: its release syncs."""
++    if not DYN_RES or not DYN.get("res") or not _in_window() or torch.cuda.is_current_stream_capturing():
++        return
++    if all(L.res_now == list(range(L.n)) for L in LAYERS):
++        return
++    dev = LAYERS[0].slots[LAYERS[0].names[0][1]].device
++    DYN["pending"] = None
++    rtbl = STATE["rtbl"]
++    rtbl.fill_(-1)
++    for L in LAYERS:
++        L.res_now = list(range(L.n))
++        rtbl[L.idx, : L.n] = torch.arange(L.n, device=dev)
 +
 +
 +def _dyn_round(dev) -> None:
@@ -383,10 +686,14 @@ index 8a7aa14962..f064703b1a 100644
 +        return
 +    cur = torch.cuda.current_stream(dev)
 +    tbl = STATE["tbl"]
++    rtbl = STATE.get("rtbl")
 +    if DYN["pending"] is not None:
 +        cur.wait_event(DYN["ev_copy"])
 +        t = DYN["pending"]
-+        tbl[t[:, 0], t[:, 1]] = t[:, 2]
++        for which, table in ((0, tbl), (1, rtbl)):
++            m = t[:, 3] == which
++            if table is not None:  # (no resident rows' table without KT_KV_HOT_DYNAMIC_RESIDENT)
++                table[t[m, 0], t[m, 1]] = t[m, 2]
 +        DYN["pending"] = None
 +    if DYN["ev_cnt"] is not None:
 +        DYN["ev_cnt"].synchronize()
@@ -394,61 +701,87 @@ index 8a7aa14962..f064703b1a 100644
 +        DYN["scores"] *= 0.5 ** (DYN_EVERY / DYN_HALF_LIFE)
 +        DYN["scores"] += seen
 +        DYN["seen"] = seen if DYN["seen"] is None else DYN["seen"] + seen
++        DYN["last"] = seen
 +    else:
 +        DYN["ev_cnt"] = torch.cuda.Event()
 +    DYN["buf"].copy_(STATE["cnt"], non_blocking=True)
 +    STATE["cnt"].zero_()
 +    DYN["ev_cnt"].record(cur)
 +    DYN["rounds"] += 1
++    if DYN["ev_cnt"] is not None and DYN.get("last") is not None:
++        # this round's routes against what the tables held through it
++        seen, res = DYN["last"], bool(DYN.get("res"))
++        for L in LAYERS:
++            on = [e for e in L.held[: L.k] if e >= 0] + (L.res_now if res else [])
++            DYN["hit"] = DYN.get("hit", 0.0) + float(seen[L.idx, on].sum())
++            DYN["all"] = DYN.get("all", 0.0) + float(seen[L.idx, 0 if res else L.n:].sum())
 +    budget = DYN_SWAPS * DYN_EVERY
-+    swaps = []
++    swaps = []  # (layer, 0: slot / 1: resident row, its index, expert out, expert in)
 +    for L in LAYERS:
 +        k = L.k
 +        if not k:
 +            continue
 +        sc, held = DYN["scores"][L.idx], L.held
-+        hs, changed, n = set(held[:k]), set(), 0
++        # the places a layer's GPU experts sit in: its lent slots, and with the dynamic
++        # resident rows those rows too (one pool: the lowest score anywhere goes)
++        res = bool(DYN.get("res")) and L.res_t is not None
++        places = [(0, j) for j in range(k)] + ([(1, r) for r in range(L.n)] if res else [])
++
++        def has(p):
++            return held[p[1]] if p[0] == 0 else L.res_held[p[1]]
++
++        hs, changed, n = {has(p) for p in places}, set(), 0
 +        for e in np.argsort(-sc, kind="stable").tolist():
 +            if n >= budget or sc[e] <= 0:
 +                break
-+            if e < L.n or e in hs:
++            if (e < L.n and not res) or e in hs:
 +                continue
-+            opts = [j for j in range(k) if j not in changed]
++            opts = [p for p in places if p not in changed]
 +            if not opts:
 +                break
-+            empty = [j for j in opts if held[j] < 0]
++            empty = [p for p in opts if has(p) < 0]
 +            if empty:
-+                j = empty[0]
++                p = empty[0]
 +            else:
-+                j = min(opts, key=lambda i: (sc[held[i]], i))
-+                if not sc[e] > sc[held[j]] * DYN_HYST:
++                p = min(opts, key=lambda q: (sc[has(q)], q))
++                if not sc[e] > sc[has(p)] * DYN_HYST:
 +                    break
-+            swaps.append((L, j, held[j], e))
-+            hs.discard(held[j])
++            old = has(p)
++            swaps.append((L, p[0], p[1], old, e))
++            hs.discard(old)
 +            hs.add(e)
-+            held[j] = e
-+            changed.add(j)
++            if p[0] == 0:
++                held[p[1]] = e
++            else:
++                L.res_held[p[1]] = e
++            changed.add(p)
 +            n += 1
 +    if swaps:
-+        out = [(L.idx, old) for L, _, old, _ in swaps if old >= 0]
-+        if out:
-+            t = torch.tensor(out, dtype=torch.int64).to(dev)
-+            tbl[t[:, 0], t[:, 1]] = -1
++        for which, table in ((0, tbl), (1, rtbl)):
++            out = [(L.idx, old) for L, w, _, old, _ in swaps if w == which and old >= 0]
++            if out and table is not None:
++                t = torch.tensor(out, dtype=torch.int64).to(dev)
++                table[t[:, 0], t[:, 1]] = -1
 +        DYN["ev_unmap"].record(cur)
 +        side = DYN["stream"]
 +        with torch.cuda.stream(side):
 +            side.wait_event(DYN["ev_unmap"])
-+            for L, j, _, e in swaps:
-+                _arena_load(L, e, {key: L.slots[nm][j] for key, nm in DYN["roles"][L.idx].items()}, DYN["order"])
++            for L, w, i, _, e in swaps:
++                if w == 0:
++                    dst = {key: L.slots[nm][i] for key, nm in DYN["roles"][L.idx].items()}
++                else:
++                    dst = {key: t[i] for key, t in L.res_t.items()}
++                    L.res_now[i] = e
++                _arena_load(L, e, dst, DYN["order"])
 +            DYN["ev_copy"].record(side)
-+        DYN["pending"] = torch.tensor([(L.idx, e, j) for L, j, _, e in swaps], dtype=torch.int64).to(dev)
++        DYN["pending"] = torch.tensor([(L.idx, e, i, w) for L, w, i, _, e in swaps], dtype=torch.int64).to(dev)
 +        DYN["swaps"] += len(swaps)
 +    if DYN["rounds"] % DYN_LOG == 0 and DYN["seen"] is not None:
-+        seen = DYN["seen"]
-+        cpu = sum(float(seen[L.idx, L.n:].sum()) for L in LAYERS)
-+        hit = sum(float(seen[L.idx, [e for e in L.held[:L.k] if e >= 0]].sum()) for L in LAYERS)
-+        _log(f"dynamic round {DYN['rounds']}: the slots took {hit / max(cpu, 1):.1%} of the routes past the "
-+             f"resident experts over the last {DYN_LOG} rounds, {DYN['swaps'] - DYN['swaps_logged']} swaps "
++        res = bool(DYN.get("res"))
++        hit, cpu = DYN.pop("hit", 0.0), DYN.pop("all", 0.0)
++        _log(f"dynamic round {DYN['rounds']}: the GPU took {hit / max(cpu, 1):.1%} of the routes"
++             + (" (resident rows and slots)" if res else " past the resident experts")
++             + f" over the last {DYN_LOG} rounds, {DYN['swaps'] - DYN['swaps_logged']} swaps "
 +             f"({(DYN['swaps'] - DYN['swaps_logged']) / (DYN_LOG * DYN_EVERY * max(len(LAYERS), 1)):.3f} "
 +             f"a forward and layer)")
 +        DYN["seen"], DYN["swaps_logged"] = None, DYN["swaps"]
@@ -457,7 +790,7 @@ index 8a7aa14962..f064703b1a 100644
  def _hook() -> None:
      if STATE["hooked"]:
          return
-@@ -473,6 +731,8 @@ def tick(runner) -> None:
+@@ -473,6 +975,8 @@ def tick(runner) -> None:
      from sglang.srt.layers.moe import kt_kv_prefill_lend as m
  
      if m.STATE["lent"] is not None:
@@ -466,7 +799,7 @@ index 8a7aa14962..f064703b1a 100644
          return
      if not STATE["want"]:
          STATE["since"] += 1
-@@ -494,6 +754,12 @@ def tick(runner) -> None:
+@@ -494,6 +998,12 @@ def tick(runner) -> None:
          if free > budget:
              spare, budget = free - budget, free
      ks = _plan(budget)
@@ -479,7 +812,7 @@ index 8a7aa14962..f064703b1a 100644
      for i, (L, k) in enumerate(zip(LAYERS, ks)):
          if k and any(kt_kv_vmm.restore(L.slots[nm], 0, _span(L, nm, k)) < 0 for _, nm in L.names):
              # no memory after all: this layer and the rest get nothing
-@@ -504,11 +770,22 @@ def tick(runner) -> None:
+@@ -504,11 +1014,22 @@ def tick(runner) -> None:
                      kt_kv_vmm.release(M.slots[nm], 0, _span(M, nm, M.x))
              ks = ks[:i] + [0] * (len(LAYERS) - i)
              break
@@ -503,7 +836,7 @@ index 8a7aa14962..f064703b1a 100644
      kd = _k_dev(dev)
      kd.copy_(torch.tensor(ks, dtype=torch.int64), non_blocking=True)
      torch.cuda.synchronize(dev)
-@@ -534,6 +811,11 @@ def release(why: str) -> None:
+@@ -534,6 +1055,11 @@ def release(why: str) -> None:
      dev = LAYERS[0].slots[LAYERS[0].names[0][1]].device
      kd = _k_dev(dev)
      kd.zero_()

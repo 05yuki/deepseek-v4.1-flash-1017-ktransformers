@@ -32,7 +32,7 @@ the code" are on as soon as the patch is applied.
 | 13 | [`13-prefill-lend.patch`](#13-prefill-lend) | +1381 / -2 | none |
 | 14 | [`14-stream-prefill.patch`](#14-stream-prefill) | +1890 / -14 | `loading`, `placement`, `prefill-lend` |
 | 15 | [`15-kv-lend-plan.patch`](#15-kv-lend-plan) | +1736 / -5 | `kv-vmm`, `prefill-lend` |
-| 16 | [`16-hot-lend.patch`](#16-hot-lend) | +316 / -9 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan` |
+| 16 | [`16-hot-lend.patch`](#16-hot-lend) | +582 / -20 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan` |
 
 ## Effect of each patch
 
@@ -74,8 +74,8 @@ after launch pays a one-time warm-up; the second is a new 35,000-token prompt on
 | `gpu-moe-fp32` | 55.3 | 37.2 | 18.4 | 2.62 |
 | `wo-a-fp8` | 56.9 | 38.8 | 18.3 | 3.17 |
 | `kv-vmm`, `kv-lend-plan` | 43.9 | 24.5 | 18.4 | 2.69 |
-| `kv-vmm`, `kv-lend-plan`, `hot-lend` | 44.0 | 24.7 | 18.7 | 2.66 |
-| all sixteen | 41.3 | 21.0 | 45.5 | 4.24 |
+| `kv-vmm`, `kv-lend-plan`, `hot-lend` | 44.4 | 24.8 | 19.2 | 2.66 |
+| all sixteen | 41.5 | 21.0 | 46.2 | 4.24 |
 
 Numerics: the 2-token NLL check gives the base's value for every patch above but four.
 `fp8-decode` and `gpu-moe-fp32` change the GPU arithmetic (see their Numerics lines), and
@@ -392,7 +392,7 @@ Files (under `python/sglang/`):
 
 `KT_KV_HOT_LEND=1`: outside prefill the KV pool's free pages hold up to `KT_KV_HOT_EXTRA` more experts a layer on the GPU, on a shadow layer; their routes go to the GPU and to the CPU at weight 0. The experts leave whenever the pool needs the pages or a prefill starts. `KT_KV_HOT_SPARE_FLOOR_MB` lets the slots also use idle driver memory above the floor. Every rank holds the same slots, the fewest any rank has room for: the CPU runs on rank 0 with its routing.
 
-`KT_KV_HOT_DYNAMIC_SLOTS=1`: the slots follow what is routed. Every routed expert is counted on the GPU; every 8 decode steps, outside the CUDA graph, each layer swaps up to 16 of its slots' experts for ones routed more often (counts halved every 256 steps). An expert that loses leaves the slot table at once and runs on the CPU again; the new one is copied in on a side stream straight from kt-kernel's expert memory (the zero-copy mapping `stream-prefill` registers, no host copy) and enters the table on the next round. At the first lend the slots check that experts copied this way match the placement's, byte for byte, and stay with the placement's experts if not. Without it the slots hold the placement's next-hottest experts, and the placement in `placements/` was recorded on Japanese prose: it catches 3-6% of the routes of code, JSON or math.
+`KT_KV_HOT_DYNAMIC_SLOTS=1`: the slots follow what is routed. Every routed expert is counted on the GPU; every 8 decode steps, outside the CUDA graph, each layer swaps up to 16 of its slots' experts for ones routed more often (counts halved every 256 steps). An expert that loses leaves the slot table at once and runs on the CPU again; the new one is copied in on a side stream straight from kt-kernel's expert memory (the zero-copy mapping `stream-prefill` registers, no host copy) and enters the table on the next round. At the first lend the slots check that experts copied this way match the placement's, byte for byte, and stay with the placement's experts if not. With `KT_KV_HOT_DYNAMIC_RESIDENT=1` the 5 resident experts a layer swap too, from one pool with the slots: kt-kernel then loads every expert, so one that leaves a resident row runs on the CPU, and the route tells kt-kernel which routes the GPU takes. In a prefill window the resident rows hold the placement's five again (the prefill lend reads every layer from its pinned copy), and the next lend fills them again. The route runs as one Triton kernel a layer. Without the dynamic slots the slots hold the placement's next-hottest experts, and the placement in `placements/` was recorded on Japanese prose: it catches 3-6% of the routes of code, JSON or math.
 
 Switches (code / serve.sh):
 
@@ -400,12 +400,14 @@ Switches (code / serve.sh):
 - `KT_KV_HOT_EXTRA`: 0 / 16
 - `KT_KV_HOT_SPARE_FLOOR_MB`: -1 (off) / 1024
 - `KT_KV_HOT_DYNAMIC_SLOTS`: 0 / 1
+- `KT_KV_HOT_DYNAMIC_RESIDENT`: 0 / 1
+- `KT_KV_HOT_ROUTE_TORCH`: 0 (the route as separate torch ops) / unset
 - `KT_KV_HOT_DYN_EVERY, _SWAPS, _HALF_LIFE, _HYST, _LOG`: 8, 2 (a step and layer), 256, 1.0, 512 / unset
 - `KT_KV_HOT_SLOTS_MAX, _RESERVE, _MIN_MB, _RETRY, _MARGIN_MB, _CHECK*`: unset / unset
 
-Numerics: Not bit-identical: the lent experts run in the GPU MoE kernel instead of kt-kernel, and which and how many are lent depends on the free KV pages and on what was routed before, so decode output depends on load and history. With the dynamic slots, every call's slot output against the same routes on the CPU (`KT_KV_HOT_CHECK=16`, 527 calls with lent routes) stayed within 1.6x of the CPU's own bf16 rounding; the paired NLL was 3.1317 against 3.1546 with the placement's slots.
+Numerics: Not bit-identical: the lent experts run in the GPU MoE kernel instead of kt-kernel, and which and how many are lent depends on the free KV pages and on what was routed before, so decode output depends on load and history. With the dynamic slots, every call's slot output against the same routes on the CPU (`KT_KV_HOT_CHECK=16`, 527 calls with lent routes) stayed within 1.6x of the CPU's own bf16 rounding; the paired NLL was 3.1317 against 3.1546 with the placement's slots. With the resident rows swapping too, each eager call's whole output against every route computed on the CPU (602 calls) differed by 4.1e-3 at the median and 5.0e-3 at most, the size of one bf16 rounding; the paired NLL was 3.1503 and 3.1576 against 3.1258 with the slots alone, inside the 3.11-3.16 that launches of the same setup gave on the same day.
 
-Effect: decode 18.4 → 18.7 tok/s on the streamed-prefill set with `kv-vmm` and `kv-lend-plan`, on Japanese prose. The 35K prompt stays where it was (43.9 → 44.0 s first, 24.5 → 24.7 s second, 4 chunks of 9,216 rows in both): the slots give their memory back when a prefill window starts. On text the placement was not recorded on, the dynamic slots against the placement's (all sixteen, `tools/bench.py --other-text`, one launch each): Python code 27.9 → 32.0, JSON 28.2 → 32.8, math 28.1 → 34.7, English technical prose 28.1 → 32.4, English prose 31.8 → 35.4, Chinese prose 34.3 → 38.5 tok/s; Japanese prose 43.7 → 43.8. Code and JSON spread their routes over more experts (a layer's 21 most used take 48-55% of its routes, against 71-75% in Japanese prose), so more slots help them most: `KT_KV_HOT_EXTRA` raises the cap where the GPU has the memory (9.4 MB a slot a layer on each GPU here).
+Effect: decode 18.4 → 19.2 tok/s on the streamed-prefill set with `kv-vmm` and `kv-lend-plan`, on Japanese prose. The 35K prompt stays where it was (43.9 → 44.4 s first, 24.5 → 24.8 s second, 4 chunks of 9,216 rows in both): the slots give their memory back when a prefill window starts. On text the placement was not recorded on (all sixteen, `tools/bench.py --other-text`, one launch each), the placement's slots → dynamic slots → the resident rows swapping too: Python code 27.9 → 32.0 → 33.7, JSON 28.2 → 32.8 → 35.1, math 28.1 → 34.7 → 37.6, English technical prose 28.1 → 32.4 → 33.7, English prose 31.8 → 35.4 → 36.0, Chinese prose 34.3 → 38.5 → 39.1 tok/s; Japanese prose 43.7 → 43.8 → 44.2. Code and JSON spread their routes over more experts (a layer's 21 most used take 48-55% of its routes, against 71-75% in Japanese prose), so more slots help them most: `KT_KV_HOT_EXTRA` raises the cap where the GPU has the memory (9.4 MB a slot a layer on each GPU here).
 
 Prerequisites: `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan`.
 
