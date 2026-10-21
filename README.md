@@ -70,7 +70,8 @@ pages. If the server runs out of memory at launch, a shorter context
     inference, so a 1 TB NVMe drive is the practical choice.
 - **Software.** Linux, bash 4.4 or newer, the CUDA toolkit (built and run with 13.1), git,
   gcc/g++, the libnuma and hwloc headers (`libnuma-dev libhwloc-dev`), and `uv` or Python 3.12.
-  The Python packages are pinned in `requirements.txt` (torch 2.14.1 + cu130).
+  The Python packages are pinned in `requirements.txt` (torch 2.14.1 + cu130): the tested
+  venv's `pip freeze`, kept whole so that a build repeats it, measurement tools included.
 - **Host settings.** Set these as root, persistently:
   - `echo advise > /sys/kernel/mm/transparent_hugepage/shmem_enabled`. The expert
     arenas want 2 MB pages; on 4 KB pages, pinning them takes most of an hour.
@@ -190,7 +191,7 @@ None of it needs a server change:
 
 2 × AMD EPYC 7452 (Zen 2, AVX2), 512 GB DDR4, 2 × RTX 5070 Ti 16 GB, the checkpoint on
 NVMe; built from this repository and run with the `serve.sh` defaults (1M-token context,
-one request at a time), measured with `tools/bench.py`.
+one request at a time), measured with `tools/bench.py` at tag `2026-10-21` (b5ad85e).
 
 Decode, 1,024 tokens a reply (`--other-text` for the rows below the first):
 

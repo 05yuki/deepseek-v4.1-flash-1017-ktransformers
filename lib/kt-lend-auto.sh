@@ -201,51 +201,9 @@ EOF
   fi
 }
 
-# KT_PREFILL_LEND_DYNAMIC=1: the chunk follows the prompt. Every rank's hint
-# file carries points (sequence length, cost per row, free memory) from the
-# full windows of earlier launches; from all of them one table goes to every
-# rank in KT_PREFILL_LEND_TABLE, so the schedulers agree, and the scheduler's
-# chunk sizer (patches/sglang-kt-lend-dynamic-chunk.py) asks kt_lend.table_chunk
-# for each later chunk of a request. The server starts at the table's chunk for
-# a short prefix, at most KT_PREFILL_LEND_DYNAMIC_MAX (the hint by default).
 kt_lend_auto() {
   _kt_lend_auto_core "$@" || return $?
   [[ -n "${!2:-}" ]] || _kt_lend_kv_guard
-  unset KT_PREFILL_LEND_TABLE
-  [[ "${KT_PREFILL_LEND_DYNAMIC:-0}" == 1 && -z "${!2:-}" ]] || return 0
-  local table
-  table="$(python3 - "$KT_PREFILL_LEND_HINT" "$KT_LEND_CHUNK" "${KT_PREFILL_LEND_DYNAMIC_MAX:-}" \
-    "${KT_PREFILL_LEND_MARGIN_MB:-256}" <<'EOF'
-import glob, json, sys
-prefix, chunk, top, margin = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
-best = {}  # bucket -> the costliest point over the ranks
-for f in glob.glob(prefix + "-rank*.json"):
-    for k, p in json.load(open(f)).get("points", {}).items():
-        if k not in best or p["per_row"] > best[k]["per_row"]:
-            best[k] = p
-if best:
-    # no wider than the launch chunk unless asked: a wider chunk needs a wider
-    # SWA cap, which on V4 / MiMo comes out of the KV pool
-    top = int(top) if top else chunk
-    print(json.dumps({"free": min(p["free"] for p in best.values()), "margin": margin << 20,
-                      "max": top, "step": 1024,
-                      "points": [{"seq": p["seq"], "per_row": p["per_row"]} for p in best.values()]}))
-EOF
-)"
-  if [[ -z "$table" ]]; then
-    echo "dynamic chunk: no measured points yet; fixed chunk $KT_LEND_CHUNK" >&2
-    return 0
-  fi
-  export KT_PREFILL_LEND_TABLE="$table"
-  KT_LEND_CHUNK="$(python3 - "${KT_LEND_PY:-$root/patches/kt_lend.py}" <<'EOF'
-import json, os, sys
-src = open(sys.argv[1]).read()
-ns = {"os": os, "Optional": None, "STATE": {}, "MARGIN": 0}
-exec(src[src.index("def table_chunk("):src.index("\ndef before_forward(")], ns)
-print(ns["table_chunk"](0, json.loads(os.environ["KT_PREFILL_LEND_TABLE"])))
-EOF
-)"
-  echo "dynamic chunk: a table of $(python3 -c 'import json, os; print(len(json.loads(os.environ["KT_PREFILL_LEND_TABLE"])["points"]))') points, starting at chunk $KT_LEND_CHUNK" >&2
 }
 
 # The DeepSeek V4 / MiMo SWA pool is full_tokens x ratio and must hold one

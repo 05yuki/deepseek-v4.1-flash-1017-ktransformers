@@ -19,15 +19,12 @@ jobs:
       - name: pinned commits
         run: |
           echo "SGLANG_COMMIT=$(sed -n 's/^SGLANG_COMMIT=\([0-9a-f]*\).*/\1/p' setup.sh)" >> "$GITHUB_ENV"
-          echo "SGLANG_TAG=$(sed -n 's/^SGLANG_TAG=\([^ ]*\).*/\1/p' setup.sh)" >> "$GITHUB_ENV"
           echo "KT_COMMIT=$(sed -n 's/^KT_COMMIT=\([0-9a-f]*\).*/\1/p' setup.sh)" >> "$GITHUB_ENV"
 
       - name: sglang
         run: |
           git init -q sglang && cd sglang
-          git fetch -q --depth 1 https://github.com/sgl-project/sglang.git "$SGLANG_COMMIT" \
-            || { echo "::warning::$SGLANG_COMMIT not fetchable from sgl-project/sglang, using the fork's tag"; \
-                 git fetch -q --depth 1 https://github.com/05yuki/sglang-upstream.git "refs/tags/$SGLANG_TAG"; }
+          git fetch -q --depth 1 https://github.com/sgl-project/sglang.git "$SGLANG_COMMIT"
           git checkout -q FETCH_HEAD
           test "$(git rev-parse HEAD)" = "$SGLANG_COMMIT"
           # tier 0, then each tier-1 feature without prerequisites alone on it

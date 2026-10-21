@@ -30,7 +30,19 @@ A switch marked "on" is on in `serve.sh`.
 ## SGLang tier 0
 
 What 1017 needs to run correctly. Each patch is one concern; its commit message says how
-it was checked.
+it was checked. Four are pull requests to SGLang, one concern each; when one is merged, its
+patch goes and the pin moves past it.
+
+| patch | upstream |
+|---|---|
+| `01-o-fp8-qdq` | [#45185](https://github.com/sgl-project/sglang/pull/45185) |
+| `02-gpu-experts-mask` | [#45183](https://github.com/sgl-project/sglang/pull/45183) |
+| `03-swiglu-clamp` | not sent |
+| `04-mask-zero` | not sent (a workaround for the Marlin MoE path) |
+| `05-zero-gpu-experts` | [#45188](https://github.com/sgl-project/sglang/pull/45188) |
+| `06-load-timeout` | [#45184](https://github.com/sgl-project/sglang/pull/45184) |
+| `07-chat-encoding` | not sent |
+| `08-sm12x-indexer` | not sent |
 
 ### KTransformers wrapper
 
@@ -105,6 +117,8 @@ are for:
 
 `distributed/device_communicators/ll_allreduce.py`,
 `distributed/device_communicators/host_staged_allreduce.py`, `distributed/parallel_state.py`
+
+Upstream: [#39605](https://github.com/sgl-project/sglang/pull/39605) (host-staged all-reduce).
 
 Two GPUs without peer access: small all-reduces (decode) through pinned host memory in NCCL's
 LL form (`SGLANG_LL_ALLREDUCE`), large ones (prefill) staged through pinned host memory with

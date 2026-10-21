@@ -224,7 +224,6 @@ export KT_PREFILL_LEND
 log_name="$(basename "$model")"
 if [[ "$KT_PREFILL_LEND" == 1 ]]; then
   lend_max_chunk="${DSV41_LEND_MAX_CHUNK:-6144}"
-  export KT_PREFILL_LEND_DYNAMIC_MAX="${KT_PREFILL_LEND_DYNAMIC_MAX:-$lend_max_chunk}"
   export KT_PREFILL_LEND_MAX_CHUNK="$lend_max_chunk"
   export KT_PREFILL_LEND_PROBE_CONTEXT="${KT_PREFILL_LEND_PROBE_CONTEXT:-$max_total_tokens}"
   source "$here/lib/kt-lend-auto.sh"
