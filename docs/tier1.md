@@ -30,9 +30,9 @@ the code" are on as soon as the patch is applied.
 | 11 | [`11-placement.patch`](#11-placement) | +68 / -0 | none |
 | 12 | [`12-kv-vmm.patch`](#12-kv-vmm) | +243 / -0 | none |
 | 13 | [`13-prefill-lend.patch`](#13-prefill-lend) | +1381 / -2 | none |
-| 14 | [`14-stream-prefill.patch`](#14-stream-prefill) | +1890 / -14 | `loading`, `placement`, `prefill-lend` |
+| 14 | [`14-stream-prefill.patch`](#14-stream-prefill) | +2045 / -14 | `loading`, `placement`, `prefill-lend` |
 | 15 | [`15-kv-lend-plan.patch`](#15-kv-lend-plan) | +1736 / -5 | `kv-vmm`, `prefill-lend` |
-| 16 | [`16-hot-lend.patch`](#16-hot-lend) | +582 / -20 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan` |
+| 16 | [`16-hot-lend.patch`](#16-hot-lend) | +664 / -32 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan` |
 
 ## Effect of each patch
 
@@ -337,6 +337,8 @@ Files (under `python/sglang/`):
 
 `KT_GPU_STREAM_PREFILL=<tokens>`: above that many tokens the CPU experts are not computed by kt-kernel; their weights are copied to the GPU in groups and computed there, the copy of the next group overlapping the compute of the current one (`kt_stream_prefill.py`). `KT_GPU_STREAM_W16=1` dequantizes each group to bf16 and runs FlashInfer's bf16 CUTLASS MoE (SM89+); otherwise the SM120 MXFP8 x MXFP4 kernel. `KT_GPU_STREAM_ZEROCOPY` reads kt-kernel's shared expert memory directly and `KT_GPU_STREAM_GRAPH` launches each group as one CUDA graph. One CUTLASS MoE workspace per GPU is preallocated before the decode graphs are captured, for the resident experts as well (this part is always on), and `KT_GPU_STREAM_ROW_BLOCK` splits long chunks into row blocks. Under the prefill lend the graphs' shared input and output buffers grow in steps of `KT_STREAM_GIN_STEP` rows as chunks get larger, instead of being sized for the plan's cap at once. Also: early streamer init, CPU groups (`KT_STREAM_CPU_GROUPS`), a reference check (`KT_HOT_CHECK`), and comment updates in the wrapper. With SGLang main's decoder bounded replay, the layers from the replay's start run over each chunk's last 128 rows only; below the threshold those calls stay on the CPU, which is faster than streaming them (`KT_GPU_STREAM_IN_WINDOW=1` streams every call of a streamed forward, for comparison).
 
+With GPUs and kt-kernel's NUMA parts that differ in number (one GPU on two sockets, two GPUs on one socket, NPS2 or NPS4 nodes), each rank reads every part its rows of the intermediate size sit in. Checked on one GPU with two parts: an 11,769-token document read and summarised correctly, and the 35K prompt at 210 tok/s; four parts on two GPUs read correctly too.
+
 Switches (code / serve.sh):
 
 - `KT_GPU_STREAM_PREFILL`: 0 (off) / 512
@@ -390,20 +392,21 @@ Files (under `python/sglang/`):
 
 ## 16 hot-lend
 
-`KT_KV_HOT_LEND=1`: outside prefill the KV pool's free pages hold up to `KT_KV_HOT_EXTRA` more experts a layer on the GPU, on a shadow layer; their routes go to the GPU and to the CPU at weight 0. The experts leave whenever the pool needs the pages or a prefill starts. `KT_KV_HOT_SPARE_FLOOR_MB` lets the slots also use idle driver memory above the floor. Every rank holds the same slots, the fewest any rank has room for: the CPU runs on rank 0 with its routing.
+`KT_KV_HOT_LEND=1`: outside prefill the KV pool's free pages hold up to `KT_KV_HOT_EXTRA` more experts a layer on the GPU, on a shadow layer; their routes go to the GPU and to the CPU at weight 0. The experts leave whenever the pool needs the pages or a prefill starts. `KT_KV_HOT_SPARE_FLOOR_MB` lets the slots also use idle driver memory above the floor. `KT_KV_HOT_EXTRA=auto` (serve.sh) gives a layer a slot for every non-resident expert in address space only, so how many hold memory follows the free memory at each lend (on two 16 GB cards 14-15 a layer with one resident expert). `KT_KV_HOT_RESERVE` keeps free KV pages back for 65,536 tokens: a new request's pages come from them, instead of every slot being handed back and loaded again for each request. Every rank holds the same slots, the fewest any rank has room for: the CPU runs on rank 0 with its routing.
 
-`KT_KV_HOT_DYNAMIC_SLOTS=1`: the slots follow what is routed. Every routed expert is counted on the GPU; every 8 decode steps, outside the CUDA graph, each layer swaps up to 16 of its slots' experts for ones routed more often (counts halved every 256 steps). An expert that loses leaves the slot table at once and runs on the CPU again; the new one is copied in on a side stream straight from kt-kernel's expert memory (the zero-copy mapping `stream-prefill` registers, no host copy) and enters the table on the next round. At the first lend the slots check that experts copied this way match the placement's, byte for byte, and stay with the placement's experts if not. With `KT_KV_HOT_DYNAMIC_RESIDENT=1` the 5 resident experts a layer swap too, from one pool with the slots: kt-kernel then loads every expert, so one that leaves a resident row runs on the CPU, and the route tells kt-kernel which routes the GPU takes. In a prefill window the resident rows hold the placement's five again (the prefill lend reads every layer from its pinned copy), and the next lend fills them again. The route runs as one Triton kernel a layer. Without the dynamic slots the slots hold the placement's next-hottest experts, and the placement in `placements/` was recorded on Japanese prose: it catches 3-6% of the routes of code, JSON or math.
+`KT_KV_HOT_DYNAMIC_SLOTS=1`: the slots follow what is routed. Every routed expert is counted on the GPU; every 8 decode steps, outside the CUDA graph, each layer swaps up to 16 of its slots' experts for ones routed more often (counts halved every 256 steps). An expert that loses leaves the slot table at once and runs on the CPU again; the new one is copied in on a side stream straight from kt-kernel's expert memory (the zero-copy mapping `stream-prefill` registers, no host copy) and enters the table on the next round. At the first lend the slots check that experts copied this way match the placement's, byte for byte, and stay with the placement's experts if not. With `KT_KV_HOT_DYNAMIC_RESIDENT=1` the resident experts swap too, from one pool with the slots: kt-kernel then loads every expert, so one that leaves a resident row runs on the CPU, and the route tells kt-kernel which routes the GPU takes. In a prefill window the resident rows hold the placement's first experts again (the prefill lend reads every layer from its pinned copy), and the next lend fills them again. The route runs as one Triton kernel a layer. Without the dynamic slots the slots hold the placement's next-hottest experts, and the placement in `placements/` was recorded on Japanese prose: it catches 3-6% of the routes of code, JSON or math.
 
 Switches (code / serve.sh):
 
 - `KT_KV_HOT_LEND`: 0 / 1 (lib/kt-kv-hot-default.sh)
-- `KT_KV_HOT_EXTRA`: 0 / 16
+- `KT_KV_HOT_EXTRA`: 0 / auto (a slot for every non-resident expert, address space only)
+- `KT_KV_HOT_RESERVE`: 4096 / 65536 (tokens of free KV pages kept back)
 - `KT_KV_HOT_SPARE_FLOOR_MB`: -1 (off) / 1024
 - `KT_KV_HOT_DYNAMIC_SLOTS`: 0 / 1
 - `KT_KV_HOT_DYNAMIC_RESIDENT`: 0 / 1
 - `KT_KV_HOT_ROUTE_TORCH`: 0 (the route as separate torch ops) / unset
 - `KT_KV_HOT_DYN_EVERY, _SWAPS, _HALF_LIFE, _HYST, _LOG`: 8, 2 (a step and layer), 256, 1.0, 512 / unset
-- `KT_KV_HOT_SLOTS_MAX, _RESERVE, _MIN_MB, _RETRY, _MARGIN_MB, _CHECK*`: unset / unset
+- `KT_KV_HOT_SLOTS_MAX, _MIN_MB, _RETRY, _MARGIN_MB, _CHECK*`: unset / unset
 
 Numerics: Not bit-identical: the lent experts run in the GPU MoE kernel instead of kt-kernel, and which and how many are lent depends on the free KV pages and on what was routed before, so decode output depends on load and history. With the dynamic slots, every call's slot output against the same routes on the CPU (`KT_KV_HOT_CHECK=16`, 527 calls with lent routes) stayed within 1.6x of the CPU's own bf16 rounding; the paired NLL was 3.1317 against 3.1546 with the placement's slots. With the resident rows swapping too, each eager call's whole output against every route computed on the CPU (602 calls) differed by 4.1e-3 at the median and 5.0e-3 at most, the size of one bf16 rounding; the paired NLL was 3.1503 and 3.1576 against 3.1258 with the slots alone, inside the 3.11-3.16 that launches of the same setup gave on the same day.
 

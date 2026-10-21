@@ -59,6 +59,12 @@ fi
 n_gpus="${#gpus[@]}"
 tp="${KT_TP:-$n_gpus}"
 cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i "${gpus[0]}" | head -1)"
+# DeepSeek-V4's attention in this SGLang is written for SM90 and newer: older GPUs stop at
+# the first forward, after minutes of loading
+if [[ "${cap%%.*}" =~ ^[0-9]+$ ]] && (( ${cap%%.*} < 9 )); then
+  echo "GPU ${gpus[0]} is compute capability $cap: DeepSeek-V4's attention needs 9.0 or newer (H100, B200, RTX 50, RTX PRO Blackwell)" >&2
+  exit 3
+fi
 n_nodes="$(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l)"
 (( n_nodes > 0 )) || n_nodes=1
 phys_cores="$(lscpu -p=CORE,SOCKET 2>/dev/null | grep -v '^#' | sort -u | wc -l)"
@@ -70,9 +76,10 @@ for ((r = 0; r < tp; r++)); do numa_list+="$(( r * n_nodes / tp )) "; done
 # --- model and memory -------------------------------------------------------
 context_length="${SGLANG_CONTEXT_LENGTH:-1048576}"
 max_total_tokens="${SGLANG_MAX_TOTAL_TOKENS:-$context_length}"
-# experts kept on each GPU per layer, the hottest by a routing recording
-# (placements/); 5 leaves a 16 GB card room for the 1M-token KV pool
-gpu_experts="${KT_GPU_EXPERTS:-5}"
+# experts that always stay on each GPU per layer: one; the hot lend fills the GPU's free
+# memory with more, swapped for what the text routes to (more here only takes memory the
+# lend would use, and must fit at load)
+gpu_experts="${KT_GPU_EXPERTS:-1}"
 cpu_threads="${KT_CPU_THREADS:-$phys_cores}"
 threadpools="${KT_THREADPOOL_COUNT:-$n_nodes}"
 deferred_experts="${KT_DEFERRED_EXPERTS:-0}"  # >0 drops expert work for speed; it hurts the text
@@ -108,19 +115,23 @@ export SGLANG_FP8_GEMV="${SGLANG_FP8_GEMV:-1}"
 export SGLANG_DSV41_ENGRAM_PREFETCH_ROWS="${SGLANG_DSV41_ENGRAM_PREFETCH_ROWS:-1}"
 
 if has hot-lend; then
-  # hot experts: the resident ones, and with the hot lend 16 more a layer in the KV
-  # pool's free pages outside prefill (KT_KV_HOT_LEND=0 turns it off)
+  # hot experts: the resident ones, and with the hot lend as many more as the KV pool's free
+  # pages and the driver's idle memory hold outside prefill (KT_KV_HOT_EXTRA=<n> caps them a
+  # layer; KT_KV_HOT_LEND=0 turns it off)
   source "$here/lib/kt-kv-hot-default.sh"
-  kt_kv_hot_default "$here/placements/dsv41-expert-placement-hot64.json" 5 "$gpu_experts" 16 "$source_dir" swa
+  kt_kv_hot_default "$here/placements/dsv41-expert-placement-hot64.json" 5 "$gpu_experts" auto "$source_dir" swa
   # in decode the hot lend's slots also take the driver's idle memory above a 1 GiB floor
   # (-1: only the KV pool's free pages)
   export KT_KV_HOT_SPARE_FLOOR_MB="${KT_KV_HOT_SPARE_FLOOR_MB:-1024}"
+  # free KV pages kept back for 65,536 tokens: a new request's pages come from them, so the
+  # slots are not all handed back (and loaded again) for each request (4,096 did that)
+  export KT_KV_HOT_RESERVE="${KT_KV_HOT_RESERVE:-65536}"
   # the slots follow what is routed: every 8 decode steps each layer swaps experts that
   # lose for ones that are routed more, copied from kt-kernel's expert memory (0: the
   # placement's next-hottest experts, recorded on Japanese prose)
   export KT_KV_HOT_DYNAMIC_SLOTS="${KT_KV_HOT_DYNAMIC_SLOTS:-1}"
-  # the 5 resident experts a layer swap too, from the same pool (kt-kernel then loads
-  # every expert, about 4 GB more RAM; 0: the placement's five stay)
+  # the resident experts swap too, from the same pool (kt-kernel then loads every expert;
+  # 0: the placement's first ones stay)
   export KT_KV_HOT_DYNAMIC_RESIDENT="${KT_KV_HOT_DYNAMIC_RESIDENT:-1}"
 else
   export KT_KV_HOT_LEND=0
@@ -131,7 +142,8 @@ else
   fi
 fi
 if has placement; then
-  placement="${KT_EXPERT_PLACEMENT:-${KT_KV_HOT_PLACEMENT:-$here/placements/dsv41-expert-placement-${gpu_experts}.json}}"
+  # the experts hottest first: any resident count takes the first ones
+  placement="${KT_EXPERT_PLACEMENT:-${KT_KV_HOT_PLACEMENT:-$here/placements/dsv41-expert-placement-hot64.json}}"
 else
   # without the placement feature the wrapper keeps experts 0..N-1 on the GPU
   placement=none
@@ -142,7 +154,7 @@ if [[ "$placement" != "none" && -f "$placement" ]]; then
   extra_args+=(--init-expert-location "$placement")
 elif [[ "$placement" != "none" ]]; then
   echo "WARNING: no placement $placement: the $gpu_experts GPU experts a layer are experts 0..$((gpu_experts - 1)), not the hottest" >&2
-  echo "         (placements/ has 5; record your own with KT_ROUTING_DUMP, or KT_EXPERT_PLACEMENT=none)" >&2
+  echo "         (record your own with KT_ROUTING_DUMP, or KT_EXPERT_PLACEMENT=none)" >&2
 fi
 # the resident experts through Marlin (W4A16, matches the checkpoint)
 if [[ "$gpu_experts" != "0" && "${KT_HOT_BACKEND:-marlin}" == "marlin" ]]; then

@@ -1,4 +1,4 @@
-From b750e8ae03ae0150a29ed95031cacafa68a3f9f0 Mon Sep 17 00:00:00 2001
+From d9ef4451e4ac76c2dcfa57d87934cd97caab94c2 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 1] stream-prefill: stream the CPU experts to the GPU
@@ -18,6 +18,13 @@ is always on), and `KT_GPU_STREAM_ROW_BLOCK` splits long chunks into row
 blocks. Also: early streamer init, CPU groups (`KT_STREAM_CPU_GROUPS`),
 a reference check (`KT_HOT_CHECK`), and comment updates in the wrapper.
 
+ZEROCOPY with GPUs and kt-kernel NUMA parts that differ in number (one
+GPU and two sockets, two GPUs and one socket, NPS2/NPS4 nodes): each rank
+reads every part its rows of the intermediate size sit in, and the W16
+dequant writes them in place (rows for gate/up, columns for down). Before,
+a rank read one part only: one GPU on two sockets ran out of bounds, and
+two GPUs on one socket would both have read the first half.
+
 Numerics: Not bit-identical when on: the streamed CPU experts run on the
 GPU (W16: bf16 rounding instead of kt-kernel's; the MXFP8 mode has a
 larger error). The shared workspace changes memory only. ZEROCOPY needs
@@ -29,10 +36,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
  python/sglang/srt/layers/moe/kt_ep_wrapper.py |   83 +-
- .../srt/layers/moe/kt_stream_prefill.py       | 1661 +++++++++++++++++
+ .../srt/layers/moe/kt_stream_prefill.py       | 1744 +++++++++++++++++
  .../moe/moe_runner/flashinfer_cutlass.py      |  191 ++
  .../mxfp4_flashinfer_cutlass_moe.py           |   41 +
- 4 files changed, 1962 insertions(+), 14 deletions(-)
+ 4 files changed, 2045 insertions(+), 14 deletions(-)
  create mode 100644 python/sglang/srt/layers/moe/kt_stream_prefill.py
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
@@ -195,10 +202,10 @@ index 5aef8bf7ac..a088c8c0e0 100644
  
 diff --git a/python/sglang/srt/layers/moe/kt_stream_prefill.py b/python/sglang/srt/layers/moe/kt_stream_prefill.py
 new file mode 100644
-index 0000000000..659b924428
+index 0000000000..77fc0f4252
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_stream_prefill.py
-@@ -0,0 +1,1661 @@
+@@ -0,0 +1,1744 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""GPU-streamed prefill for the KT EP wrapper: expert groups over PCIe.
 +
@@ -397,36 +404,56 @@ index 0000000000..659b924428
 +@triton.jit
 +def _mxfp4_dequant_kernel(
 +    packed_ptr, scale_ptr, out_ptr,
-+    n_elems, packed_stride, scale_stride, out_stride,
++    n_elems, cols, packed_stride, scale_stride, out_stride, in_rs, s_rs, col_off, out_rs,
 +    BLOCK: tl.constexpr,
 +):
 +    """One expert per program_id(1); BLOCK output elements per program_id(0).
-+    packed: e2m1 pairs, low nibble first; scale: fp32 per 32 elements
-+    (kt-kernel's storage); out: bf16."""
++    packed: e2m1 pairs, low nibble first, in_rs bytes a row; scale: fp32 per 32
++    elements (kt-kernel's storage), s_rs a row; columns from col_off (even, a
++    multiple of 32 for the scales); out: bf16, out_rs a row."""
 +    e = tl.program_id(1)
 +    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
 +    m = offs < n_elems
-+    byte = tl.load(packed_ptr + e * packed_stride + offs // 2, mask=m, other=0).to(tl.int32)
-+    nib = (byte >> ((offs % 2) * 4)) & 0xF
++    row = offs // cols
++    col = offs % cols + col_off
++    byte = tl.load(packed_ptr + e * packed_stride + row * in_rs + col // 2, mask=m, other=0).to(tl.int32)
++    nib = (byte >> ((col % 2) * 4)) & 0xF
 +    sign = tl.where((nib & 8) != 0, -1.0, 1.0)
 +    ex = (nib >> 1) & 3
 +    man = (nib & 1).to(tl.float32)
 +    mag = tl.where(ex == 0, man * 0.5, (1.0 + man * 0.5) * tl.exp2((ex - 1).to(tl.float32)))
-+    sc = tl.load(scale_ptr + e * scale_stride + offs // 32, mask=m, other=0.0)
-+    tl.store(out_ptr + e * out_stride + offs, (sign * mag * sc).to(tl.bfloat16), mask=m)
++    sc = tl.load(scale_ptr + e * scale_stride + row * s_rs + col // 32, mask=m, other=0.0)
++    tl.store(out_ptr + e * out_stride + row * out_rs + (col - col_off), (sign * mag * sc).to(tl.bfloat16), mask=m)
 +
 +
 +def _mxfp4_dequant(packed: torch.Tensor, packed_stride: int, scales_f32: torch.Tensor,
-+                   scale_stride: int, out: torch.Tensor, n: int, rows: int, cols: int):
++                   scale_stride: int, out: torch.Tensor, n: int, rows: int, cols: int,
++                   in_cols: int = 0, col_off: int = 0):
 +    """packed/scales are the raw slot tensors (expert-major, given strides in
-+    bytes / floats); out [n, rows, cols] bf16 contiguous."""
++    bytes / floats), rows of in_cols elements (cols when 0) of which columns
++    col_off.. are taken; out [n, rows, cols] bf16, its rows at any stride."""
++    in_cols = in_cols or cols
 +    n_elems = rows * cols
-+    assert out.stride(1) == cols and out.stride(2) == 1, "dequant target rows must be contiguous"
++    assert out.stride(2) == 1, "dequant target columns must be contiguous"
 +    BLOCK = 4096
 +    grid = (triton.cdiv(n_elems, BLOCK), n)
 +    _mxfp4_dequant_kernel[grid](
-+        packed, scales_f32, out, n_elems, packed_stride, scale_stride, out.stride(0), BLOCK=BLOCK
++        packed, scales_f32, out, n_elems, cols, packed_stride, scale_stride, out.stride(0),
++        in_cols // 2, in_cols // 32, col_off, out.stride(1), BLOCK=BLOCK
 +    )
++
++
++def _rank_segments(rank: int, world: int, parts: int, inter: int):
++    """[(part, first row in the part, rows, first row in the rank's slice, rows a part)] for
++    rank's rows rank*N..(rank+1)*N of the intermediate size, N = inter / world, that
++    kt-kernel keeps in parts of inter / parts rows each."""
++    n, m = inter // world, inter // parts
++    out = []
++    for p in range(parts):
++        lo, hi = max(rank * n, p * m), min((rank + 1) * n, (p + 1) * m)
++        if lo < hi:
++            out.append((p, lo - p * m, hi - lo, lo - rank * n, m))
++    return out
 +
 +
 +def _open_shm(name: str, timeout_s: float = 600.0) -> shared_memory.SharedMemory:
@@ -629,6 +656,9 @@ index 0000000000..659b924428
 +        # Zero-copy: per layer the three host arena tensors of this rank's
 +        # part, and one DMA graph per (layer, group).
 +        self._arenas = {}
++        self._arena_parts = {}  # layer_idx -> the parts' arenas (see _map_expert_arenas)
++        self._segs = [(0, 0, self.N, 0, self.N)]
++        self._seg_whole = True
 +        # The SGLang runner wrapper around cutlass_fused_moe costs ~11 ms of
 +        # host time per call in the server (symmetric-memory output
 +        # allocation and the FusedOpPool dispatch); the kernel itself is
@@ -687,10 +717,12 @@ index 0000000000..659b924428
 +        from sglang.srt.layers.moe.kt_ep_wrapper import KT_LAYERS
 +
 +        sock_path = f"/tmp/kt_stream_{os.getppid()}_r{self.rank}.sock"
-+        infos = {}  # layer_idx -> [(fd, size, stride) x 3]
++        infos = {}  # layer_idx -> the parts this rank reads, each [(fd, size, stride) x 6]
 +        fd_objs = []
++        segs = None
 +        if self.rank == 0:
 +            per_rank = {r: {} for r in range(self.world)}
++            seg_of = {}
 +            for layer_idx, m in sorted(KT_LAYERS.items()):
 +                parts = m.wrapper.moe.expert_arena_infos()
 +                if not parts or len(parts[0]) != 6:
@@ -699,13 +731,17 @@ index 0000000000..659b924428
 +                        f"(got {0 if not parts else len(parts[0])} arenas per part, want 6)")
 +                cpu_tp = len(parts)
 +                for r in range(self.world):
-+                    # Same part -> rank mapping as write_weights_to_buffer.
-+                    part = r * cpu_tp // self.world if cpu_tp >= self.world else r // (self.world // cpu_tp)
-+                    per_rank[r][layer_idx] = parts[part]
++                    # kt-kernel splits the intermediate size evenly over its NUMA parts, and
++                    # this rank's experts are rows r*N..(r+1)*N of it: the parts that hold
++                    # them (one GPU and two parts: both halves; two GPUs and one part: a half
++                    # of it each; 10-21, both read part 0 alone before)
++                    seg_of[r] = _rank_segments(r, self.world, cpu_tp, self.N * self.world)
++                    per_rank[r][layer_idx] = [parts[p] for p, _, _, _, _ in seg_of[r]]
 +            infos = per_rank[0]
++            segs = seg_of[0]
 +            if COLLAPSE:
 +                _collapse_arenas([(fd, sz) for r in per_rank for l in per_rank[r]
-+                                  for (fd, sz, _) in per_rank[r][l]])
++                                  for part in per_rank[r][l] for (fd, sz, _) in part])
 +            for r in range(1, self.world):
 +                path = f"/tmp/kt_stream_{os.getppid()}_r{r}.sock"
 +                t0 = time.time()
@@ -720,9 +756,10 @@ index 0000000000..659b924428
 +                            raise
 +                        time.sleep(0.05)
 +                layers = sorted(per_rank[r])
-+                fds = [fd for l in layers for (fd, _, _) in per_rank[r][l]]
-+                meta = repr([(l, [(sz, st) for (_, sz, st) in per_rank[r][l]]) for l in layers]).encode()
-+                assert all(len(per_rank[r][l]) == 6 for l in layers)
++                fds = [fd for l in layers for part in per_rank[r][l] for (fd, _, _) in part]
++                meta = repr((seg_of[r], [(l, [[(sz, st) for (_, sz, st) in part] for part in per_rank[r][l]])
++                                         for l in layers])).encode()
++                assert all(len(part) == 6 for l in layers for part in per_rank[r][l])
 +                c.sendall(len(meta).to_bytes(8, "little"))
 +                c.sendall(meta)
 +                # SCM_RIGHTS in chunks (kernel limit ~253 fds per message).
@@ -743,8 +780,8 @@ index 0000000000..659b924428
 +            buf = b""
 +            while len(buf) < n:
 +                buf += c.recv(n - len(buf))
-+            meta = eval(buf.decode())  # our own repr of ints
-+            nfds = sum(len(v) for _, v in meta)
++            segs, meta = eval(buf.decode())  # our own repr of ints
++            nfds = sum(len(part) for _, v in meta for part in v)
 +            fds = []
 +            while len(fds) < nfds:
 +                _, got, _, _ = socket.recv_fds(c, 1, 200)
@@ -754,19 +791,32 @@ index 0000000000..659b924428
 +            srv.close()
 +            os.unlink(sock_path)
 +            i = 0
-+            for layer_idx, sizes in meta:
-+                infos[layer_idx] = [(fds[i + j], sizes[j][0], sizes[j][1]) for j in range(6)]
-+                i += 6
++            for layer_idx, parts in meta:
++                infos[layer_idx] = []
++                for sizes in parts:
++                    infos[layer_idx].append([(fds[i + j], sizes[j][0], sizes[j][1]) for j in range(6)])
++                    i += 6
++        # (part index, first row in it, rows, first row in this rank's slice, the part's rows)
++        self._segs = segs
++        self._seg_whole = (len(segs) == 1 and segs[0][1] == 0 and segs[0][2] == self.N and segs[0][4] == self.N)
++        if not self._seg_whole and not W16:
++            raise RuntimeError(f"KT_GPU_STREAM_ZEROCOPY: rank {self.rank} reads kt-kernel parts {segs} "
++                               "(GPUs and NUMA parts differ in number); that needs KT_GPU_STREAM_W16=1")
 +        # mmap every arena now (cheap); cudaHostRegister (~4-5 GB/s, 4.2 GB
 +        # per layer per rank) happens on a layer's first streamed group, so
 +        # only the layers that actually stream get pinned.
-+        for layer_idx, arenas in sorted(infos.items()):
-+            tensors = []
-+            for (fd, size, stride) in arenas:
-+                mm = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
-+                t = torch.frombuffer(mm, dtype=torch.uint8)
-+                tensors.append((t, stride, mm))
-+            self._arenas[layer_idx] = tensors
++        for layer_idx, parts in sorted(infos.items()):
++            per_part = []
++            for arenas in parts:
++                tensors = []
++                for (fd, size, stride) in arenas:
++                    mm = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
++                    t = torch.frombuffer(mm, dtype=torch.uint8)
++                    tensors.append((t, stride, mm))
++                per_part.append(tensors)
++            # _arenas: the first part (all of this rank's rows when the parts and the GPUs match)
++            self._arena_parts[layer_idx] = per_part
++            self._arenas[layer_idx] = per_part[0]
 +        self._registered = set()
 +        _log(f"rank {self.rank}: mapped {len(infos)} layers of expert arenas")
 +        if self.rank == 0 and os.environ.get("KT_GPU_STREAM_SELFTEST") == "1":
@@ -850,7 +900,7 @@ index 0000000000..659b924428
 +            fcntl.flock(lock, fcntl.LOCK_EX)
 +        t1 = time.time()
 +        try:
-+            for (t, _, _) in self._arenas[layer_idx]:
++            for (t, _, _) in [a for part in self._arena_parts.get(layer_idx, [self._arenas[layer_idx]]) for a in part]:
 +                rc = torch.cuda.cudart().cudaHostRegister(t.data_ptr(), t.numel(), 0)
 +                if int(rc) != 0:
 +                    raise RuntimeError(f"cudaHostRegister(expert arena, layer {layer_idx}) failed: {int(rc)}")
@@ -870,6 +920,9 @@ index 0000000000..659b924428
 +        slot = self.slots[gi % 2]
 +        n = len(experts)
 +        base = experts[0]
++        if not self._seg_whole:
++            self._stage_zc_parts(layer_idx, slot, base, n, stats)
++            return
 +        arenas = self._arenas[layer_idx]  # gate_w, up_w, down_w, gate_s, up_s, down_s
 +        if slot.raw is None:
 +            wstride = arenas[0][1]
@@ -891,6 +944,31 @@ index 0000000000..659b924428
 +                slot.raw[pi, :n].view(-1).copy_(arenas[pi][0][base * wstride:(base + n) * wstride], non_blocking=True)
 +                slot.raw_s[pi, :n].view(-1).copy_(
 +                    arenas[3 + pi][0][base * sstride:(base + n) * sstride], non_blocking=True)
++            slot.dma_done.record(self.transfer_stream)
++        stats["dma_enq"] += time.perf_counter() - t0
++
++    def _stage_zc_parts(self, layer_idx: int, slot, base: int, n: int, stats):
++        """_stage_zc when this rank's rows sit in other than one whole kt-kernel part: each
++        part's blocks into a landing of its own (slot.raws / slot.raw_ss)."""
++        parts = self._arena_parts[layer_idx]
++        if getattr(slot, "raws", None) is None:
++            from sglang.srt.layers.moe import kt_lend
++
++            slot.raws, slot.raw_ss = [], []
++            with kt_lend.scratch_region():
++                for arenas in parts:
++                    slot.raws.append(torch.empty((3, self.G, arenas[0][1]), dtype=torch.uint8, device=self.device))
++                    slot.raw_ss.append(torch.empty((3, self.G, arenas[3][1]), dtype=torch.uint8, device=self.device))
++            slot.raw, slot.raw_s = slot.raws[0], slot.raw_ss[0]
++        t0 = time.perf_counter()
++        with torch.cuda.stream(self.transfer_stream):
++            if slot.compute_used:
++                self.transfer_stream.wait_event(slot.compute_done)
++            for arenas, raw, raw_s in zip(parts, slot.raws, slot.raw_ss):
++                ws, ss = raw.shape[2], raw_s.shape[2]
++                for pi in range(3):
++                    raw[pi, :n].view(-1).copy_(arenas[pi][0][base * ws:(base + n) * ws], non_blocking=True)
++                    raw_s[pi, :n].view(-1).copy_(arenas[3 + pi][0][base * ss:(base + n) * ss], non_blocking=True)
 +            slot.dma_done.record(self.transfer_stream)
 +        stats["dma_enq"] += time.perf_counter() - t0
 +
@@ -1117,12 +1195,24 @@ index 0000000000..659b924428
 +            sstride_f = slot.raw_s.shape[2] // 4
 +            raw_s_f = slot.raw_s.view(torch.float32)
 +            # CUTLASS fc1 rows are [up; gate]: up into rows :N, gate into N:.
-+            _mxfp4_dequant(slot.raw[1], wstride, raw_s_f[1], sstride_f,
-+                           self.w13_bf16[:n, :N], n, N, K)
-+            _mxfp4_dequant(slot.raw[0], wstride, raw_s_f[0], sstride_f,
-+                           self.w13_bf16[:n, N:], n, N, K)
-+            _mxfp4_dequant(slot.raw[2], wstride, raw_s_f[2], sstride_f,
-+                           self.w2_bf16[:n], n, K, N)
++            if self._seg_whole:
++                _mxfp4_dequant(slot.raw[1], wstride, raw_s_f[1], sstride_f,
++                               self.w13_bf16[:n, :N], n, N, K)
++                _mxfp4_dequant(slot.raw[0], wstride, raw_s_f[0], sstride_f,
++                               self.w13_bf16[:n, N:], n, N, K)
++                _mxfp4_dequant(slot.raw[2], wstride, raw_s_f[2], sstride_f,
++                               self.w2_bf16[:n], n, K, N)
++            else:
++                # each part's rows lo..lo+c (gate, up) and columns lo..lo+c (down, rows of
++                # m) into this rank's rows d..d+c
++                for (_, lo, c, d, m), raw, raw_s in zip(self._segs, slot.raws, slot.raw_ss):
++                    ws, ssf = raw.shape[2], raw_s.shape[2] // 4
++                    rs = raw_s.view(torch.float32)
++                    for pi, row0 in ((1, 0), (0, N)):
++                        _mxfp4_dequant(raw[pi][:, lo * K // 2:], ws, rs[pi][:, lo * (K // 32):], ssf,
++                                       self.w13_bf16[:n, row0 + d:row0 + d + c], n, c, K)
++                    _mxfp4_dequant(raw[2], ws, rs[2], ssf, self.w2_bf16[:n, :, d:d + c], n, K, c,
++                                   in_cols=m, col_off=lo)
 +            local = torch.where((ids32 >= base) & (ids32 < base + n), ids32 - base, torch.full_like(ids32, -1))
 +            out.zero_()
 +            self._cutlass_rows(

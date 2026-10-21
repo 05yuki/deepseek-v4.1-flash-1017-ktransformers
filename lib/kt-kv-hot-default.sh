@@ -7,9 +7,11 @@
 #
 #   kt_kv_hot_default <hot placement> <resident count it keeps> <gpu experts> <X> <tree python dir> [swa]
 #
+# Any resident count works: the placement lists the experts hottest first, so the slots
+# take the ones after the residents (the count it was built around is kept as an argument).
+#
 # On when KT_KV_HOT_LEND is unset or 1, KT_EXPERT_PLACEMENT is unset (or names the hot
-# placement), the launch keeps the resident count the placement was built around,
-# the hot placement, libkv_vmm.so and the tree's kt_kv_hot_lend.py exist, and
+# placement), the hot placement, libkv_vmm.so and the tree's kt_kv_hot_lend.py exist, and
 # KT_KV_VMM is not 0. Then KT_KV_HOT_PLACEMENT is the placement to use. Otherwise
 # KT_KV_HOT_LEND=0 and KT_KV_HOT_PLACEMENT is empty.
 kt_kv_hot_default() {
@@ -22,8 +24,6 @@ kt_kv_hot_default() {
     # a placement given turns the lend off unless KT_KV_HOT_LEND=1 is given too: then
     # the lend runs on that placement (its N..N+X-1 must be the next hottest)
     why="a placement given ($KT_EXPERT_PLACEMENT; KT_KV_HOT_LEND=1 keeps the lend on it)"
-  elif [[ "$n" != "$keep" ]]; then
-    why="$n resident experts (the hot placement keeps $keep)"
   elif [[ ! -f "$hot" ]]; then
     why="$hot missing"
   elif [[ ! -f "$lib" ]]; then
@@ -42,5 +42,5 @@ kt_kv_hot_default() {
   export KT_KV_VMM=1 KT_PREFILL_KV_LEND="${KT_PREFILL_KV_LEND:-1}" KT_PREFILL_PLAN="${KT_PREFILL_PLAN:-1}"
   [[ "$swa" == swa ]] && export KT_PREFILL_SWA_LEND="${KT_PREFILL_SWA_LEND:-1}"
   KT_KV_HOT_PLACEMENT="$hot"
-  echo "hot lend: $KT_KV_HOT_EXTRA experts a layer past the $n resident ones, in the KV pool's free pages (${KT_EXPERT_PLACEMENT:-$hot})" >&2
+  echo "hot lend: up to $KT_KV_HOT_EXTRA experts a layer past the $n resident ones (auto: as many as the free memory holds), in the KV pool's free pages (${KT_EXPERT_PLACEMENT:-$hot})" >&2
 }

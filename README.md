@@ -43,13 +43,11 @@ launch, and each use of it shrinks when there is less:
   pages is lent to it, and given back before decode;
 - in decode, extra hot experts go into the KV pool's free pages and the driver's idle
   memory, as many as fit (`KT_KV_HOT_SPARE_FLOOR_MB` keeps a margin free); with less
-  room fewer are kept, and decode is slower;
-- the resident experts per layer (`KT_GPU_EXPERTS`, 5) can go down to 0.
+  room fewer are kept, and decode is slower.
 
 The KV pool itself is never made smaller to gain speed: the lends take only its free
-pages. On these 16 GB cards, with no resident experts, the weights take 7.9 GB a card
-and 4.6 GB is still free after the 1M-token KV pool. A shorter context
-(`SGLANG_CONTEXT_LENGTH`) makes the pool smaller. Smaller cards were not tested.
+pages. If the server runs out of memory at launch, a shorter context
+(`SGLANG_CONTEXT_LENGTH`) makes the pool smaller; it is the only setting memory needs.
 
 - **RAM: a 512 GB class machine.** The server uses about 420 GiB, most of it the MXFP4
   CPU experts on 2 MB pages. 384 GB does not fit.
@@ -57,15 +55,14 @@ and 4.6 GB is still free after the 1M-token KV pool. A shorter context
   The launcher makes one expert pool per NUMA node and uses every physical core.
   kt-kernel is built for the CPU it is built on (`CPUINFER_CPU_INSTRUCT=NATIVE`). Its
   MXFP4 kernels need AVX2.
-- **VRAM: the dense layers and the KV pool, then whatever room is left.** Tested on two
-  16 GB cards (tensor parallel 2). Per card: 8.3 GB of weights (half of attention and the
-  other dense layers, plus 5 resident experts a layer) and 1.9 GB for the 1M-token KV
-  pool. The prefill chunks and the extra hot experts take the rest, so the cards show
-  nearly full whatever their size; on a smaller card they get less room.
-
-  One GPU holds all of the dense part and the whole KV pool itself, about 24 GB at a 1M
-  context by estimate. `CUDA_VISIBLE_DEVICES` picks the GPUs, one tensor-parallel rank
-  each.
+- **VRAM: 16 GB a card.** The dense layers and the KV pool have to fit; the prefill chunks
+  and the extra hot experts take the rest, so the cards show nearly full whatever room is
+  left. `CUDA_VISIBLE_DEVICES` picks the GPUs, one tensor-parallel rank each.
+  - Two 16 GB cards: 6.9 GB of weights each (half of the dense layers and one resident
+    expert a layer) and the 1M-token KV pool.
+  - One 16 GB card: 11.7 GB of weights, and the KV pool gets what is left: about 88K tokens.
+  - Smaller cards do not hold their share of this checkpoint's dense layers with room for a
+    long prefill: a more quantized checkpoint is needed (not covered here).
 - **Disk: about 500 GB, NVMe.**
   - The checkpoint is 476 GiB (510 GB).
   - `.venv` is 8.6 GB and the upstream clones about 1 GB.
@@ -199,27 +196,28 @@ Decode, 1,024 tokens a reply (`--other-text` for the rows below the first):
 
 | text | tok/s |
 |---|---|
-| Japanese prose (median of four prompts) | 44.2 |
-| Chinese prose | 39.1 |
-| English prose | 36.0 |
-| math | 37.6 |
-| JSON | 35.1 |
+| Japanese prose (median of four prompts) | 44.3 |
+| Chinese prose | 39.4 |
+| English prose | 35.8 |
+| math | 36.8 |
+| JSON | 34.7 |
 | English technical prose | 33.7 |
 | Python code | 33.7 |
 
-Up to 21 experts a layer run on the GPU: 5 that always stay and 16 in the KV pool's free
-pages. All of them are swapped for the experts the text being written routes to most, so
-no routing has to be recorded for a new kind of text. Code, JSON, math and English spread
+One expert a layer always stays on the GPU, and as many more as the free GPU memory holds
+sit in the KV pool's free pages and the driver's idle memory (14-15 a layer here). All of
+them are swapped for the experts the text being written routes to most, so no routing has
+to be recorded for a new kind of text. Code, JSON, math and English spread
 their routes over more experts than Japanese prose (a layer's 21 most used take about half
 of their routes, against 70-75% in Japanese prose), so the CPU computes more of them: a GPU
-with more memory can hold more with `KT_KV_HOT_EXTRA`
+with more free memory holds more of them by itself
 ([docs/tier1.md](docs/tier1.md#16-hot-lend)).
 
 Prefill, one prompt of random token ids:
 
 | prompt (tokens) | tok/s | time |
 |---|---|---|
-| 35,000 | 759 | 46 s |
+| 35,000 | 753 | 46 s |
 | 131,072 | 776 | 2.8 min |
 | 524,288 | 659 | 13 min |
 | 1,000,000 | 558 | 30 min |
@@ -241,8 +239,8 @@ padding-page fix (#3) is no longer carried: SGLang main's sparse attention with 
 - Tested on 2 × RTX 5070 Ti (SM120) with Zen 2 CPUs only.
 - CPUs with AVX-512 should work: the experts run on the AVX2 kernels, which those CPUs
   also have.
-- One GPU, or more than two: `serve.sh` sets tensor parallelism from the GPUs it sees;
-  not tested. One GPU needs about 24 GB at a 1M context.
+- More than two GPUs: `serve.sh` sets tensor parallelism from the GPUs it sees; not
+  tested.
 - Other NVIDIA GPUs: the DeepSeek-V4 attention in this SGLang branch is written for SM90
   and newer, so RTX 30/40 and A100 are not expected to run. With
   `SGLANG_MXFP4_MOE_FP32=0`, the MXFP4 Marlin path also needs SM90 or SM120.
