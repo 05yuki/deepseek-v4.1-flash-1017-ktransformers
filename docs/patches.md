@@ -30,7 +30,7 @@ A switch marked "on" is on in `serve.sh`.
 ## SGLang tier 0
 
 What 1017 needs to run correctly. Each patch is one concern; its commit message says how
-it was checked. Six are pull requests to SGLang, one concern each; when one is merged, its
+it was checked. Seven are pull requests to SGLang, one concern each; when one is merged, its
 patch goes and the pin moves past it.
 
 | patch | upstream |
@@ -45,7 +45,7 @@ patch goes and the pin moves past it.
 | `08-sm12x-indexer` | not sent |
 | `09-indexer-score-in-place` | [#45745](https://github.com/sgl-project/sglang/pull/45745) |
 | `10-routed-scale-once` | [#45810](https://github.com/sgl-project/sglang/pull/45810) |
-| `11-v41-kv-layout` | not sent |
+| `11-v41-kv-layout` | [#45851](https://github.com/sgl-project/sglang/pull/45851) |
 
 ### KTransformers wrapper
 
