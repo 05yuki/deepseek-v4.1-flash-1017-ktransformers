@@ -191,19 +191,19 @@ None of it needs a server change:
 
 2 × AMD EPYC 7452 (Zen 2, AVX2), 512 GB DDR4, 2 × RTX 5070 Ti 16 GB, the checkpoint on
 NVMe; built from this repository and run with the `serve.sh` defaults (1M-token context,
-one request at a time), measured with `tools/bench.py` at tag `2026-10-22-1001`, every row from one launch.
+one request at a time), measured with `tools/bench.py` at tag `2026-10-22-1307`, every row from one launch.
 
 Decode, 1,024 tokens a reply (`--other-text` for the rows below the first):
 
 | text | tok/s |
 |---|---|
-| Japanese prose (median of four prompts) | 45.3 |
-| Chinese prose | 39.2 |
-| math | 38.2 |
-| English prose | 37.5 |
-| JSON | 35.4 |
-| Python code | 34.5 |
-| English technical prose | 34.3 |
+| Japanese prose (median of four prompts) | 45.0 |
+| Chinese prose | 38.8 |
+| math | 37.6 |
+| English prose | 36.5 |
+| JSON | 35.5 |
+| English technical prose | 34.4 |
+| Python code | 34.1 |
 
 One expert a layer always stays on the GPU, and as many more as the free GPU memory holds
 sit in the KV pool's free pages and the driver's idle memory (14-15 a layer here). All of
@@ -218,10 +218,10 @@ Prefill, one prompt of random token ids:
 
 | prompt (tokens) | tok/s | time |
 |---|---|---|
-| 35,000 | 1,013 | 35 s |
-| 131,072 | 1,009 | 2.2 min |
-| 524,288 | 877 | 10 min |
-| 1,000,000 | 703 | 24 min |
+| 35,000 | 1,214 | 29 s |
+| 131,072 | 1,441 | 1.5 min |
+| 524,288 | 1,212 | 7.2 min |
+| 1,000,000 | 929 | 18 min |
 
 Longer prompts run in smaller chunks: the prompt's own KV and the attention's working
 memory grow with its length, leaving less GPU memory for a chunk, and every chunk streams
