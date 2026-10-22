@@ -228,6 +228,24 @@ memory grow with its length, leaving less GPU memory for a chunk, and every chun
 the CPU experts to the GPU once. The prompts are random token ids, which spread over more
 experts than real text, so these figures are lower than with text.
 
+### One GPU
+
+The same machine and tag with `CUDA_VISIBLE_DEVICES=0`: one RTX 5070 Ti 16 GB (tensor
+parallel 1), the CPU experts on both sockets, `serve.sh` defaults, every row from one launch.
+The KV pool holds 88,064 tokens, and no memory is left for the hot lend: one expert a layer
+stays on the GPU, so every text runs most of its routes on the CPU.
+
+| text | tok/s |
+|---|---|
+| Japanese prose (median of four prompts) | 28.5 |
+| English prose | 26.6 |
+| Chinese prose, math, JSON, English technical prose, Python code | 26.3 |
+
+| prompt (tokens) | tok/s | time |
+|---|---|---|
+| 35,000 | 793 | 44 s |
+| 65,536 | 881 | 74 s |
+
 ## Fixes from dsv41-flash-dual-epyc
 
 Two fixes by f-wunderlich, from the earlier release's repo: `--kt-num-gpu-experts 0` starts
