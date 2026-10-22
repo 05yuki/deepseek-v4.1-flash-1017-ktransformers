@@ -7,8 +7,9 @@ prompts, then the prefill of a 35,000-token prompt, twice.
   python tools/bench.py --prefill-only --lengths 35000,131072,524288,1000000   (about an hour)
 
 - decode: each prompt asks for a story of about 2,000 characters; 1,024 tokens are generated
-  at temperature 1.0, top_p 0.95. The tok/s of a request is its completion tokens over its
-  time, so it includes the short prompt's prefill; the median of the four is printed.
+  at the model card's temperature 1.0, top_p 1.0. The tok/s of a request is its completion
+  tokens over its time, so it includes the short prompt's prefill; the median of the four is
+  printed.
 - --other-text: decode on six prompts unlike the prose the hot-expert placement was recorded on
   (Chinese and English prose, English technical prose, math, JSON, Python code), one request
   each, the same settings; each rate is printed.
@@ -68,7 +69,7 @@ def main():
     a = ap.parse_args()
 
     def decode(prompt):
-        body = {"model": "x", "max_tokens": 1024, "temperature": 1.0, "top_p": 0.95,
+        body = {"model": "x", "max_tokens": 1024, "temperature": 1.0, "top_p": 1.0,
                 "chat_template_kwargs": {"enable_thinking": False},
                 "messages": [{"role": "user", "content": prompt}]}
         t = time.time()
@@ -97,7 +98,8 @@ def main():
         rng = random.Random(seed)
         ids = [rng.randrange(1000, a.vocab) for _ in range(length)]
         t = time.time()
-        post(a.url + "/generate", {"input_ids": ids, "sampling_params": {"max_new_tokens": 1, "temperature": 0}},
+        post(a.url + "/generate",
+             {"input_ids": ids, "sampling_params": {"max_new_tokens": 1, "temperature": 1.0, "top_p": 1.0}},
              a.api_key)
         dt = time.time() - t
         print(f"prefill, {name} {length}-token prompt: {dt:.2f} s = {length / dt:.0f} tok/s", flush=True)

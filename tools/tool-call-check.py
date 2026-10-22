@@ -2,7 +2,7 @@
 
   tools/tool-call-check.py [http://127.0.0.1:8080]
 
-Checks, each with temperature 0:
+Checks, each with the model card's sampling (temperature 1.0, top_p 1.0):
   plain      a request with one tool comes back with finish_reason "tool_calls" and the
              call's name and JSON arguments in message.tool_calls
   stream     the same request streamed: the deltas join into the same call
@@ -42,7 +42,7 @@ def post(body, stream=False):
     headers = {"Content-Type": "application/json"}
     if KEY:
         headers["Authorization"] = "Bearer " + KEY
-    body = {"model": "default", "temperature": 0, "max_tokens": 512, "stream": stream, **body}
+    body = {"model": "default", "temperature": 1.0, "top_p": 1.0, "max_tokens": 512, "stream": stream, **body}
     req = urllib.request.Request(URL + "/v1/chat/completions", json.dumps(body).encode(), headers)
     r = urllib.request.urlopen(req, timeout=900)
     if not stream:

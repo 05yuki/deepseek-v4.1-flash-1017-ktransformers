@@ -53,7 +53,7 @@ key_header=()
 [[ -n "${SGLANG_API_KEY:-}" ]] && key_header=(-H "Authorization: Bearer $SGLANG_API_KEY")
 reply="$(curl -s --max-time 600 "${key_header[@]}" -H "Content-Type: application/json" \
   "http://127.0.0.1:$port/v1/chat/completions" \
-  -d '{"messages":[{"role":"user","content":"Name three primary colors."}],"max_tokens":64,"temperature":0}')"
+  -d '{"messages":[{"role":"user","content":"Name three primary colors."}],"max_tokens":64,"temperature":1.0,"top_p":1.0}')"
 text="$("$here/.venv/bin/python" -c 'import json,sys
 d = json.loads(sys.argv[1]); m = d["choices"][0]["message"]
 print((m.get("content") or "") + (m.get("reasoning_content") or ""))' "$reply" 2>/dev/null || true)"
