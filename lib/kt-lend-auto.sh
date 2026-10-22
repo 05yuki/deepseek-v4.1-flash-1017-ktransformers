@@ -257,16 +257,20 @@ kt_prefill_plan_setup() {
     read -r pf_free pf_row pf_cost pf_delta <<<"$(python3 "$(dirname "${BASH_SOURCE[0]}")/kt-prefill-plan-constants.py" "$KT_PREFILL_LEND_HINT" "$cap")"
     if [[ -n "${pf_free:-}" ]]; then
       export KT_PREFILL_PLAN_FREE_MB="$pf_free" KT_PREFILL_PLAN_ROW_KB="$pf_row"
-      [[ "${pf_cost:--}" != - ]] && export KT_PREFILL_PLAN_COST="$pf_cost"
+      # a cost fitted from the windows a setup's serving recorded is opt-in: it is fitted on
+      # the lend's allocated bytes, torch's reserved memory runs up to 2 GB above them, and a
+      # fitted cost planned 131K in 26,624-row chunks on a second launch and ran out of
+      # memory (10-22); the prior below plans that prompt in 11,264-row chunks
+      [[ "${pf_cost:--}" != - && "${KT_PREFILL_PLAN_FIT:-0}" == 1 ]] && export KT_PREFILL_PLAN_COST="$pf_cost"
       [[ "${pf_delta:-0}" != 0 ]] && export KT_PREFILL_PLAN_DELTA_MB="$pf_delta"
     fi
   fi
-  # measured a row but not fitted yet (a new setup's first launches): the model's prior,
-  # whose sequence term keeps a long prompt's chunks small (a row-only cost planned 13,312
-  # rows at 1M and the indexer's scores ran out of memory, 10-21)
+  # no fitted cost (the default, or a new setup's first launches with KT_PREFILL_PLAN_FIT=1):
+  # the model's prior, whose sequence term keeps a long prompt's chunks small (a row-only
+  # cost planned 13,312 rows at 1M and the indexer's scores ran out of memory, 10-21)
   if [[ "${KT_PREFILL_PLAN_ROW_KB:-0}" != 0 && -z "${KT_PREFILL_PLAN_COST:-}" && -n "${KT_PREFILL_PLAN_COST_PRIOR:-}" ]]; then
     export KT_PREFILL_PLAN_COST="$KT_PREFILL_PLAN_COST_PRIOR"
-    echo "prefill plan: cost not fitted yet for this setup; the prior $KT_PREFILL_PLAN_COST until it is" >&2
+    echo "prefill plan: the prior cost $KT_PREFILL_PLAN_COST (KT_PREFILL_PLAN_FIT=1 uses this setup's fitted cost once it has one)" >&2
   fi
   if [[ "${KT_PREFILL_PLAN_ROW_KB:-0}" == 0 && -z "${KT_PREFILL_PLAN_COST:-}" ]]; then
     export KT_PREFILL_PLAN=0

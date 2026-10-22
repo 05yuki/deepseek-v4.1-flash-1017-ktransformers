@@ -373,7 +373,8 @@ Switches (code / serve.sh):
 
 - `KT_PREFILL_KV_LEND`: 0; KT_PREFILL_KV_LEND_* / 1 (lib/kt-kv-hot-default.sh)
 - `KT_PREFILL_PLAN`: 0; KT_PREFILL_PLAN_* / 1
-- `KT_PREFILL_PLAN_COST_PRIOR`: unset / 2600,471040,280,820 (the cost until this setup's own fit; lib/kt-lend-auto.sh)
+- `KT_PREFILL_PLAN_COST_PRIOR`: unset / 2600,471040,280,820 (the cost the plan uses; lib/kt-lend-auto.sh)
+- `KT_PREFILL_PLAN_FIT`: - / 0 (1: the cost fitted from this setup's recorded windows instead of the prior; a fitted cost ran out of memory at 131K)
 - `KT_PREFILL_SWA_LEND`: 0; KT_PREFILL_SWA_* / 1
 
 Numerics: The lend is bit-identical. The plan picks per-request chunk sizes, so the prefill chunking (and NLL) moves against a fixed chunk. The SWA lend changes memory only.
