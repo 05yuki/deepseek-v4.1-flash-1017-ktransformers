@@ -216,22 +216,22 @@ None of it needs a server change:
 
 2 × AMD EPYC 7452 (Zen 2, AVX2), 512 GB DDR4, 2 × RTX 5070 Ti 16 GB, the checkpoint on
 NVMe; built from this repository and run with the `serve.sh` defaults (1M-token context,
-one request at a time), measured with `tools/bench.py` at tag `2026-10-22-1552`, every row from one launch.
+one request at a time), measured with `tools/bench.py` at tag `2026-10-23-0135`, every row from one launch.
 
 Decode, 1,024 tokens a reply (`--other-text` for the rows below the first):
 
 | text | tok/s |
 |---|---|
-| Japanese prose (median of four prompts) | 45.6 |
-| Chinese prose | 39.5 |
-| math | 37.6 |
-| English prose | 36.8 |
-| JSON | 35.9 |
-| English technical prose | 34.3 |
-| Python code | 34.0 |
+| Japanese prose (median of four prompts) | 47.1 |
+| Chinese prose | 40.6 |
+| math | 40.0 |
+| English prose | 38.5 |
+| JSON | 37.2 |
+| English technical prose | 35.4 |
+| Python code | 35.3 |
 
 One expert a layer always stays on the GPU, and as many more as the free GPU memory holds
-sit in the KV pool's free pages and the driver's idle memory (14-15 a layer here). All of
+sit in the KV pool's free pages and the driver's idle memory (15-16 a layer here). All of
 them are swapped for the experts the text being written routes to most, so no routing has
 to be recorded for a new kind of text. Code, JSON, math and English spread
 their routes over more experts than Japanese prose (a layer's 21 most used take about half
@@ -243,10 +243,10 @@ Prefill, one prompt of random token ids:
 
 | prompt (tokens) | tok/s | time |
 |---|---|---|
-| 35,000 | 1,314 | 27 s |
-| 131,072 | 1,449 | 1.5 min |
-| 524,288 | 1,225 | 7.1 min |
-| 1,000,000 | 909 | 18 min |
+| 35,000 | 1,301 | 27 s |
+| 131,072 | 1,515 | 1.4 min |
+| 524,288 | 1,209 | 7.2 min |
+| 1,000,000 | 943 | 18 min |
 
 Longer prompts run in smaller chunks: the prompt's own KV and the attention's working
 memory grow with its length, leaving less GPU memory for a chunk, and every chunk streams
@@ -257,19 +257,22 @@ experts than real text, so these figures are lower than with text.
 
 The same machine and tag with `CUDA_VISIBLE_DEVICES=0`: one RTX 5070 Ti 16 GB (tensor
 parallel 1), the CPU experts on both sockets, `serve.sh` defaults, every row from one launch.
-The KV pool holds 88,064 tokens, and no memory is left for the hot lend: one expert a layer
-stays on the GPU, so every text runs most of its routes on the CPU.
+The KV pool holds 98,560 tokens, and the hot lend holds 1-3 more experts a layer beside the one
+that stays, so every text runs most of its routes on the CPU.
 
 | text | tok/s |
 |---|---|
-| Japanese prose (median of four prompts) | 28.5 |
-| English prose | 26.6 |
-| Chinese prose, math, JSON, English technical prose, Python code | 26.3 |
+| Japanese prose (median of four prompts) | 32.0 |
+| English prose, math | 28.9 |
+| Chinese prose | 28.5 |
+| English technical prose | 28.2 |
+| JSON | 28.1 |
+| Python code | 27.8 |
 
 | prompt (tokens) | tok/s | time |
 |---|---|---|
-| 35,000 | 793 | 44 s |
-| 65,536 | 881 | 74 s |
+| 35,000 | 774 | 45 s |
+| 65,536 | 863 | 76 s |
 
 ## Fixes from dsv41-flash-dual-epyc
 
