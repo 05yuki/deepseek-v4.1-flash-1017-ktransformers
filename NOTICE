@@ -9,5 +9,5 @@ https://github.com/0xSero/deepseek-v4.1-flash-4x-rtx-pro-6000
 (Copyright (c) 2026 0xSero, MIT License); the MIT terms apply to those files, as
 their headers say.
 
-The patches under patches/ modify sgl-project/sglang (commit da7e3f1c) and
+The patches under patches/ modify sgl-project/sglang (commit a6a6beff) and
 kvcache-ai/ktransformers (kt-kernel, commit 95009ea), both Apache-2.0.

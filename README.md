@@ -10,7 +10,7 @@ to 1M tokens.
 
 This repository is everything needed: patches against two public upstream commits, a
 setup script that builds them, a launcher that reads the machine it runs on, and tests.
-It is a snapshot against those commits as of October 2026 (SGLang main at `da7e3f1c`,
+It is a snapshot against those commits as of October 2026 (SGLang main at `a6a6beff`,
 KTransformers `95009ea`, torch 2.14.1 with CUDA 13 wheels, FlashInfer 0.7.2, CUDA toolkit
 13.1); later upstream versions are not tracked.
 
@@ -81,7 +81,7 @@ pages. If the server runs out of memory at launch, a shorter context
 
 ## What setup.sh does
 
-1. Clones sgl-project/sglang at `da7e3f1c` on its main branch and applies the SGLang patches
+1. Clones sgl-project/sglang at `a6a6beff` on its main branch and applies the SGLang patches
    up to `TIER` (default 2), each tier on top of the ones below it:
 
    | `TIER` | patch | what it adds |
@@ -173,7 +173,7 @@ The earlier release did not have this step; 1017's weights were made with it.
   checkpoint's own `inference/model.py`. The step therefore turns on for 1017 (block
   32) and stays off for the earlier release.
 - `patches/sglang-dsv4-o-fp8-qdq.py` installs the same step in another SGLang tree on
-  its own. It applies to SGLang main at `da7e3f1c` unmodified.
+  its own. It applies to SGLang main at `a6a6beff` unmodified.
 
 It works the same at any tensor-parallel size. Its 32-value blocks lie inside a head
 (512 values), so splitting heads across GPUs never cuts a block.

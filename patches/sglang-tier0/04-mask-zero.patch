@@ -1,4 +1,4 @@
-From a5a29d9b81020927614b8eb760ee3ecc0e0822ad Mon Sep 17 00:00:00 2001
+From d873b409ba3cefd8f077f4a10753ef4ac83621f1 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:33 +0900
 Subject: [PATCH] [tier 0] kt: keep CPU-routed experts out of the Marlin MoE
