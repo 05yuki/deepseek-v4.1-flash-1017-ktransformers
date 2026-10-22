@@ -49,7 +49,7 @@ The KV pool itself is never made smaller to gain speed: the lends take only its 
 pages. If the server runs out of memory at launch, a shorter context
 (`SGLANG_CONTEXT_LENGTH`) makes the pool smaller; it is the only setting memory needs.
 
-- **RAM: a 512 GB class machine.** The server uses about 420 GiB, most of it the MXFP4
+- **RAM: a 512 GB class machine.** The server uses about 425 GiB, most of it the MXFP4
   CPU experts on 2 MB pages. 384 GB does not fit.
 
   The launcher makes one expert pool per NUMA node and uses every physical core.

@@ -57,6 +57,7 @@ repeats to the last digit from launch to launch (1017).
 | KV pool on remappable memory; a chunk borrows the pool's free pages; the chunk planned per request (`KT_KV_VMM`, `KT_PREFILL_KV_LEND`, `KT_PREFILL_PLAN`) | 35K 57.5 → 51.3 s (6 → 4 chunks), KV pool unchanged | earlier |
 | The plan charges the sliding-window pool for the chunks in flight, not the rest of the prompt | 512K 256 → 611 tok/s | 1017 |
 | The GPU-resident experts of a chunk on the tensor cores, live routes only (`SGLANG_MXFP4_MOE_FP32`) | a chunk's resident call 64.0 → 15.7 ms; 35K +4-6% | 1017 |
+| The engram scales of each rank's rows held in RAM (1.4 GiB a table and rank), so a missed row is one NVMe read instead of two (`DSV41_ENGRAM_SCALES_RAM`) | a 12K-token chunk's lookups 4.0 / 6.7 → 2.1 / 2.1 s (layers 1 / 14); 35K 655 → 1011, 131K 652 → 989 tok/s, rows byte-identical | 1017 |
 
 None of these takes tokens from the KV pool. The 1M-token pool comes first.
 

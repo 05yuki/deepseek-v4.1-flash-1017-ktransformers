@@ -11,6 +11,7 @@
 //   - stats expose cache slot count and bytes so the budget is auditable.
 //
 // No CUDA calls in the callback: suitable for cudaLaunchHostFunc graph nodes.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -24,6 +25,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <mutex>
+#include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -39,12 +41,17 @@ constexpr int kLockShards = 256;
 
 struct Store {
   int fd = -1;
+  std::string path;
   uint64_t rows = 0, weight_offset = 0, scale_offset = 0, slots = 0;
   uint64_t row_lo = 0, row_hi = 0;
   uint8_t *cache = nullptr;
   uint64_t *keys = nullptr;
   uint8_t *resident = nullptr;
   size_t resident_size = 0;
+  // the owned rows' E8M0 scales (8 B a row, 1.5 GB a table and rank) in RAM,
+  // so a miss is one NVMe read instead of two (DSV41_ENGRAM_SCALES_RAM, on)
+  uint8_t *scales_ram = nullptr;
+  size_t scales_ram_size = 0;
   std::mutex locks[kLockShards];
   std::atomic<uint64_t> hits{0}, misses{0}, reads{0}, errors{0};
   // timing: whole callback and the part spent on cache misses, so the share
@@ -145,6 +152,61 @@ bool read_bytes(Store *s, uint64_t offset, uint8_t *out, size_t length) {
   return true;
 }
 
+bool read_row(Store *s, uint64_t id, uint8_t *row) {
+  if (!read_bytes(s, s->weight_offset + id * kDim, row, kDim)) return false;
+  if (s->scales_ram) {
+    std::memcpy(row + kDim, s->scales_ram + (id - s->row_lo) * kScales, kScales);
+    return true;
+  }
+  return read_bytes(s, s->scale_offset + id * kScales, row + kDim, kScales);
+}
+
+void scales_free(Store *s) {
+  if (s->scales_ram) munmap(s->scales_ram, s->scales_ram_size);
+  s->scales_ram = nullptr;
+  s->scales_ram_size = 0;
+}
+
+// Reads the scales of rows [row_lo, row_hi) sequentially through the page cache
+// and drops those pages again. On failure the store keeps reading them per miss.
+void scales_load(Store *s, const char *path) {
+  scales_free(s);
+  const char *e = getenv("DSV41_ENGRAM_SCALES_RAM");
+  if (s->resident || (e && std::strcmp(e, "0") == 0) || s->row_hi <= s->row_lo) return;
+  const auto t0 = std::chrono::steady_clock::now();
+  const size_t size = (s->row_hi - s->row_lo) * kScales;
+  void *m = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (m == MAP_FAILED) {
+    std::fprintf(stderr, "row_store: scales in RAM: allocation failed errno=%d\n", errno);
+    return;
+  }
+  madvise(m, size, MADV_HUGEPAGE);
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  const uint64_t base = s->scale_offset + s->row_lo * kScales;
+  size_t done = 0;
+  while (fd >= 0 && done < size) {
+    const size_t n = std::min<size_t>(size - done, size_t(64) << 20);
+    ssize_t got = pread(fd, static_cast<uint8_t *>(m) + done, n, base + done);
+    if (got < 0 && errno == EINTR) continue;
+    if (got <= 0) break;
+    done += size_t(got);
+  }
+  if (fd >= 0) {
+    posix_fadvise(fd, base, size, POSIX_FADV_DONTNEED);
+    close(fd);
+  }
+  if (done < size) {
+    std::fprintf(stderr, "row_store: scales in RAM: read %zu of %zu bytes, reading them per miss\n", done, size);
+    munmap(m, size);
+    return;
+  }
+  s->scales_ram = static_cast<uint8_t *>(m);
+  s->scales_ram_size = size;
+  const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  std::fprintf(stderr, "row_store: scales of rows [%llu,%llu) in RAM, %zu MiB in %.1f s\n",
+               (unsigned long long)s->row_lo, (unsigned long long)s->row_hi, size >> 20, secs);
+}
+
 }  // namespace
 
 extern "C" Store *row_store_open(const char *path, uint64_t rows, uint64_t woff,
@@ -183,6 +245,7 @@ extern "C" Store *row_store_open(const char *path, uint64_t rows, uint64_t woff,
     }
     budget = 0;
   }
+  s->path = path;
   s->rows = rows;
   s->weight_offset = woff;
   s->scale_offset = soff;
@@ -251,17 +314,12 @@ extern "C" void row_store_lookup(void *opaque) {
   if (!misses.empty()) {
     const auto t_miss = std::chrono::steady_clock::now();
     if (s->resident || misses.size() == 1 || s->io.threads.empty()) {
-      for (auto &m : misses)
-        m.ok = read_bytes(s, s->weight_offset + uint64_t(m.id) * kDim, m.row, kDim) &&
-               read_bytes(s, s->scale_offset + uint64_t(m.id) * kScales, m.row + kDim, kScales);
+      for (auto &m : misses) m.ok = read_row(s, uint64_t(m.id), m.row);
     } else {
       std::vector<std::function<void()>> jobs;
       jobs.reserve(misses.size());
       for (auto &m : misses)
-        jobs.emplace_back([s, &m] {
-          m.ok = read_bytes(s, s->weight_offset + uint64_t(m.id) * kDim, m.row, kDim) &&
-                 read_bytes(s, s->scale_offset + uint64_t(m.id) * kScales, m.row + kDim, kScales);
-        });
+        jobs.emplace_back([s, &m] { m.ok = read_row(s, uint64_t(m.id), m.row); });
       io_run_batch(s, jobs);
     }
     s->miss_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_miss).count(),
@@ -311,11 +369,13 @@ extern "C" void row_store_range(Store *s, uint64_t lo, uint64_t hi) {
   }
   s->row_lo = lo;
   s->row_hi = hi;
+  scales_load(s, s->path.c_str());
 }
 
 extern "C" void row_store_close(Store *s) {
   if (!s) return;
   io_stop(s);
+  scales_free(s);
   if (s->resident) munmap(s->resident, s->resident_size);
   if (s->slots) {
     munmap(s->cache, s->slots * kRow);
