@@ -1,15 +1,25 @@
-From e715d21a9501a2bb82bc7d6e6a65bf02f8a27015 Mon Sep 17 00:00:00 2001
+From 824ecb5582394bbc569831cdf74a0833ce4de3b6 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
-Subject: [PATCH] [tier 1] engram-row-prefetch: start decode's engram row
- lookups with the token, on a side stream
+Subject: [PATCH] [tier 1] engram-row-prefetch: start the engram row lookups
+ with the forward, on a side stream
 
-In decode, each engram layer's rank-local row lookup starts at the
-beginning of the token on a side stream instead of when its layer comes.
-The all-reduce, `wkv` and the gate stay where they were. Only with one
-pipeline stage, no DP attention and engram tables that are not shared.
+Each engram layer's rank-local row lookup starts at the beginning of the
+forward on a side stream instead of when its layer comes: in decode, and
+in a prefill chunk (SGLANG_DSV41_ENGRAM_PREFETCH_PREFILL, on), where the
+later engram layer's rows are read while the layers before it run. The
+all-reduce, `wkv` and the gate stay where they were. Only with one
+pipeline stage, no DP attention and engram tables that are not shared;
+a prefill chunk also not under context parallelism or a breakable CUDA
+graph.
 
-Numerics: Bit-identical: only the lookup moves.
+Numerics: Bit-identical: only the lookup moves. Checked in prefill:
+teacher-forced log-probs of 12K-token pieces identical token for token
+with SGLANG_DSV41_ENGRAM_PREFETCH_PREFILL=0 and 1.
+
+Effect in prefill, alone, on two 16 GB cards: a 35K prompt in 9,216-token
+chunks 972 -> 1,084 tok/s (12,288-token chunks 1,011 -> 1,022). Most of
+the engram read time goes with the engram adapter's next-chunk warm-up.
 
 Prerequisites: none; applies alone on tier 0.
 
@@ -17,8 +27,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
  python/sglang/srt/layers/engram.py      |  4 ++
- python/sglang/srt/models/deepseek_v4.py | 58 ++++++++++++++++++++++---
- 2 files changed, 56 insertions(+), 6 deletions(-)
+ python/sglang/srt/models/deepseek_v4.py | 73 +++++++++++++++++++++++--
+ 2 files changed, 71 insertions(+), 6 deletions(-)
 
 diff --git a/python/sglang/srt/layers/engram.py b/python/sglang/srt/layers/engram.py
 index f8f28ab0d1..2fbb4a4be4 100644
@@ -36,7 +46,7 @@ index f8f28ab0d1..2fbb4a4be4 100644
          return engram_gate(
              x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index b7ae299f85..bad214b1c5 100644
+index b7ae299f85..8eab970297 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
 @@ -3,6 +3,7 @@ from __future__ import annotations
@@ -47,7 +57,7 @@ index b7ae299f85..bad214b1c5 100644
  import time
  from array import array
  from contextlib import contextmanager, nullcontext
-@@ -3717,6 +3718,22 @@ class DeepseekV4Model(nn.Module):
+@@ -3717,6 +3718,26 @@ class DeepseekV4Model(nn.Module):
                      else None
                  ),
              )
@@ -67,20 +77,35 @@ index b7ae299f85..bad214b1c5 100644
 +        ):
 +            self.engram_rows_stream = torch.cuda.Stream()
 +            logger.info("Engram row lookups start with the token in decode")
++        self.engram_rows_prefill = (
++            self.engram_rows_stream is not None
++            and os.environ.get("SGLANG_DSV41_ENGRAM_PREFETCH_PREFILL", "1") == "1"
++        )
  
          if not _is_cuda:
              self.use_fused_mhc_post_pre = (
-@@ -3873,6 +3890,26 @@ class DeepseekV4Model(nn.Module):
+@@ -3873,6 +3894,37 @@ class DeepseekV4Model(nn.Module):
                  )
              else:
                  hash_ids = self.engram_hasher(input_ids, forward_batch)
 +        # {layer: (rows, event)}: this rank's rows, looked up on the side stream
 +        prefetched_rows = {}
++        mode = forward_batch.forward_mode
 +        if (
 +            self.engram_rows_stream is not None
 +            and hash_ids is not None
 +            and hash_ids.shape[0] > 0
-+            and forward_batch.forward_mode.is_decode()
++            and (
++                mode.is_decode()
++                # a prefill chunk's later engram layers read their rows while the
++                # layers before them run
++                or (
++                    self.engram_rows_prefill
++                    and mode.is_extend_without_speculative()
++                    and not cp_extend
++                    and not is_in_breakable_cuda_graph()
++                )
++            )
 +        ):
 +            rows_stream = self.engram_rows_stream
 +            rows_stream.wait_stream(torch.cuda.current_stream())
@@ -97,7 +122,7 @@ index b7ae299f85..bad214b1c5 100644
          tail = None
          if (
              self.late_layer_start is not None
-@@ -4043,12 +4080,21 @@ class DeepseekV4Model(nn.Module):
+@@ -4043,12 +4095,21 @@ class DeepseekV4Model(nn.Module):
              engram = self.layers[i].engram
              if engram is not None:
                  before_engram = state.residual

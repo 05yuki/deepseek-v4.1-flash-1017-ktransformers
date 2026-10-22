@@ -20,7 +20,7 @@ the code" are on as soon as the patch is applied.
 | 01 | [`01-fp8-decode.patch`](#01-fp8-decode) | +222 / -1 | none |
 | 02 | [`02-gpu-moe-fp32.patch`](#02-gpu-moe-fp32) | +487 / -1 | none |
 | 03 | [`03-cutlass-kt-expert-count.patch`](#03-cutlass-kt-expert-count) | +6 / -1 | none |
-| 04 | [`04-engram-row-prefetch.patch`](#04-engram-row-prefetch) | +56 / -6 | none |
+| 04 | [`04-engram-row-prefetch.patch`](#04-engram-row-prefetch) | +71 / -6 | none |
 | 05 | [`05-wo-a-fp8.patch`](#05-wo-a-fp8) | +174 / -2 | none |
 | 06 | [`06-vision-on-demand.patch`](#06-vision-on-demand) | +87 / -11 | `wo-a-fp8` |
 | 07 | [`07-thinking-default-parser.patch`](#07-thinking-default-parser) | +6 / -4 | none |
@@ -139,15 +139,16 @@ Files (under `python/sglang/`):
 
 ## 04 engram-row-prefetch
 
-In decode, each engram layer's rank-local row lookup starts at the beginning of the token on a side stream instead of when its layer comes. The all-reduce, `wkv` and the gate stay where they were. Only with one pipeline stage, no DP attention and engram tables that are not shared.
+Each engram layer's rank-local row lookup starts at the beginning of the forward on a side stream instead of when its layer comes: in decode, and in a prefill chunk, where the later engram layer's rows are read while the layers before it run. The all-reduce, `wkv` and the gate stay where they were. Only with one pipeline stage, no DP attention and engram tables that are not shared; a prefill chunk also not under context parallelism or a breakable CUDA graph.
 
 Switches (code / serve.sh):
 
 - `SGLANG_DSV41_ENGRAM_PREFETCH_ROWS`: 1 (on in the code) / 1
+- `SGLANG_DSV41_ENGRAM_PREFETCH_PREFILL`: 1 (on in the code) / 1
 
-Numerics: Bit-identical: only the lookup moves.
+Numerics: Bit-identical: only the lookup moves (a prefill's teacher-forced log-probs identical token for token).
 
-Effect: a token about 1 ms shorter, alone (15.9 → 16.2 tok/s, 62.7 → 61.8 ms) and with `fp8-decode` (27.3 → 28.2 tok/s, 36.6 → 35.5 ms). The cut is a fixed time a token, so it shows more as the token gets shorter.
+Effect in prefill: a 35K prompt in 9,216-token chunks 972 → 1,084 tok/s alone; with the engram adapter's next-chunk warm-up most of the rest of the read time goes (docs/optimizations.md). In decode: a token about 1 ms shorter, alone (15.9 → 16.2 tok/s, 62.7 → 61.8 ms) and with `fp8-decode` (27.3 → 28.2 tok/s, 36.6 → 35.5 ms). The cut is a fixed time a token, so it shows more as the token gets shorter.
 
 Prerequisites: none; applies alone on tier 0.
 

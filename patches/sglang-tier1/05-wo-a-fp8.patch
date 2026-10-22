@@ -1,4 +1,4 @@
-From b4aa899176bd3c996736f23eae4f9bebe81cff09 Mon Sep 17 00:00:00 2001
+From bee05a82160861b0ccbcb33558113b878966a944 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 22:58:32 +0900
 Subject: [PATCH] [tier 1] wo-a-fp8: keep wo_a in the checkpoint's FP8, read by
@@ -106,7 +106,7 @@ index 0000000000..8ff875faee
 +                                                     BLOCK_R=32, BLOCK_D=128, num_warps=4)
 +    return out
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index bad214b1c5..c56092836d 100644
+index 8eab970297..472124b7ec 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
 @@ -473,6 +473,68 @@ def _o_fp8_qdq_block() -> int:
@@ -236,7 +236,7 @@ index bad214b1c5..c56092836d 100644
                      if (
                          _NPU_BF16_WO_A_GEMM
                          and forward_batch.forward_mode.is_decode()
-@@ -4930,6 +5024,8 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4945,6 +5039,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                  attn.wo_a.weight_scale_inv.format_ue8m0 = False
  
      def post_load_weights(self, is_nextn=False, weight_names=None):
@@ -245,7 +245,7 @@ index bad214b1c5..c56092836d 100644
          if self.wo_a_fp8:
              self._setup_fp8_wo_a_scales(is_nextn)
  
-@@ -5646,6 +5742,9 @@ def _prepare_deepseek_v4_weights(
+@@ -5661,6 +5757,9 @@ def _prepare_deepseek_v4_weights(
          return weights
      if quant_config is not None and quant_config.get_name() == "quark":
          weights = _rename_quark_fp8_block_scales(weights)

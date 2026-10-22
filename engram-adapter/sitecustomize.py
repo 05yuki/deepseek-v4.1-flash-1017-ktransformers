@@ -14,6 +14,7 @@ import sys
 
 _ENGRAM = "sglang.srt.layers.engram"
 _METADATA = "sglang.srt.layers.attention.dsv4.metadata"
+_SCHEDULER = "sglang.srt.managers.scheduler"
 
 
 class _Loader(importlib.abc.Loader):
@@ -29,6 +30,12 @@ class _Loader(importlib.abc.Loader):
             from engram_backend import install
 
             install(module)
+            return
+        if module.__name__ == _SCHEDULER:
+            # prefill: the next chunk's engram rows are read while this one runs
+            from engram_backend import install_scheduler
+
+            install_scheduler(module)
             return
         # V4.1 ratio-1/2 indexers always call the FP4 DeepGEMM kernel. SM120
         # needs its split-128 planner even when the legacy FP8 indexer uses the
@@ -49,7 +56,7 @@ class _Loader(importlib.abc.Loader):
 
 class _Finder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname not in (_ENGRAM, _METADATA):
+        if fullname not in (_ENGRAM, _METADATA, _SCHEDULER):
             return None
         spec = importlib.machinery.PathFinder.find_spec(fullname, path)
         if spec is not None:

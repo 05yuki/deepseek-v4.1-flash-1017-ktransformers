@@ -1,4 +1,4 @@
-From 1f0f462dc3c238d2df748c70dee313c3c542f1f2 Mon Sep 17 00:00:00 2001
+From 435a04e526593faf676fc2021d8c6eeff8b8c47e Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] [tier 1] thinking-default-parser: reasoning parser falls back

@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <thread>
 #include <vector>
@@ -38,6 +39,12 @@ constexpr uint64_t kRow = kDim + kScales;
 constexpr uint64_t kSlotBytes = kRow + sizeof(uint64_t);
 constexpr size_t kPage = 4096;
 constexpr int kLockShards = 256;
+
+// Lookups finished by every store of this process, and how many stores are open:
+// a prefill chunk looks each store up once, so the chunk's lookups are done when
+// the first count has grown by the second.
+std::atomic<uint64_t> g_lookups{0};
+std::atomic<uint64_t> g_stores{0};
 
 struct Store {
   int fd = -1;
@@ -70,6 +77,18 @@ struct Store {
     size_t next = 0, pending = 0;
     bool stop = false;
   } io;
+  // Prefill: the scheduler hands over the next chunk's row ids while this chunk
+  // runs; a warm thread reads the missing ones into the cache with its own I/O
+  // threads (DSV41_ENGRAM_WARM_THREADS, 16), so the next chunk's lookups hit.
+  struct Warm {
+    std::thread thread;
+    std::mutex mu;
+    std::condition_variable cv;
+    // each batch with the process's lookup count when it was queued
+    std::deque<std::pair<uint64_t, std::vector<int64_t>>> queue;
+    bool stop = false, started = false;
+  } warm;
+  std::atomic<uint64_t> warm_rows{0}, warm_ns{0};
 };
 
 void io_worker(Store *s) {
@@ -207,7 +226,92 @@ void scales_load(Store *s, const char *path) {
                (unsigned long long)s->row_lo, (unsigned long long)s->row_hi, size >> 20, secs);
 }
 
+bool cache_has(Store *s, uint64_t id) {
+  const uint64_t slot = id % s->slots;
+  std::lock_guard<std::mutex> guard(s->locks[slot % kLockShards]);
+  return s->keys[slot] == id + 1;
+}
+
+void cache_put(Store *s, uint64_t id, const uint8_t *row) {
+  const uint64_t slot = id % s->slots;
+  std::lock_guard<std::mutex> guard(s->locks[slot % kLockShards]);
+  std::memcpy(s->cache + slot * kRow, row, kRow);
+  s->keys[slot] = id + 1;
+}
+
+void warm_loop(Store *s) {
+  int n = 16;
+  if (const char *e = getenv("DSV41_ENGRAM_WARM_THREADS")) n = std::atoi(e);
+  n = std::max(1, std::min(n, 64));
+  for (;;) {
+    std::vector<int64_t> ids;
+    uint64_t calls_at_queue;
+    {
+      std::unique_lock<std::mutex> lk(s->warm.mu);
+      s->warm.cv.wait(lk, [&] { return s->warm.stop || !s->warm.queue.empty(); });
+      if (s->warm.stop) return;
+      calls_at_queue = s->warm.queue.front().first;
+      ids = std::move(s->warm.queue.front().second);
+      s->warm.queue.pop_front();
+    }
+    // The chunk running now looks its own rows up first, in every store: start
+    // reading the next chunk's once those lookups are done (up to 30 s), not
+    // against them. Read together, the first chunk's lookups took 5.0 and 3.9 s
+    // instead of 2.1 s each.
+    const uint64_t done_at = calls_at_queue + g_stores.load();
+    for (int waited = 0; waited < 15000 && g_lookups.load() < done_at; waited++) {
+      {
+        std::lock_guard<std::mutex> lk(s->warm.mu);
+        if (s->warm.stop) return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    std::atomic<size_t> next{0};
+    auto work = [&] {
+      uint8_t row[kRow];
+      for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < ids.size();) {
+        const int64_t id = ids[i];
+        if (id < int64_t(s->row_lo) || id >= int64_t(s->row_hi) || cache_has(s, uint64_t(id))) continue;
+        if (!read_row(s, uint64_t(id), row)) continue;  // the lookup reads it again and counts the error
+        cache_put(s, uint64_t(id), row);
+        s->warm_rows.fetch_add(1, std::memory_order_relaxed);
+      }
+    };
+    std::vector<std::thread> threads;
+    for (int i = 0; i < n; i++) threads.emplace_back(work);
+    for (auto &t : threads) t.join();
+    s->warm_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(),
+                         std::memory_order_relaxed);
+  }
+}
+
+void warm_stop(Store *s) {
+  {
+    std::lock_guard<std::mutex> lk(s->warm.mu);
+    s->warm.stop = true;
+  }
+  s->warm.cv.notify_all();
+  if (s->warm.thread.joinable()) s->warm.thread.join();
+}
+
 }  // namespace
+
+// Queue row ids to read into the cache in the background; returns at once. A
+// no-op without a cache (resident mode, or a zero budget).
+extern "C" void row_store_warm(Store *s, const int64_t *ids, uint64_t count) {
+  if (!s || !s->slots || s->resident || !count) return;
+  std::vector<int64_t> batch(ids, ids + count);
+  {
+    std::lock_guard<std::mutex> lk(s->warm.mu);
+    if (!s->warm.started) {
+      s->warm.thread = std::thread(warm_loop, s);
+      s->warm.started = true;
+    }
+    s->warm.queue.emplace_back(g_lookups.load(), std::move(batch));
+  }
+  s->warm.cv.notify_one();
+}
 
 extern "C" Store *row_store_open(const char *path, uint64_t rows, uint64_t woff,
                                  uint64_t soff, uint64_t budget, int resident_mode) {
@@ -268,6 +372,7 @@ extern "C" Store *row_store_open(const char *path, uint64_t rows, uint64_t woff,
     madvise(s->cache, s->slots * kRow, MADV_HUGEPAGE);
   }
   if (!s->resident) io_start(s);
+  g_stores.fetch_add(1);
   return s;
 }
 
@@ -345,6 +450,7 @@ extern "C" void row_store_lookup(void *opaque) {
     }
   }
   s->calls.fetch_add(1, std::memory_order_relaxed);
+  g_lookups.fetch_add(1);
   s->lookup_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_call).count(),
                          std::memory_order_relaxed);
 }
@@ -359,6 +465,8 @@ extern "C" void row_store_stats(Store *s, uint64_t *out) {
   out[6] = s->calls.load();
   out[7] = s->lookup_ns.load();
   out[8] = s->miss_ns.load();
+  out[9] = s->warm_rows.load();
+  out[10] = s->warm_ns.load();
 }
 
 extern "C" void row_store_range(Store *s, uint64_t lo, uint64_t hi) {
@@ -374,6 +482,8 @@ extern "C" void row_store_range(Store *s, uint64_t lo, uint64_t hi) {
 
 extern "C" void row_store_close(Store *s) {
   if (!s) return;
+  g_stores.fetch_sub(1);
+  warm_stop(s);
   io_stop(s);
   scales_free(s);
   if (s->resident) munmap(s->resident, s->resident_size);

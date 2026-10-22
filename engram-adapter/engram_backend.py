@@ -37,6 +37,7 @@ _lib.row_store_open.restype = P
 _lib.row_store_range.argtypes = [P, U, U]
 _lib.row_store_stats.argtypes = [P, C.POINTER(U)]
 _lib.row_store_close.argtypes = [P]
+_lib.row_store_warm.argtypes = [P, P, U]
 
 
 class Work(C.Structure):
@@ -89,12 +90,13 @@ def _lend_prefill() -> bool:
 
 
 def _stats(store) -> dict:
-    buf = (U * 9)()
+    buf = (U * 11)()
     _lib.row_store_stats(store, buf)
     return {
         "hits": buf[0], "misses": buf[1], "reads": buf[2],
         "cache_bytes": buf[3], "errors": buf[4], "slots": buf[5],
         "calls": buf[6], "lookup_ns": buf[7], "miss_ns": buf[8],
+        "warm_rows": buf[9], "warm_ns": buf[10],
     }
 
 
@@ -113,17 +115,106 @@ def _start_timing_log(store, layer_id):
             cur = _stats(store); t1 = time.time()
             d = {k: cur[k] - prev[k] for k in cur}
             calls = d["calls"]; looks = d["hits"] + d["misses"]
-            if calls:
+            if calls or d["warm_rows"]:
                 print(f"[engram-timing layer {layer_id}] {t1-t0:.0f}s: calls={calls} rows={looks} "
                       f"miss={d['misses']} ({100.0*d['misses']/max(1,looks):.1f}%) "
-                      f"lookup={d['lookup_ns']/1e6:.1f}ms ({d['lookup_ns']/1e3/calls:.0f}us/call) "
-                      f"miss_io={d['miss_ns']/1e6:.1f}ms", file=sys.stderr, flush=True)
+                      f"lookup={d['lookup_ns']/1e6:.1f}ms ({d['lookup_ns']/1e3/max(1,calls):.0f}us/call) "
+                      f"miss_io={d['miss_ns']/1e6:.1f}ms warm={d['warm_rows']} rows in {d['warm_ns']/1e6:.1f}ms",
+                      file=sys.stderr, flush=True)
             prev, t0 = cur, t1
     threading.Thread(target=run, daemon=True, name=f"engram-timing-{layer_id}").start()
 
 
+# Prefill warm-up: while chunk k runs, the scheduler hands chunk k+1's tokens over,
+# their hash ids are computed on the CPU (the same arithmetic as the hash kernel)
+# and each rank's row stores read the missing rows into their cache in the
+# background, so chunk k+1's lookups are cache hits (DSV41_ENGRAM_WARM, on).
+WARM = os.environ.get("DSV41_ENGRAM_WARM", "1") == "1"
+WARM_MIN = int(os.environ.get("DSV41_ENGRAM_WARM_MIN_TOKENS", "2048"))
+_STORES = []  # (store, row_lo, row_hi, layer_id)
+_HASH = {}  # module, hasher, layer_ids, CPU copies of its tables
+
+
+def _hash_tables():
+    h = _HASH.get("hasher")
+    if h is None:
+        return None
+    if "token_map" not in _HASH:
+        for k in ("token_map", "multipliers", "primes", "offsets"):
+            _HASH[k] = getattr(h, k).detach().to("cpu")
+    return _HASH
+
+
+def prewarm(seq, start: int, end: int) -> int:
+    """Queue the rows tokens [start, end) of `seq` (a whole sequence's ids) look up.
+    Returns the rows queued on this rank, 0 when nothing applies (images, no cache)."""
+    t = _hash_tables()
+    if t is None or end <= start or not _STORES:
+        return 0
+    h, module = t["hasher"], t["module"]
+    n = h.max_ngram_size
+    lo = max(0, start - (n - 1))
+    window = torch.tensor(seq[lo:end], dtype=torch.int64)
+    image = getattr(h, "image_token_id", None)
+    if (window >= getattr(module, "MM_PAD_SHIFT_VALUE", 1 << 62)).any() or (
+        image is not None and (window == image).any()
+    ):
+        return 0
+    pos = torch.arange(start, end, dtype=torch.int64)
+    shifts = torch.arange(n, dtype=torch.int64)
+    back = pos.unsqueeze(-1) - shifts
+    blocked = back < 0
+    tokens = window[(back - lo).clamp_min(0)]
+    ids = module.compute_engram_hash_ids(
+        tokens, blocked, h.pad_id, t["token_map"], t["multipliers"], t["primes"], t["offsets"]
+    )
+    queued = 0
+    for store, row_lo, row_hi, layer_id in _STORES:
+        col = ids[:, t["layer_ids"].index(layer_id)].reshape(-1)
+        own = col[(col >= row_lo) & (col < row_hi)].contiguous()
+        if own.numel():
+            _lib.row_store_warm(store, own.data_ptr(), own.numel())
+            queued += own.numel()
+    return queued
+
+
+def prewarm_batch(batch) -> None:
+    """Scheduler hook, before a prefill batch runs: warm each request's next chunk."""
+    if not WARM or not _STORES or not batch.forward_mode.is_extend():
+        return
+    for req in batch.reqs:
+        start, end = req.prefix_len, req.extend_end
+        if end is None or end - start < WARM_MIN:
+            continue
+        seq = req.full_untruncated_fill_ids
+        total = len(req.origin_input_ids)
+        if end < total:
+            prewarm(seq, end, min(total, end + (end - start)))
+
+
+def install_scheduler(module):
+    cls = module.Scheduler
+    original = cls.run_batch
+
+    def run_batch(self, batch, *args, **kwargs):
+        try:
+            prewarm_batch(batch)
+        except Exception as e:  # the warm-up is an optimisation: never fail the batch
+            logger.warning("engram prewarm skipped: %s", e)
+        return original(self, batch, *args, **kwargs)
+
+    cls.run_batch = run_batch
+
+
 def install(module):
     cls = module.EngramEmbedding
+    hasher_init = module.EngramHasher.__init__
+
+    def init_hasher(self, layout, *args, **kwargs):
+        hasher_init(self, layout, *args, **kwargs)
+        _HASH.update(module=module, hasher=self, layer_ids=list(layout.layer_ids))
+
+    module.EngramHasher.__init__ = init_hasher
 
     def init(self, num_embeddings, dim, layer_id, column_bounds=None):
         torch.nn.Module.__init__(self)
@@ -166,6 +257,8 @@ def install(module):
         if not self._store:
             raise RuntimeError(f"row_store_open failed for {path}")
         _lib.row_store_range(self._store, self.row_start, end)
+        if WARM and mode != "ram" and budget:
+            _STORES.append((self._store, self.row_start, end, layer_id))
         self._staging, self._works = {}, {}
 
         # The loader must see the parameter names but never allocate the tables.

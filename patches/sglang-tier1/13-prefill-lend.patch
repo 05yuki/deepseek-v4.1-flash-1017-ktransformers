@@ -1,4 +1,4 @@
-From b95b2cb2699e9ec9e172d9de0c64d2a382114ab8 Mon Sep 17 00:00:00 2001
+From fa26afb3ee2f13569068f5a757c971c1f9b29b5b Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 1] prefill-lend: lend the GPU-resident weights' memory
@@ -1740,7 +1740,7 @@ index fdb3187567..62a35dd360 100644
      @staticmethod
      def restore_weights_before_loading(model, target_device):
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 9e3ae1df9f..b19e9d07e7 100644
+index 14625c034f..a7993ce5a4 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
 @@ -1331,7 +1331,11 @@ class MqaAttentionBase(nn.Module):
@@ -1756,7 +1756,7 @@ index 9e3ae1df9f..b19e9d07e7 100644
              if meta is not None:
                  try:
                      meta.q_pad_buffer = buf
-@@ -4193,6 +4197,10 @@ class DeepseekV4Model(nn.Module):
+@@ -4208,6 +4212,10 @@ class DeepseekV4Model(nn.Module):
              if tail is not None and i == self.late_layer_start:
                  if self.tail_writes_source_kv:
                      source = self.layers[i]

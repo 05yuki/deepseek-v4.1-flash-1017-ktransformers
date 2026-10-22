@@ -1,4 +1,4 @@
-From 924209e6773e007960a79574842905cabc708d67 Mon Sep 17 00:00:00 2001
+From 80c849ab8ad296a91ea467dceaa93aab1a6ad5d9 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] [tier 1] loading: skip the CPU-only experts in the GPU
@@ -291,7 +291,7 @@ index 1d7fce13b2..74390749aa 100644
  
      # Sliding window: max_workers loading + 1 prefetched.
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 954dd9e367..9e3ae1df9f 100644
+index b27a030ce4..14625c034f 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
 @@ -21,6 +21,7 @@ from typing import (
@@ -349,7 +349,7 @@ index 954dd9e367..9e3ae1df9f 100644
  def _o_fp8_qdq_block() -> int:
      """SGLANG_DSV4_O_FP8_QDQ_BLOCK (sglang-dsv4-o-fp8-qdq.py): FP8 quant-dequant of the
      attention output before a bf16 wo_a, in blocks of this many; 0 = off."""
-@@ -5331,6 +5372,8 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -5346,6 +5387,8 @@ class DeepseekV4ForCausalLM(nn.Module):
  
          cache_compressor_weight = {}
          COMPRESSOR_PART = ".compressor.w"
@@ -358,7 +358,7 @@ index 954dd9e367..9e3ae1df9f 100644
  
          fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
          cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
-@@ -5384,6 +5427,13 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -5399,6 +5442,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                          is_nextn=is_nextn,
                          num_hidden_layers=self.config.num_hidden_layers,
                      )
