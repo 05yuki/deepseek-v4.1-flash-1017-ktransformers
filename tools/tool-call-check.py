@@ -116,8 +116,11 @@ calls = r["choices"][0]["message"].get("tool_calls") or []
 ok = len(calls) == 1 and calls[0]["function"]["name"] == "get_weather" and calls[0].get("namespace") == "weather"
 check("namespace", ok, f"calls={[(c['function']['name'], c.get('namespace')) for c in calls]}")
 
-# thinking
-r = post({"messages": ASK, "tools": [WEATHER], "max_tokens": 4096,
+# thinking: a request that needs a step of reasoning before the call. A bare "use the tool" is answered
+# with an empty reasoning block, by the checkpoint's own inference code too.
+PLAN = [{"role": "user", "content": "I land at Haneda at 18:00 and must decide between an outdoor dinner and an "
+         "indoor one. Work out which city's weather decides this, then check it with the tool."}]
+r = post({"messages": PLAN, "tools": [WEATHER], "max_tokens": 4096,
           "chat_template_kwargs": {"thinking": True}})
 m = r["choices"][0]["message"]
 calls = m.get("tool_calls") or []
