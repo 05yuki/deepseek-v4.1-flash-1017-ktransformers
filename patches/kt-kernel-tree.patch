@@ -999,7 +999,7 @@ index e626537..a3f2a2e 100644
                g = std::min(std::max(g, -swiglu_limit), swiglu_limit);
                u = std::min(std::max(u, -swiglu_limit), swiglu_limit);
 diff --git a/kt-kernel/operators/avx2/mxfp4-moe.hpp b/kt-kernel/operators/avx2/mxfp4-moe.hpp
-index e328908..d68d230 100644
+index e328908..b482ee1 100644
 --- a/kt-kernel/operators/avx2/mxfp4-moe.hpp
 +++ b/kt-kernel/operators/avx2/mxfp4-moe.hpp
 @@ -16,15 +16,213 @@
@@ -1297,7 +1297,7 @@ index e328908..d68d230 100644
 +        auto r = split_range(m, ith, nth);
 +        m_start = r.first;
 +        m_end = r.second;
-+      }
+       }
 +      std::memcpy(data + (size_t)m_start * k, src + (size_t)m_start * k,
 +                  (size_t)(m_end - m_start) * k * sizeof(ggml_bf16_t));
 +      qa_m = 0;
@@ -1361,7 +1361,7 @@ index e328908..d68d230 100644
 +            }
 +          }
 +        }
-       }
++      }
 +      q8_m = m;
      }
    };
@@ -1469,7 +1469,7 @@ index e328908..d68d230 100644
  static void gemm_mxfp4(int m, int n, int k, GemmKernelAVX2MXFP4::BufferA& a, GemmKernelAVX2MXFP4::BufferB& b,
                         GemmKernelAVX2MXFP4::BufferC& c, int ith, int nth) {
    // H3: Check weight buffer is not null
-@@ -199,6 +604,842 @@ static void gemm_mxfp4(int m, int n, int k, GemmKernelAVX2MXFP4::BufferA& a, Gem
+@@ -199,6 +604,920 @@ static void gemm_mxfp4(int m, int n, int k, GemmKernelAVX2MXFP4::BufferA& a, Gem
    const __m128i lut_lo = _mm_load_si128((const __m128i*)GemmKernelAVX2MXFP4::fp4_bf16_lo);
    const __m128i lut_hi = _mm_load_si128((const __m128i*)GemmKernelAVX2MXFP4::fp4_bf16_hi);
  
@@ -1629,6 +1629,84 @@ index e328908..d68d230 100644
 +      const char* v = std::getenv("KT_MXFP4_G32_TILE");
 +      return v ? std::max(0, std::atoi(v)) & ~3 : 0;
 +    }();
++    // Verify-sized batches (group-32, 2 <= m <= 8, KT_MXFP4_SMALL_M, on): a speculative
++    // verify step puts a few tokens on the same experts. Each 32-value group is decoded
++    // once for up to four rows held in registers (rows 4-7 take a second pass, their
++    // weights from L2), k-blocked so the rows' activations stay in L1. Every row keeps
++    // the single-row path's arithmetic (one product chain a group, the scale folded
++    // into two sums by group parity, groups in order), so each row's output is
++    // bit-identical to computing it alone. Before: 2 rows 1.58x, 3 rows 2.17x a row.
++    static const bool kSmallM = [] {
++      const char* v = std::getenv("KT_MXFP4_SMALL_M");
++      return v ? std::atoi(v) != 0 : true;
++    }();
++    if (kSmallM && m >= 2 && m <= 8 && n_end > n_start) {
++      const int ncols = n_end - n_start;
++      constexpr int kSmBlk = 32;  // groups a k block: four rows' activations are 16 KiB
++      static thread_local std::vector<float> sm_park_storage;
++      if (sm_park_storage.size() < (size_t)ncols * 64) sm_park_storage.resize((size_t)ncols * 64);
++      float* park = sm_park_storage.data();
++      const uint8_t* codes = b.code;
++      if (codes != nullptr && kt_scale_codes_verify()) b.verify_scale_codes();
++      auto rows_pass = [&](auto nr_const, int r0) {
++        constexpr int NR = decltype(nr_const)::value;
++        std::fill(park, park + (size_t)ncols * 64, 0.f);
++        for (int gb = 0; gb < group_count; gb += kSmBlk) {
++          const int ge = std::min(group_count, gb + kSmBlk);
++          for (int ni = n_start; ni < n_end; ni++) {
++            const uint8_t* b_row = b.b + (size_t)ni * row_bytes;
++            if (ni + 1 < n_end) {
++              const char* nx = (const char*)(b_row + row_bytes + (size_t)gb * 16);
++              for (int off = 0; off < (ge - gb) * 16; off += 64) _mm_prefetch(nx + off, _MM_HINT_T0);
++            }
++            float* pk = park + (size_t)(ni - n_start) * 64;
++            __m256 ta[NR], tb[NR];
++#pragma GCC unroll 4
++            for (int r = 0; r < NR; r++) {
++              ta[r] = _mm256_loadu_ps(pk + 16 * r);
++              tb[r] = _mm256_loadu_ps(pk + 16 * r + 8);
++            }
++            for (int g = gb; g < ge; g++) {
++              KT_MXFP4_DECODE_GROUP(b_row, g);
++              const __m256 sv = _mm256_broadcast_ss(codes ? &b.lut[codes[(size_t)ni * group_count + g]]
++                                                          : &b.d[(size_t)ni * group_count + g]);
++#pragma GCC unroll 4
++              for (int r = 0; r < NR; r++) {
++                const float* ap = a_perm + (size_t)(r0 + r) * k + (size_t)g * 32;
++                __m256 gacc = _mm256_mul_ps(_mm256_loadu_ps(ap), w0);
++                gacc = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 8), w1, gacc);
++                gacc = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 16), w2, gacc);
++                gacc = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 24), w3, gacc);
++                if (g & 1)
++                  tb[r] = _mm256_fmadd_ps(gacc, sv, tb[r]);
++                else
++                  ta[r] = _mm256_fmadd_ps(gacc, sv, ta[r]);
++              }
++            }
++#pragma GCC unroll 4
++            for (int r = 0; r < NR; r++) {
++              _mm256_storeu_ps(pk + 16 * r, ta[r]);
++              _mm256_storeu_ps(pk + 16 * r + 8, tb[r]);
++            }
++          }
++        }
++        for (int ni = n_start; ni < n_end; ni++) {
++          const float* pk = park + (size_t)(ni - n_start) * 64;
++          for (int r = 0; r < NR; r++)
++            c.data[(size_t)(r0 + r) * n + ni] =
++                hsum_avx2(_mm256_add_ps(_mm256_loadu_ps(pk + 16 * r), _mm256_loadu_ps(pk + 16 * r + 8)));
++        }
++      };
++      for (int r0 = 0; r0 < m; r0 += 4) {
++        switch (std::min(4, m - r0)) {
++          case 1: rows_pass(std::integral_constant<int, 1>{}, r0); break;
++          case 2: rows_pass(std::integral_constant<int, 2>{}, r0); break;
++          case 3: rows_pass(std::integral_constant<int, 3>{}, r0); break;
++          default: rows_pass(std::integral_constant<int, 4>{}, r0); break;
++        }
++      }
++      return;
++    }
 +    // int8 path v2 (group-32, KT_MXFP4_G32_INT8). See patches/kt-mxfp4-g32-int8.py.
 +    int mi8 = 0;
 +    if (GemmKernelAVX2MXFP4::BufferA::int8_enabled() && a.q8 != nullptr && a.q8_m >= m && m >= 4 &&
@@ -2312,7 +2390,7 @@ index e328908..d68d230 100644
    for (int ni = n_start; ni < n_end; ni++) {
      const uint8_t* b_row = b.b + (size_t)ni * row_bytes;
      const float* b_scales = b.d + (size_t)ni * group_count;
-@@ -367,12 +1608,25 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+@@ -367,12 +1686,25 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
    size_t buffer_c_required_size_impl(size_t m, size_t n) const { return T::BufferC::required_size(m, n); }
  
    std::shared_ptr<typename T::BufferA> make_buffer_a_impl(size_t m, size_t k, void* data) const {
@@ -2339,7 +2417,7 @@ index e328908..d68d230 100644
    std::shared_ptr<typename T::BufferC> make_buffer_c_impl(size_t m, size_t n, void* data) const {
      return std::make_shared<typename T::BufferC>(m, n, data);
    }
-@@ -521,6 +1775,13 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+@@ -521,6 +1853,13 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
      size_t gpu_tp_weight_bytes = (size_t)full_config.intermediate_size * full_config.hidden_size / gpu_tp_count / 2;
      size_t gpu_tp_scale_elem_count =
          (size_t)full_config.intermediate_size * full_config.hidden_size / gpu_tp_count / group_size;
@@ -2353,7 +2431,7 @@ index e328908..d68d230 100644
  
      if (cpu_tp_count >= gpu_tp_count) {
        int target_gpu_tp = tp_part_idx / (cpu_tp_count / gpu_tp_count);
-@@ -540,10 +1801,10 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+@@ -540,10 +1879,10 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
            [=, this](int tid) {
              if (tid < NWT) {
                size_t s = (size_t)tid * wchunk, e = std::min(s + wchunk, cpu_tp_weight_bytes);
@@ -2366,7 +2444,7 @@ index e328908..d68d230 100644
              } else if (tid < NWT * 2 + ndt) {
                size_t cols_per = (config_.hidden_size + ndt - 1) / ndt;
                size_t cs = (size_t)(tid - NWT * 2) * cols_per;
-@@ -558,9 +1819,9 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+@@ -558,9 +1897,9 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
                  fp32_to_bf16(w2_sdst + col * gss + gso, down_bb_[expert_id]->d + col * spc, spc);
                }
              } else if (tid == NWT * 2 + ndt) {
@@ -2378,7 +2456,7 @@ index e328908..d68d230 100644
              }
            },
            nullptr);
-@@ -587,10 +1848,10 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+@@ -587,10 +1926,10 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
              size_t cow = (size_t)lg * dw, cos = (size_t)lg * ds;
              if (tt < NWT) {
                size_t s = (size_t)tt * wchunk, e = std::min(s + wchunk, dw);
@@ -2391,7 +2469,7 @@ index e328908..d68d230 100644
              } else if (tt < NWT * 2 + ndt) {
                size_t cols_per = (config_.hidden_size + ndt - 1) / ndt;
                size_t cs = (size_t)(tt - NWT * 2) * cols_per;
-@@ -604,9 +1865,9 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+@@ -604,9 +1943,9 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
                  fp32_to_bf16(w2_sdst + col * sgc, down_bb_[expert_id]->d + csoff, sgc);
                }
              } else if (tt == NWT * 2 + ndt) {
@@ -2403,7 +2481,7 @@ index e328908..d68d230 100644
              }
            },
            nullptr);
-@@ -620,12 +1881,19 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
+@@ -620,12 +1959,19 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
    std::vector<void*> tp_owned_down_bufs_;
    std::vector<void*> tp_owned_gate_bufs_;
    std::vector<void*> tp_owned_up_bufs_;
@@ -2423,7 +2501,7 @@ index e328908..d68d230 100644
      for (void* p : tp_owned_down_bufs_)
        if (p) std::free(p);
      for (void* p : tp_owned_gate_bufs_)
-@@ -634,6 +1902,21 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
+@@ -634,6 +1980,21 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
        if (p) std::free(p);
    }
  
@@ -2445,7 +2523,7 @@ index e328908..d68d230 100644
    void load_weights() override {
      auto& config = this->config;
      auto& tps = this->tps;
-@@ -664,16 +1947,41 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
+@@ -664,16 +2025,41 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
          // gate/up: [intermediate × hidden] = [N × K], TP slices along N → contiguous rows
          size_t gate_up_wt_per_expert = (size_t)per_tp_interm * tpc.hidden_size / 2;
          size_t gate_up_alloc = ((size_t)tpc.expert_num * gate_up_wt_per_expert + 63) & ~(size_t)63;
@@ -2495,7 +2573,7 @@ index e328908..d68d230 100644
          tp_owned_down_bufs_[i] = down_buf;
  
          auto subpool = pool->get_subpool(i);
-@@ -820,6 +2128,26 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
+@@ -820,6 +2206,26 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
        });
      }
  

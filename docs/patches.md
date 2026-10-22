@@ -147,6 +147,12 @@ Tier 1.
 - **Decode reads** (`KT_MXFP4_DEC_VCONV`, `KT_MXFP4_DEC_PFS=1024`, on): each task converts the
   activation row to the kernel's order with PSHUFB instead of a scalar loop, and the weights
   are prefetched 1 KB ahead, a line every 4 groups. Bit-identical results.
+- **A few tokens on one expert** (`KT_MXFP4_SMALL_M`, on): with 2 to 8 rows on an expert
+  (the prefill's last rows that the decoder's bounded replay leaves to the CPU, short
+  prompts, a speculative verify), each weight group is decoded once for up to four rows
+  instead of once a row. 2 rows take 1.17x one row's time instead of 1.55x, 3 rows 1.46x
+  instead of 2.17x. Every row's output is byte-identical to computing that row alone,
+  which the previous 4-row blocks were not.
 - **Shared expert memory** (`KT_EXPERT_SHM`, on): the experts live in shared memory on 2 MB
   pages, which the GPU ranks map to stream from (the streamed prefill).
 - **Placement on the CPU side**: each NUMA part loads the experts the placement assigns to
@@ -180,7 +186,9 @@ them unchanged, which may not be their best:
 - `tools/dsv41-encoding-check.py`: SGLang's chat encoding and tool parsing against the
   checkpoint's `encoding/encoding.py` and its tests, byte for byte.
 - `tools/kt-mxfp4-decode-bw.py`: the CPU experts' decode call on one socket (time, read rate,
-  output hash), to compare kt-kernel switches and against the socket's read bandwidth.
+  output hash), to compare kt-kernel switches and against the socket's read bandwidth;
+  `--m` rows a call, `--same` all of them on the same experts, `--check` every row against
+  the row computed alone, byte for byte.
 - `tools/mxfp4-fp32-moe-test.py`: the GPU MoE kernels against an fp64 reference and Marlin,
   and their outputs repeating bit for bit.
 - `tools/bench.py`: the README's decode and prefill numbers, against a running server.

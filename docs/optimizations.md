@@ -58,6 +58,7 @@ repeats to the last digit from launch to launch (1017).
 | The plan charges the sliding-window pool for the chunks in flight, not the rest of the prompt | 512K 256 → 611 tok/s | 1017 |
 | The GPU-resident experts of a chunk on the tensor cores, live routes only (`SGLANG_MXFP4_MOE_FP32`) | a chunk's resident call 64.0 → 15.7 ms; 35K +4-6% | 1017 |
 | A prefill chunk's engram rows read before it runs: while chunk k runs, the scheduler hashes chunk k+1's tokens on the CPU and each rank's row store reads the missing rows into its RAM cache once chunk k's lookups are done (`DSV41_ENGRAM_WARM`); the later engram layer's lookup starts with the forward (`SGLANG_DSV41_ENGRAM_PREFETCH_PREFILL`) | lookups after the first chunk 2.1 s → 0.04 s (0.9% misses); 35K 1,011 → 1,306, 131K 1,009 → 1,450 tok/s; log-probs identical | 1017 |
+| The CPU experts decode each weight group once for 2 to 8 rows on an expert, not once a row (`KT_MXFP4_SMALL_M`) | 3 rows on an expert 1,064 → 719 µs; 35K +0.7%; rows byte-identical to computed alone | 1017 |
 | The engram scales of each rank's rows held in RAM (1.4 GiB a table and rank), so a missed row is one NVMe read instead of two (`DSV41_ENGRAM_SCALES_RAM`) | a 12K-token chunk's lookups 4.0 / 6.7 → 2.1 / 2.1 s (layers 1 / 14); 35K 655 → 1011, 131K 652 → 989 tok/s, rows byte-identical | 1017 |
 
 None of these takes tokens from the KV pool. The 1M-token pool comes first.

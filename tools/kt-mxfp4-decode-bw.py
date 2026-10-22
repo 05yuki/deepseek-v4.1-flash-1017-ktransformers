@@ -40,6 +40,10 @@ def main():
     ap.add_argument("--iters", type=int, default=400)
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--m", type=int, default=1, help="tokens a call (rows)")
+    ap.add_argument("--same", action="store_true",
+                    help="every row routed to the same C experts (a verify step's overlap), not C each")
+    ap.add_argument("--check", type=int, default=0,
+                    help="compare N calls of M rows with the same rows computed one at a time, byte for byte")
     args = ap.parse_args()
     gs = 32
 
@@ -50,10 +54,14 @@ def main():
     print(f"weights built in {time.time() - t0:.0f} s", flush=True)
 
     wpe = 3 * args.hidden * args.inter
-    nbytes = args.c * wpe * (0.5 + 1 / gs)
     torch.manual_seed(0)
     M = args.m
-    sets = [torch.stack([torch.randperm(args.experts)[: args.c] for _ in range(M)]).to(torch.int64).contiguous() for _ in range(997)]
+    if args.same:
+        sets = [torch.randperm(args.experts)[: args.c].repeat(M, 1).to(torch.int64).contiguous() for _ in range(997)]
+    else:
+        sets = [torch.stack([torch.randperm(args.experts)[: args.c] for _ in range(M)]).to(torch.int64).contiguous() for _ in range(997)]
+    # bytes a call: the distinct experts it reads
+    nbytes = sum(len(set(s.flatten().tolist())) for s in sets[:50]) / 50 * wpe * (0.5 + 1 / gs)
     rw = torch.rand(M, args.c, dtype=torch.float32).contiguous()
     x = (torch.randn(M, args.hidden) / 10).to(torch.bfloat16).contiguous()
     y = torch.empty(M, args.hidden, dtype=torch.bfloat16)
@@ -101,6 +109,21 @@ def main():
         for i in range(64):
             call(sets[i])
             h.update(y.view(torch.int16).numpy().tobytes())
+        if args.check:
+            y1 = torch.empty(1, args.hidden, dtype=torch.bfloat16)
+            one = torch.tensor([1], dtype=torch.int32)
+            same = 0
+            for i in range(args.check):
+                call(sets[i])
+                for r in range(M):
+                    ids_r = sets[i][r:r + 1].contiguous()
+                    rw_r = rw[r:r + 1].contiguous()
+                    x_r = x[r:r + 1].contiguous()
+                    cpu.submit(moe.forward_task(one.data_ptr(), args.c, ids_r.data_ptr(), rw_r.data_ptr(),
+                                                x_r.data_ptr(), y1.data_ptr(), False))
+                    cpu.sync()
+                    same += int(torch.equal(y1[0].view(torch.int16), y[r].view(torch.int16)))
+            print(f"check: {same} of {args.check * M} rows byte-identical to the row alone", flush=True)
         print(f"threads {nt:3d}: {med:7.1f} us a call ({', '.join(f'{u:.0f}' for u in times)}), "
               f"{nbytes / 1e6:.1f} MB -> {nbytes / med / 1e3:.1f} GB/s, outputs {h.hexdigest()[:16]}", flush=True)
         del moe, cpu
