@@ -1,4 +1,4 @@
-From 7d1ee630f5bf558665302e5bb05949f965c6405b Mon Sep 17 00:00:00 2001
+From 1705293dec3f970e0250ad856364f34f272f3331 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Wed, 21 Oct 2026 22:34:00 +0900
 Subject: [PATCH] [tier 0] deepseek-v4.1: score the torch indexer chunk in

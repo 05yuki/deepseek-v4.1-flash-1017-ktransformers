@@ -1,4 +1,4 @@
-From d1e398961e0ccdc2ba792a17a3ab2d1b73734638 Mon Sep 17 00:00:00 2001
+From 6bb383bdaf5a1e4823b6f002af1c1efa5f48eda9 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 23 Oct 2026 00:40:00 +0900
 Subject: [PATCH] [tier 0] deepseek-v4.1: the V4.1 KV cache layouts on SM120 /
@@ -37,7 +37,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  3 files changed, 104 insertions(+), 1 deletion(-)
 
 diff --git a/python/sglang/kernels/ops/attention/flash_mla_sm120.py b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
-index c57194d3c5..ef32889435 100644
+index c57194d3c5..1ec816c7a9 100644
 --- a/python/sglang/kernels/ops/attention/flash_mla_sm120.py
 +++ b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
 @@ -313,6 +313,22 @@ def flash_mla_with_kvcache_sm120(**kwargs):
@@ -68,7 +68,7 @@ index c57194d3c5..ef32889435 100644
  
  
 +_V41_MAIN_BYTES = 528  # KVLayout.V41: 512 fp8 + 16 ue8m0 scales (one per 32 values)
-+_V41_FP4_BYTES = 288  # KVLayout.V41_FP4: 256 bytes of e2m1 + 32 e4m3 scales (one per 16)
++_V41_FP4_BYTES = 288  # KVLayout.V41_FP4: 256 e2m1 bytes + 32 e4m3 scales (one per 16)
 +_V41_WRAPPERS = {}
 +
 +
@@ -145,10 +145,10 @@ index c57194d3c5..ef32889435 100644
      q,
      k_cache,
 diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
-index 66fcd0fa79..6db8ee76ab 100644
+index 10f20eb799..e3129a5968 100644
 --- a/python/sglang/srt/environ.py
 +++ b/python/sglang/srt/environ.py
-@@ -1665,6 +1665,8 @@ class Envs:
+@@ -1679,6 +1679,8 @@ class Envs:
      # Compressed-cache layout under "v41": "auto" (fp4 for the fp4-rounded
      # ratio-1 / ratio-2 latents, fp8 for ratios 4 / 128), "fp8" or "fp4" for all.
      SGLANG_DSV4_COMPRESSED_KV_LAYOUT = EnvStr("auto")

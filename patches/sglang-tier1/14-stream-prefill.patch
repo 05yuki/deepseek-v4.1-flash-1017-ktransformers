@@ -1,4 +1,4 @@
-From fc2e7ff812aea6486907cc95aaefa7d895ec52f0 Mon Sep 17 00:00:00 2001
+From 59a41781fd0aa0b93ffd8ea0bea20a668f9d2d78 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 1] stream-prefill: stream the CPU experts to the GPU

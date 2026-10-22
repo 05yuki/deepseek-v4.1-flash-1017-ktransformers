@@ -1,4 +1,4 @@
-From 2727b09e24c5a8ac3cfa7c77755cefda7c58be66 Mon Sep 17 00:00:00 2001
+From b9459d875cb388207035c297e40e1dd8ece42a56 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 1] kv-lend-plan: lend the KV pool's free pages to
@@ -1793,10 +1793,10 @@ index 0133caafcf..b4f97bfc6c 100644
                      else:
                          self._evict_swa(req, pre_len)
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index e1befd3c4d..333b470200 100644
+index d31cf7da06..018756c5a9 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -3421,6 +3421,10 @@ class Scheduler(
+@@ -3430,6 +3430,10 @@ class Scheduler(
              req.storage_prefetch_retry_attempts = 0
              req.storage_prefetch_last_match_len = None
              req.staged_prefetch_plan = None
@@ -1807,7 +1807,7 @@ index e1befd3c4d..333b470200 100644
          if self.disaggregation_mode == DisaggregationMode.NULL:
              if self._abort_on_queued_limit(req):
                  self._release_aborted_request(req)
-@@ -4081,6 +4085,11 @@ class Scheduler(
+@@ -4090,6 +4094,11 @@ class Scheduler(
              dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
              if dynamic_size is not None:
                  chunked_prefill_size = dynamic_size

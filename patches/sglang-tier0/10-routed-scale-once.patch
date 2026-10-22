@@ -1,4 +1,4 @@
-From b18385c9960ca51196f8c1b90ce22871a46aa99e Mon Sep 17 00:00:00 2001
+From 47c5e88cfbdc2766cb94f4081ccf36b52b27483c Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Thu, 22 Oct 2026 23:30:00 +0900
 Subject: [PATCH] [tier 0] kt: scale the routed output once when the top-k

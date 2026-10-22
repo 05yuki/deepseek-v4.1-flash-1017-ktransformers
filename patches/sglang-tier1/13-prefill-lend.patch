@@ -1,4 +1,4 @@
-From 4d8d3dace69b4ae7db69ca5cd8bb67f3c823348f Mon Sep 17 00:00:00 2001
+From 6bb5704f942d507e480d7caf2dee1275d2726405 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 1] prefill-lend: lend the GPU-resident weights' memory
@@ -1678,10 +1678,10 @@ index 0000000000..776077ca55
 +        _bounce["n"] = nbytes
 +    return _bounce["buf"][:nbytes]
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index e1f2a0dac1..e1befd3c4d 100644
+index 1831160646..d31cf7da06 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -6080,6 +6080,11 @@ class Scheduler(
+@@ -6089,6 +6089,11 @@ class Scheduler(
  
  
  def dispatch_event_loop(scheduler: Scheduler):
@@ -1740,10 +1740,10 @@ index fdb3187567..62a35dd360 100644
      @staticmethod
      def restore_weights_before_loading(model, target_device):
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 399ce0b3a0..b8443e5a92 100644
+index 33f6f7fcd3..09d66d92ab 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -1334,7 +1334,11 @@ class MqaAttentionBase(nn.Module):
+@@ -1336,7 +1336,11 @@ class MqaAttentionBase(nn.Module):
              assert not getattr(meta, "q_pad_captured", False), (
                  "the padded query buffer grew after a CUDA graph captured it"
              )
@@ -1756,7 +1756,7 @@ index 399ce0b3a0..b8443e5a92 100644
              if meta is not None:
                  try:
                      meta.q_pad_buffer = buf
-@@ -4239,6 +4243,10 @@ class DeepseekV4Model(nn.Module):
+@@ -4242,6 +4246,10 @@ class DeepseekV4Model(nn.Module):
              if tail is not None and i == self.late_layer_start:
                  if self.tail_writes_source_kv:
                      source = self.layers[i]

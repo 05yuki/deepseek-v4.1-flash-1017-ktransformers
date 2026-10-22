@@ -1,4 +1,4 @@
-From e490009ae7e8bda08aa659ebdd8c3b05d5760f99 Mon Sep 17 00:00:00 2001
+From 330b7e0ca569f2ec3c1f92b9482c0e2a5fc10057 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] [tier 1] pool-swa-guard: fail at startup when the SWA pool

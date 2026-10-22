@@ -1,4 +1,4 @@
-From 5ca282ada321641469c6a45ca2dae62e4f4c3881 Mon Sep 17 00:00:00 2001
+From e50d54c2d627cd47cb102592b651e2ecb6850dec Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:32 +0900
 Subject: [PATCH] [tier 0] deepseek-v4: FP8 quantize-dequantize of the
@@ -132,7 +132,7 @@ index 0000000000..3a062ae805
 +    v = (f / s).clamp(-448.0, 448.0)
 +    return (v.to(torch.float8_e4m3fn).float() * s).to(x.dtype).reshape(shape)
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index e6a6683188..16d04babc3 100644
+index 4379714115..13697f6e54 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
 @@ -461,6 +461,17 @@ def _fused_wo_a_arch_supported() -> bool:
@@ -153,7 +153,7 @@ index e6a6683188..16d04babc3 100644
  def _apply_wo_a_bf16_matmul(
      o: torch.Tensor,
      wo_a: torch.Tensor,
-@@ -2896,6 +2907,10 @@ class MQALayer(MqaAttentionBase):
+@@ -2899,6 +2910,10 @@ class MQALayer(MqaAttentionBase):
                      recipe=recipe,
                  )
              else:
