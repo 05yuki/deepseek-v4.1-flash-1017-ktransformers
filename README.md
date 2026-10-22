@@ -49,7 +49,7 @@ The KV pool itself is never made smaller to gain speed: the lends take only its 
 pages. If the server runs out of memory at launch, a shorter context
 (`SGLANG_CONTEXT_LENGTH`) makes the pool smaller; it is the only setting memory needs.
 
-- **RAM: a 512 GB class machine.** The server uses about 425 GiB, most of it the MXFP4
+- **RAM: a 512 GB class machine.** The server uses about 420 GiB, most of it the MXFP4
   CPU experts on 2 MB pages. 384 GB does not fit.
 
   The launcher makes one expert pool per NUMA node and uses every physical core.
@@ -191,19 +191,19 @@ None of it needs a server change:
 
 2 × AMD EPYC 7452 (Zen 2, AVX2), 512 GB DDR4, 2 × RTX 5070 Ti 16 GB, the checkpoint on
 NVMe; built from this repository and run with the `serve.sh` defaults (1M-token context,
-one request at a time), measured with `tools/bench.py` at tag `2026-10-21-1904`, every row from one launch.
+one request at a time), measured with `tools/bench.py` at tag `2026-10-22-1001`, every row from one launch.
 
 Decode, 1,024 tokens a reply (`--other-text` for the rows below the first):
 
 | text | tok/s |
 |---|---|
-| Japanese prose (median of four prompts) | 45.1 |
-| Chinese prose | 39.3 |
-| English prose | 37.0 |
-| math | 37.6 |
-| JSON | 35.7 |
-| English technical prose | 34.1 |
-| Python code | 33.8 |
+| Japanese prose (median of four prompts) | 45.3 |
+| Chinese prose | 39.2 |
+| math | 38.2 |
+| English prose | 37.5 |
+| JSON | 35.4 |
+| Python code | 34.5 |
+| English technical prose | 34.3 |
 
 One expert a layer always stays on the GPU, and as many more as the free GPU memory holds
 sit in the KV pool's free pages and the driver's idle memory (14-15 a layer here). All of
@@ -218,10 +218,10 @@ Prefill, one prompt of random token ids:
 
 | prompt (tokens) | tok/s | time |
 |---|---|---|
-| 35,000 | 758 | 46 s |
-| 131,072 | 757 | 2.9 min |
-| 524,288 | 686 | 13 min |
-| 1,000,000 | 579 | 29 min |
+| 35,000 | 1,013 | 35 s |
+| 131,072 | 1,009 | 2.2 min |
+| 524,288 | 877 | 10 min |
+| 1,000,000 | 703 | 24 min |
 
 Longer prompts run in smaller chunks: the prompt's own KV and the attention's working
 memory grow with its length, leaving less GPU memory for a chunk, and every chunk streams
