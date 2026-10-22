@@ -30,7 +30,7 @@ A switch marked "on" is on in `serve.sh`.
 ## SGLang tier 0
 
 What 1017 needs to run correctly. Each patch is one concern; its commit message says how
-it was checked. Four are pull requests to SGLang, one concern each; when one is merged, its
+it was checked. Six are pull requests to SGLang, one concern each; when one is merged, its
 patch goes and the pin moves past it.
 
 | patch | upstream |
@@ -43,7 +43,8 @@ patch goes and the pin moves past it.
 | `06-load-timeout` | [#45184](https://github.com/sgl-project/sglang/pull/45184) |
 | `07-chat-encoding` | not sent |
 | `08-sm12x-indexer` | not sent |
-| `09-indexer-score-in-place` | not sent |
+| `09-indexer-score-in-place` | [#45745](https://github.com/sgl-project/sglang/pull/45745) |
+| `10-routed-scale-once` | [#45810](https://github.com/sgl-project/sglang/pull/45810) |
 
 ### KTransformers wrapper
 
@@ -56,6 +57,9 @@ adds the two results. Tier 0:
 - Sends the CPU's routes to GPU expert 0 at weight 0 instead of `-1`, which the Marlin MoE
   kernels need (`KT_GPU_MASK_ZERO`, set by `serve.sh` with Marlin).
 - Runs with zero GPU experts (`--kt-num-gpu-experts 0`).
+- Scales the routed experts' output by `routed_scaling_factor` once. Since SGLang #44993 the top-k
+  folds the factor into its weights for the MXFP4 GPU methods, and the KT path multiplied it in a
+  second time (1.5 x 1.5 on 1017).
 
 ### 1017's FP8 step
 

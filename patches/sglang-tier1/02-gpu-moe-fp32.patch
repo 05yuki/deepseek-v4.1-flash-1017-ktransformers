@@ -1,4 +1,4 @@
-From 7e2580d9a7c4bf838be664036bec40a9a0c94c9c Mon Sep 17 00:00:00 2001
+From 75da673684c35e3484e670c12bea0b06cbe32b51 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:34 +0900
 Subject: [PATCH] [tier 1] gpu-moe-fp32: GPU MXFP4 experts in the checkpoint's

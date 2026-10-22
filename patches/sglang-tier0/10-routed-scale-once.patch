@@ -1,0 +1,48 @@
+From b18385c9960ca51196f8c1b90ce22871a46aa99e Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Thu, 22 Oct 2026 23:30:00 +0900
+Subject: [PATCH] [tier 0] kt: scale the routed output once when the top-k
+ already folds the factor
+
+Since #44993 the top-k folds routed_scaling_factor into its weights whenever the
+quant method says so, and KTEPWrapperMethod forwards that question to its GPU
+method (the MXFP4 ones answer yes). DeepseekV2MoE still multiplied the routed
+output by the factor again for every KT layer, so the routed experts came out
+1.5x too strong on DeepSeek V4.1. Paired NLL on 11,496 tokens against the
+checkpoint's own inference code: 2.878 before, 2.596 after (reference 2.594).
+---
+ python/sglang/srt/models/deepseek_v2.py | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 60c7f4a27f..7b5627540c 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -1233,7 +1233,12 @@ class DeepseekV2MoE(nn.Module):
+             not _is_cuda
+             and not _is_musa
+             and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
+-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
++            # KT applies the topk weights as given: scale here only when the topk
++            # did not already fold the factor into them.
++            or (
++                isinstance(self.experts.quant_method, KTEPWrapperMethod)
++                and not self.routed_scaling_factor_fused_in_topk
++            )
+         ):
+             final_hidden_states *= self.routed_scaling_factor
+ 
+@@ -1416,7 +1421,12 @@ class DeepseekV2MoE(nn.Module):
+             and not _is_musa
+             and not _is_xpu
+             and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
+-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
++            # KT applies the topk weights as given: scale here only when the topk
++            # did not already fold the factor into them.
++            or (
++                isinstance(self.experts.quant_method, KTEPWrapperMethod)
++                and not self.routed_scaling_factor_fused_in_topk
++            )
+         ):
+             final_hidden_states *= self.routed_scaling_factor
+ 

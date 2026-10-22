@@ -1,4 +1,4 @@
-From 90835830423bb967c2094885f771db7ac2efc2e1 Mon Sep 17 00:00:00 2001
+From ebf7444679211d1224ac67f8cb8bc5be95d9f8ab Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] [tier 1] launch-timing: KT_LAUNCH_TIMING, a timeline of the
