@@ -95,6 +95,13 @@ radix_args=(--disable-radix-cache)
 # DeepSeek-V4.1-Flash-1017 rounds the attention output to FP8 before wo_a; the block
 # comes from the checkpoint's own inference code (off for the earlier release)
 source "$here/tools/o-fp8-qdq-block.sh"
+# V4.1 keeps its KV in its own formats (tier 0's v41-kv-layout): the window KV as all 512
+# values in FP8 blocks of 32, the RoPE part too, and the compressed KV in FP4 blocks of 16.
+# SGLang reads them on SM100 and, with this repository, on SM120 / SM121; other GPUs keep the
+# V4 layout (v4: the V4 layout everywhere)
+if [[ -z "${SGLANG_DSV4_KV_LAYOUT:-}" ]] && [[ "${cap%%.*}" == 10 || "${cap%%.*}" == 12 ]]; then
+  export SGLANG_DSV4_KV_LAYOUT=v41
+fi
 # wo_a stays in the checkpoint's FP8 (32x32 E8M0 blocks) instead of a bf16 copy (0: bf16)
 export SGLANG_DSV4_WO_A_FP8_NATIVE="${SGLANG_DSV4_WO_A_FP8_NATIVE:-1}"
 # the vision tower waits in pinned host memory and is on the GPU only while a batch's
@@ -319,7 +326,7 @@ command=(
 
 printf '%s\n' "DeepSeek-V4.1-Flash on SGLang + KTransformers: $model"
 printf '%s\n' "GPUs ${CUDA_VISIBLE_DEVICES} (sm $cap), TP $tp on NUMA nodes $numa_list; CPU experts: $cpu_threads threads in $threadpools pools; GPU experts $gpu_experts a layer"
-printf '%s\n' "patch tier $tier; context $context_length; attention output FP8 before wo_a: block ${SGLANG_DSV4_O_FP8_QDQ_BLOCK:-0}"
+printf '%s\n' "patch tier $tier; context $context_length; attention output FP8 before wo_a: block ${SGLANG_DSV4_O_FP8_QDQ_BLOCK:-0}; KV layout ${SGLANG_DSV4_KV_LAYOUT:-v4}"
 (( tier >= 1 )) && printf '%s\n' "tier-1 features: $( [[ -f "$features_file" ]] && tr '\n' ' ' < "$features_file" || echo all)"
 (( tier >= 1 )) && printf '%s\n' "wo_a native FP8: $SGLANG_DSV4_WO_A_FP8_NATIVE; vision tower on demand: $SGLANG_DSV4_VISION_ON_DEMAND; MXFP4 MoE fp32: $SGLANG_MXFP4_MOE_FP32; Marlin MoE fp32 glue: $SGLANG_MARLIN_MOE_FP32_GLUE; CPU scale codes: $KT_MXFP4_SCALE_CODES; hot lend spare floor: ${KT_KV_HOT_SPARE_FLOOR_MB:-off} MiB; dynamic hot slots: ${KT_KV_HOT_DYNAMIC_SLOTS:-0}, resident rows too: ${KT_KV_HOT_DYNAMIC_RESIDENT:-0}"
 printf '%s\n' "Run directory: $run_dir"

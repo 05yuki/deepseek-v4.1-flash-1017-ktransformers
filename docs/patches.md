@@ -45,6 +45,7 @@ patch goes and the pin moves past it.
 | `08-sm12x-indexer` | not sent |
 | `09-indexer-score-in-place` | [#45745](https://github.com/sgl-project/sglang/pull/45745) |
 | `10-routed-scale-once` | [#45810](https://github.com/sgl-project/sglang/pull/45810) |
+| `11-v41-kv-layout` | not sent |
 
 ### KTransformers wrapper
 

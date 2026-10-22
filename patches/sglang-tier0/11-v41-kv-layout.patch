@@ -1,0 +1,185 @@
+From d1e398961e0ccdc2ba792a17a3ab2d1b73734638 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Fri, 23 Oct 2026 00:40:00 +0900
+Subject: [PATCH] [tier 0] deepseek-v4.1: the V4.1 KV cache layouts on SM120 /
+ SM121
+
+DeepSeek-V4.1 defines its SWA KV as all 512 values (RoPE included) in e4m3
+blocks of 32 with UE8M0 scales, and its ratio-1/2 compressed KV in e2m1 blocks
+of 16 with e4m3 scales: the checkpoint's inference/model.py and DeepSeek's
+DeepInfer (V41_FORMAT) agree. SGLang has both (KVLayout.V41, V41_FP4) but
+select_dsv4_kv_layout kept every GPU other than SM100 on the V4 layout (448 fp8
+per 64 plus RoPE in bf16).
+
+With SGLANG_DSV4_KV_LAYOUT=v41 and the default FlashInfer SM120 backend,
+SM120 / SM121 now take V41. flash_mla_sm120 reads a 528-byte main cache through
+FlashInfer's SparseMLASm120Wrapper (kv_scale_format "ue8m0_g32", the 288-byte
+V41_FP4 extra cache with extra_kv_fp4) without the 256->64 page split, at
+SGLANG_SM120_V41_PRECISION, by default FlashInfer's full-BF16 route (bf16 Q and
+P, exact on-chip dequantization, fp32 softmax and merge) as the reference
+computes. The writers needed nothing.
+
+Checked on 2x RTX 5070 Ti:
+- the V41 / V41_FP4 writers against the reference's act_quant / fp4_act_quant:
+  0 of 2,097,152 values differ each;
+- the attention against torch over the same pages: 0.2-0.3% (FlashInfer's
+  default MXFP8 route: 3.2-3.9%);
+- decode attention under a CUDA graph: 10-11 us against V4's 16-18 us;
+- layer 0's attention output against the reference: 3.8% -> 1.0%;
+- NLL on 24 x 480 tokens 2.590 (reference 2.594).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ .../kernels/ops/attention/flash_mla_sm120.py  | 90 +++++++++++++++++++
+ python/sglang/srt/environ.py                  |  2 +
+ .../srt/mem_cache/deepseek_v4_memory_pool.py  | 13 ++-
+ 3 files changed, 104 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/kernels/ops/attention/flash_mla_sm120.py b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
+index c57194d3c5..ef32889435 100644
+--- a/python/sglang/kernels/ops/attention/flash_mla_sm120.py
++++ b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
+@@ -313,6 +313,22 @@ def flash_mla_with_kvcache_sm120(**kwargs):
+     extra_indices = kwargs.get("extra_indices_in_kvcache")
+     extra_topk_length = kwargs.get("extra_topk_length")
+ 
++    if k_cache.shape[-1] == _V41_MAIN_BYTES:
++        # The DeepSeek-V4.1 layouts (KVLayout.V41 main, V41_FP4 or V41 extra) are read
++        # in place: FlashInfer takes their page size at run time, so no page split.
++        return _flash_mla_flashinfer_v41(
++            q,
++            k_cache,
++            indices,
++            topk_length,
++            attn_sink,
++            head_dim_v,
++            softmax_scale,
++            extra_k_cache,
++            extra_indices,
++            extra_topk_length,
++        )
++
+     if _sm120_default_backend == "flashinfer":
+         if q.shape[0] > SM120_DECODE_MAX_TOKENS:
+             return _flash_mla_sm120_prefill(
+@@ -580,6 +596,80 @@ def _split_kv_pages_to_64(
+     )
+ 
+ 
++_V41_MAIN_BYTES = 528  # KVLayout.V41: 512 fp8 + 16 ue8m0 scales (one per 32 values)
++_V41_FP4_BYTES = 288  # KVLayout.V41_FP4: 256 bytes of e2m1 + 32 e4m3 scales (one per 16)
++_V41_WRAPPERS = {}
++
++
++def _v41_wrapper(extra_fp4: bool, device):
++    """One FlashInfer SM120 sparse-MLA wrapper per (extra cache format, device).
++
++    SGLANG_SM120_V41_PRECISION: "bf16" (default) runs the full-BF16 route, which
++    computes as DeepSeek's reference does: bf16 Q and P operands, the cache
++    dequantized exactly on chip, fp32 softmax and split merge. "default" is
++    FlashInfer's MXFP8 route (Q and P rounded to FP8).
++    """
++    precision = envs.SGLANG_SM120_V41_PRECISION.get()
++    key = (extra_fp4, precision, device)
++    wrapper = _V41_WRAPPERS.get(key)
++    if wrapper is None:
++        from flashinfer.mla import SparseMLASm120Wrapper
++
++        wrapper = SparseMLASm120Wrapper(
++            kv_scale_format="ue8m0_g32",
++            extra_kv_fp4=extra_fp4,
++            compute_precision=precision,
++            device=device,
++        )
++        _V41_WRAPPERS[key] = wrapper
++    return wrapper
++
++
++def _flash_mla_flashinfer_v41(
++    q,
++    k_cache,
++    indices,
++    topk_length,
++    attn_sink,
++    head_dim_v,
++    softmax_scale,
++    extra_k_cache,
++    extra_indices,
++    extra_topk_length,
++):
++    """Sparse MLA over a KVLayout.V41 main cache, decode and prefill alike."""
++    q2 = q.squeeze(1) if q.ndim == 4 else q
++    num_tokens, num_heads, _ = q2.shape
++    kv_u8 = k_cache if k_cache.dtype == torch.uint8 else k_cache.view(torch.uint8)
++    idx = indices.squeeze(1) if indices.dim() == 3 else indices
++    extra_u8 = None
++    extra_idx = None
++    if extra_k_cache is not None:
++        extra_u8 = (
++            extra_k_cache
++            if extra_k_cache.dtype == torch.uint8
++            else extra_k_cache.view(torch.uint8)
++        )
++        extra_idx = (
++            extra_indices.squeeze(1) if extra_indices.dim() == 3 else extra_indices
++        )
++    extra_fp4 = extra_u8 is not None and extra_u8.shape[-1] == _V41_FP4_BYTES
++    output = q2.new_empty((num_tokens, num_heads, head_dim_v), dtype=torch.bfloat16)
++    _v41_wrapper(extra_fp4, q2.device).run(
++        q2,
++        kv_u8,
++        idx,
++        output,
++        softmax_scale,
++        topk_length=topk_length,
++        attn_sink=attn_sink,
++        extra_kv_cache=extra_u8,
++        extra_indices=extra_idx,
++        extra_topk_length=extra_topk_length,
++    )
++    return (output.unsqueeze(1), None)
++
++
+ def _flash_mla_flashinfer(
+     q,
+     k_cache,
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 66fcd0fa79..6db8ee76ab 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -1665,6 +1665,8 @@ class Envs:
+     # Compressed-cache layout under "v41": "auto" (fp4 for the fp4-rounded
+     # ratio-1 / ratio-2 latents, fp8 for ratios 4 / 128), "fp8" or "fp4" for all.
+     SGLANG_DSV4_COMPRESSED_KV_LAYOUT = EnvStr("auto")
++    # SM120, KVLayout.V41 caches: FlashInfer compute precision, "bf16" or "default" (MXFP8 Q/P).
++    SGLANG_SM120_V41_PRECISION = EnvStr("bf16")
+     # unified_kv only: split the pool into an fp8 nope pool plus a parallel
+     # bf16 rope pool, 640 B/token instead of 1024. The unified pool takes no
+     # dtype, so --kv-cache-dtype has no effect there and this switch is the
+diff --git a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
+index 9f6f404018..522a38cace 100644
+--- a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
++++ b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
+@@ -229,9 +229,20 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
+                 "V4.1 KV layouts on HIP require gfx950 with aiter_sparse attention"
+             )
+         return KVLayout.V41, option
++    # SM120 / SM121 read the V4.1 layouts through FlashInfer's SM120 sparse MLA
++    # (flash_mla_sm120.py); "auto" still keeps V4 there.
++    is_sm12x_flashinfer = (
++        torch.cuda.is_available()
++        and torch.version.cuda is not None
++        and torch.cuda.get_device_capability()[0] == 12
++        and envs.SGLANG_SM120_FLASHMLA_BACKEND.get() == "flashinfer"
++    )
+     if mode == "auto" and not is_sm100:
+         return KVLayout.V4, None
+-    assert is_sm100, "the V4.1 KV cache layouts need an SM100 / SM103 GPU"
++    assert is_sm100 or is_sm12x_flashinfer, (
++        "the V4.1 KV cache layouts need an SM100 / SM103 GPU, or SM120 / SM121 "
++        "with SGLANG_SM120_FLASHMLA_BACKEND=flashinfer"
++    )
+     return KVLayout.V41, option
+ 
+ 

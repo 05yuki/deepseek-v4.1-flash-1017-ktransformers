@@ -1,4 +1,4 @@
-From e69c0518298b487c2d917dc347cb6a38aef9a1f8 Mon Sep 17 00:00:00 2001
+From 1b51718bb78bdda91007289fd8d670901f3d866b Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] [tier 1] loading: skip the CPU-only experts in the GPU

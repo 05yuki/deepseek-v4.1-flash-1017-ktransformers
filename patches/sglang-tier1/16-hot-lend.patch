@@ -1,4 +1,4 @@
-From f59ffdcd70d07b14339d5d93d87f06f9d5d204f5 Mon Sep 17 00:00:00 2001
+From ddd64f2e3b6ed8a20efcf721ed65fccce7cad601 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 1] hot-lend: more hot experts in the KV pool's free
@@ -53,8 +53,8 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
  .../srt/layers/moe/fused_moe_triton/layer.py  |   7 +
  python/sglang/srt/layers/moe/kt_ep_wrapper.py |  37 +-
- .../sglang/srt/layers/moe/kt_kv_hot_lend.py   | 652 +++++++++++++++++-
- 3 files changed, 664 insertions(+), 32 deletions(-)
+ .../sglang/srt/layers/moe/kt_kv_hot_lend.py   | 664 +++++++++++++++++-
+ 3 files changed, 674 insertions(+), 34 deletions(-)
 
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 index e8629f0895..4897247be7 100644
@@ -181,7 +181,7 @@ index c4dd1167e5..bcc8f41425 100644
  
      def __getattr__(self, name: str):
 diff --git a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
-index 8a7aa14962..2adc994967 100644
+index 8a7aa14962..f335b8d6e3 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
 @@ -31,19 +31,45 @@ ones most worth adding. This module:
@@ -965,7 +965,28 @@ index 8a7aa14962..2adc994967 100644
          return
      if not STATE["want"]:
          STATE["since"] += 1
-@@ -494,6 +1068,12 @@ def tick(runner) -> None:
+@@ -481,10 +1055,18 @@ def tick(runner) -> None:
+     STATE["want"], STATE["since"] = False, 0
+     _hook()
+     t0 = time.perf_counter()
+-    got = m.decode_lend(runner, RESERVE, MIN_MB << 20)
++    dev = LAYERS[0].slots[LAYERS[0].names[0][1]].device
++    # MIN_MB is the whole lend's floor, free pages and the driver's spare together: a
++    # smaller KV layout (V4.1's FP4 compressed caches halve the full pool's pages)
++    # leaves fewer free-page bytes and puts the rest in the driver's free memory
++    min_bytes = MIN_MB << 20
++    if SPARE_FLOOR_MB >= 0:
++        torch.cuda.empty_cache()
++        spare_now = torch.cuda.mem_get_info(dev)[0] - (SPARE_FLOOR_MB << 20)
++        min_bytes = max(1, min_bytes - max(0, spare_now))
++    got = m.decode_lend(runner, RESERVE, min_bytes)
+     if got <= 0:
+         return
+-    dev = LAYERS[0].slots[LAYERS[0].names[0][1]].device
+     budget = got - (MARGIN_MB << 20)
+     spare = 0
+     if SPARE_FLOOR_MB >= 0:
+@@ -494,6 +1076,12 @@ def tick(runner) -> None:
          if free > budget:
              spare, budget = free - budget, free
      ks = _plan(budget)
@@ -978,7 +999,7 @@ index 8a7aa14962..2adc994967 100644
      for i, (L, k) in enumerate(zip(LAYERS, ks)):
          if k and any(kt_kv_vmm.restore(L.slots[nm], 0, _span(L, nm, k)) < 0 for _, nm in L.names):
              # no memory after all: this layer and the rest get nothing
-@@ -504,11 +1084,22 @@ def tick(runner) -> None:
+@@ -504,11 +1092,22 @@ def tick(runner) -> None:
                      kt_kv_vmm.release(M.slots[nm], 0, _span(M, nm, M.x))
              ks = ks[:i] + [0] * (len(LAYERS) - i)
              break
@@ -1002,7 +1023,7 @@ index 8a7aa14962..2adc994967 100644
      kd = _k_dev(dev)
      kd.copy_(torch.tensor(ks, dtype=torch.int64), non_blocking=True)
      torch.cuda.synchronize(dev)
-@@ -534,6 +1125,11 @@ def release(why: str) -> None:
+@@ -534,6 +1133,11 @@ def release(why: str) -> None:
      dev = LAYERS[0].slots[LAYERS[0].names[0][1]].device
      kd = _k_dev(dev)
      kd.zero_()
