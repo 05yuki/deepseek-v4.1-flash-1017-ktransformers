@@ -1,4 +1,4 @@
-From 371c42510862a7049e20b8c4f2805f664929e4ca Mon Sep 17 00:00:00 2001
+From 56101ab9b163aefa6c3937b36fe3340bbbdbab27 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 1] prefill-lend: lend the GPU-resident weights' memory
@@ -21,10 +21,18 @@ a larger chunk, and the chunk size moves NLL.
 
 Prerequisites: none; applies alone on tier 0.
 
+Both window transitions synchronize the device before unmapping: entering, the
+previous decode's kernels may still read the decoder weights (overlap scheduling
+runs the CPU a step ahead); leaving, the prefill streams may still read scratch.
+torch_memory_saver's CUDA pause unmaps without waiting. Reproduced and fixed by
+Florian Wunderlich (illegal address on both ranks with four cached requests
+replayed together); see 05yuki/deepseek-v4.1-flash-1017-ktransformers#4.
+
+Co-authored-by: Florian Wunderlich <fwunderlich@factor3.de>
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
- python/sglang/srt/layers/moe/kt_lend.py       | 1333 +++++++++++++++++
+ python/sglang/srt/layers/moe/kt_lend.py       | 1339 +++++++++++++++++
  python/sglang/srt/layers/moe/kt_lend_probe.py |  157 ++
  python/sglang/srt/layers/moe/kt_pinned.py     |  132 ++
  python/sglang/srt/managers/scheduler.py       |    5 +
@@ -32,17 +40,17 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  python/sglang/srt/model_loader/loader.py      |   12 +
  python/sglang/srt/models/deepseek_v4.py       |   10 +-
  .../srt/models/deepseek_v4_replay_tail.py     |    5 +
- 8 files changed, 1658 insertions(+), 1 deletion(-)
+ 8 files changed, 1664 insertions(+), 1 deletion(-)
  create mode 100644 python/sglang/srt/layers/moe/kt_lend.py
  create mode 100644 python/sglang/srt/layers/moe/kt_lend_probe.py
  create mode 100644 python/sglang/srt/layers/moe/kt_pinned.py
 
 diff --git a/python/sglang/srt/layers/moe/kt_lend.py b/python/sglang/srt/layers/moe/kt_lend.py
 new file mode 100644
-index 0000000000..316bcc765b
+index 0000000000..5079b6a17f
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_lend.py
-@@ -0,0 +1,1333 @@
+@@ -0,0 +1,1339 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""KT prefill lend (KT_PREFILL_LEND=1): during a streamed prefill the
 +GPU-resident weights hand their physical memory to the prefill and come back,
@@ -1069,6 +1077,9 @@ index 0000000000..316bcc765b
 +        if DEBUG and not STATE.get("history"):
 +            torch.cuda.memory._record_memory_history(max_entries=500000)
 +            STATE["history"] = True
++        # Overlap scheduling may leave decode readers on these spans.
++        # TMS pause unmaps them without waiting for outstanding GPU work.
++        torch.cuda.synchronize(dev)
 +        _tms().pause(TAG_WEIGHTS)
 +        free_a = torch.cuda.mem_get_info(dev)[0]
 +        _tms().resume(TAG_SCRATCH)
@@ -1223,6 +1234,9 @@ index 0000000000..316bcc765b
 +            rank = get_parallel().tp_rank
 +        except Exception:
 +            rank = dev.index
++        # Prefill compute/copy streams may still read scratch mappings.
++        # Finish those reads before rebinding weights and unmapping scratch.
++        torch.cuda.synchronize(dev)
 +        _leave()
 +        torch.cuda.empty_cache()
 +        free_c = torch.cuda.mem_get_info(dev)[0]
