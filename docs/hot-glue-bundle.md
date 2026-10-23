@@ -69,7 +69,7 @@ max-running=1, radix disabled and a 1M configured cap:
 
 All ten decode rows increased by 6.0–23.9% in this one ordered A→B pair. Keep
 the slightly slower prefill rows and the complete comparison together.
-[The public evidence draft](benchmarks/hot-glue-00fd12a-20261024-review-r2/PR_DRAFT.md)
+[The full observed results](https://github.com/howl9003/deepseek-v4.1-flash-1017-ktransformers/blob/7e14cf92aa9016680e50c3ed95f97ed8e31add68/docs/benchmarks/hot-glue-00fd12a-20261024-review-r2/PR_DRAFT.md)
 includes every row, unchanged raw scores/stdout and source identities. Rounded
 rates, stochastic output and one campaign per arm do not establish a stable
 speedup or isolate a component's contribution.
@@ -101,7 +101,7 @@ physical-NUMA mapping adapter in `worker_pool.cpp`; the selected three-file
 reconstruction starts from this adapted A tree, not an unadapted clean setup.
 On the actual identity mapping of nodes 0–7, the adapter preserves target nodes
 and strict policy. It handles sparse/reordered physical IDs safely. The
-[native provenance note and exact common adapter](benchmarks/hot-glue-00fd12a-20261024-review-r2/NATIVE_PROVENANCE.md)
+[native provenance note and exact common adapter](https://github.com/howl9003/deepseek-v4.1-flash-1017-ktransformers/blob/7e14cf92aa9016680e50c3ed95f97ed8e31add68/docs/benchmarks/hot-glue-00fd12a-20261024-review-r2/NATIVE_PROVENANCE.md)
 separate this common host adaptation from the optional B delta and record the
 measured wheel/source identities. No byte-identical fresh-toolchain build is claimed.
 The measurements above remain tied to `00fd12a` / `9c0f6d6`; merging or applying

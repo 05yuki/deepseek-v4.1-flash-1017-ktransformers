@@ -1,3 +1,0 @@
-# Preserve exact archived evidence bytes, including original line endings.
-* -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
-common-host-numa-adapter.patch whitespace=-blank-at-eol,cr-at-eol

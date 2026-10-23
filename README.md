@@ -28,7 +28,7 @@ build and runtime gates. The ordinary setup and serving defaults leave it off.
 One matched, single-request comparison against `00fd12a` + SM89 observed a
 31.0 → 35.0 tok/s default decode median; the two 35K prefill times were
 41.63 → 42.08 s and 29.65 → 29.77 s. The full treatment includes service-affinity
-and queue-spin changes. [All rows, numerical differences and limitations](docs/benchmarks/hot-glue-00fd12a-20261024-review-r2/PR_DRAFT.md)
+and queue-spin changes. [All rows, numerical differences and limitations](https://github.com/howl9003/deepseek-v4.1-flash-1017-ktransformers/blob/7e14cf92aa9016680e50c3ed95f97ed8e31add68/docs/benchmarks/hot-glue-00fd12a-20261024-review-r2/PR_DRAFT.md)
 are retained; this is not an isolated-component or repeated-run speedup claim.
 
 The server speaks SGLang's OpenAI-compatible API on `127.0.0.1:8080`, one request at a
