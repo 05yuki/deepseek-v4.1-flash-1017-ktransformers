@@ -1,7 +1,7 @@
 # Tier 1, one patch per feature
 
 Tier 1 is one patch per feature in `patches/sglang-tier1/`, applied in the order of their numbers on
-SGLang main at `9c0f6d6a` after tier 0; tier 2 applies on top. `setup.sh` applies all of them by
+SGLang main at `8b9f7241` after tier 0; tier 2 applies on top. `setup.sh` applies all of them by
 default; `SGLANG_FEATURES=a,b,...` picks some (the names below), and `serve.sh` turns on only what
 was applied.
 
@@ -29,7 +29,7 @@ the code" are on as soon as the patch is applied.
 | 10 | [`10-pool-swa-guard.patch`](#10-pool-swa-guard) | +17 / -0 | none |
 | 11 | [`11-placement.patch`](#11-placement) | +45 / -0 | none |
 | 12 | [`12-kv-vmm.patch`](#12-kv-vmm) | +243 / -0 | none |
-| 13 | [`13-prefill-lend.patch`](#13-prefill-lend) | +1658 / -1 | none |
+| 13 | [`13-prefill-lend.patch`](#13-prefill-lend) | +1664 / -1 | none |
 | 14 | [`14-stream-prefill.patch`](#14-stream-prefill) | +2045 / -14 | `loading`, `placement`, `prefill-lend` |
 | 15 | [`15-kv-lend-plan.patch`](#15-kv-lend-plan) | +1751 / -5 | `kv-vmm`, `prefill-lend` |
 | 16 | [`16-hot-lend.patch`](#16-hot-lend) | +674 / -34 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan` |
@@ -321,6 +321,12 @@ Switches (code / serve.sh):
 Numerics: Bit-identical at a given chunk size. It lets the launcher pick a larger chunk, and the chunk size moves NLL.
 
 Effect: none in decode (15.9). It is part of the streamed-prefill set, whose 35K prompt takes 56.8 s against about 15 minutes on the CPU.
+
+Overlap scheduling can leave GPU readers in flight when the next phase begins.
+Both phase transitions wait for those readers before unmapping weights or scratch;
+ordinary decode and disabled lending do not add a device synchronization.
+`python tools/lend-transition-fences-test.py` checks this ordering against the
+module embedded in the patch, without SGLang, model weights or a GPU.
 
 Prerequisites: none; applies alone on tier 0.
 

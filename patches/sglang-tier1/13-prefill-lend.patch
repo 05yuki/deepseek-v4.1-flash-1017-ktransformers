@@ -1,4 +1,4 @@
-From 6f5083d99693211a9bd689678613a7045e01b281 Mon Sep 17 00:00:00 2001
+From 56101ab9b163aefa6c3937b36fe3340bbbdbab27 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 1] prefill-lend: lend the GPU-resident weights' memory
@@ -21,10 +21,18 @@ a larger chunk, and the chunk size moves NLL.
 
 Prerequisites: none; applies alone on tier 0.
 
+Both window transitions synchronize the device before unmapping: entering, the
+previous decode's kernels may still read the decoder weights (overlap scheduling
+runs the CPU a step ahead); leaving, the prefill streams may still read scratch.
+torch_memory_saver's CUDA pause unmaps without waiting. Reproduced and fixed by
+Florian Wunderlich (illegal address on both ranks with four cached requests
+replayed together); see 05yuki/deepseek-v4.1-flash-1017-ktransformers#4.
+
+Co-authored-by: Florian Wunderlich <fwunderlich@factor3.de>
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
- python/sglang/srt/layers/moe/kt_lend.py       | 1333 +++++++++++++++++
+ python/sglang/srt/layers/moe/kt_lend.py       | 1339 +++++++++++++++++
  python/sglang/srt/layers/moe/kt_lend_probe.py |  157 ++
  python/sglang/srt/layers/moe/kt_pinned.py     |  132 ++
  python/sglang/srt/managers/scheduler.py       |    5 +
@@ -32,17 +40,17 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  python/sglang/srt/model_loader/loader.py      |   12 +
  python/sglang/srt/models/deepseek_v4.py       |   10 +-
  .../srt/models/deepseek_v4_replay_tail.py     |    5 +
- 8 files changed, 1658 insertions(+), 1 deletion(-)
+ 8 files changed, 1664 insertions(+), 1 deletion(-)
  create mode 100644 python/sglang/srt/layers/moe/kt_lend.py
  create mode 100644 python/sglang/srt/layers/moe/kt_lend_probe.py
  create mode 100644 python/sglang/srt/layers/moe/kt_pinned.py
 
 diff --git a/python/sglang/srt/layers/moe/kt_lend.py b/python/sglang/srt/layers/moe/kt_lend.py
 new file mode 100644
-index 0000000000..316bcc765b
+index 0000000000..5079b6a17f
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_lend.py
-@@ -0,0 +1,1333 @@
+@@ -0,0 +1,1339 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""KT prefill lend (KT_PREFILL_LEND=1): during a streamed prefill the
 +GPU-resident weights hand their physical memory to the prefill and come back,
@@ -1069,6 +1077,9 @@ index 0000000000..316bcc765b
 +        if DEBUG and not STATE.get("history"):
 +            torch.cuda.memory._record_memory_history(max_entries=500000)
 +            STATE["history"] = True
++        # Overlap scheduling may leave decode readers on these spans.
++        # TMS pause unmaps them without waiting for outstanding GPU work.
++        torch.cuda.synchronize(dev)
 +        _tms().pause(TAG_WEIGHTS)
 +        free_a = torch.cuda.mem_get_info(dev)[0]
 +        _tms().resume(TAG_SCRATCH)
@@ -1223,6 +1234,9 @@ index 0000000000..316bcc765b
 +            rank = get_parallel().tp_rank
 +        except Exception:
 +            rank = dev.index
++        # Prefill compute/copy streams may still read scratch mappings.
++        # Finish those reads before rebinding weights and unmapping scratch.
++        torch.cuda.synchronize(dev)
 +        _leave()
 +        torch.cuda.empty_cache()
 +        free_c = torch.cuda.mem_get_info(dev)[0]
@@ -1694,10 +1708,10 @@ index 1831160646..d31cf7da06 100644
          return role_switch.run_event_loop_supervisor(
              scheduler,
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 261b9db8c4..b3e7ffa007 100644
+index 1b318682ba..db5d0bc7d4 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -1857,6 +1857,11 @@ class ModelRunner:
+@@ -1859,6 +1859,11 @@ class ModelRunner:
                  forward_batch,
              ) as recorder_outputs,
          ):
@@ -1710,10 +1724,10 @@ index 261b9db8c4..b3e7ffa007 100644
                  forward_batch,
                  pp_proxy_tensors,
 diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
-index fdb3187567..62a35dd360 100644
+index 711af8a86b..4b7afbd023 100644
 --- a/python/sglang/srt/model_loader/loader.py
 +++ b/python/sglang/srt/model_loader/loader.py
-@@ -305,6 +305,10 @@ def _initialize_model(
+@@ -307,6 +307,10 @@ def _initialize_model(
          model = model_class(**kwargs)
          check_stage_producers(model)
      model.shared_experts_config = shared_experts
@@ -1724,7 +1738,7 @@ index fdb3187567..62a35dd360 100644
      return model
  
  
-@@ -1083,6 +1087,14 @@ class DefaultModelLoader(BaseModelLoader):
+@@ -1085,6 +1089,14 @@ class DefaultModelLoader(BaseModelLoader):
              # parameters onto device for processing and back off after.
              with device_loading_context(module, target_device):
                  quant_method.process_weights_after_loading(module)
@@ -1740,10 +1754,10 @@ index fdb3187567..62a35dd360 100644
      @staticmethod
      def restore_weights_before_loading(model, target_device):
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 33f6f7fcd3..09d66d92ab 100644
+index aeefcd1114..cf7a2549d8 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -1336,7 +1336,11 @@ class MqaAttentionBase(nn.Module):
+@@ -1371,7 +1371,11 @@ class MqaAttentionBase(nn.Module):
              assert not getattr(meta, "q_pad_captured", False), (
                  "the padded query buffer grew after a CUDA graph captured it"
              )
@@ -1756,7 +1770,7 @@ index 33f6f7fcd3..09d66d92ab 100644
              if meta is not None:
                  try:
                      meta.q_pad_buffer = buf
-@@ -4242,6 +4246,10 @@ class DeepseekV4Model(nn.Module):
+@@ -4266,6 +4270,10 @@ class DeepseekV4Model(nn.Module):
              if tail is not None and i == self.late_layer_start:
                  if self.tail_writes_source_kv:
                      source = self.layers[i]
@@ -1768,10 +1782,10 @@ index 33f6f7fcd3..09d66d92ab 100644
                          # The previous FFN hc_post has not run yet, so run it here too.
                          source_x = fused_boundary_attn_input(source, state)
 diff --git a/python/sglang/srt/models/deepseek_v4_replay_tail.py b/python/sglang/srt/models/deepseek_v4_replay_tail.py
-index b5e5529298..1bb4497d6c 100644
+index 440f1186e3..990b8a0a13 100644
 --- a/python/sglang/srt/models/deepseek_v4_replay_tail.py
 +++ b/python/sglang/srt/models/deepseek_v4_replay_tail.py
-@@ -151,6 +151,8 @@ class DecoderReplayTail:
+@@ -154,6 +154,8 @@ class DecoderReplayTail:
  
      @classmethod
      def maybe_create(cls, model: torch.nn.Module) -> Optional[DecoderReplayTail]:
@@ -1780,7 +1794,7 @@ index b5e5529298..1bb4497d6c 100644
          max_rows = envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.get()
          if not (
              model.tail_writes_source_kv
-@@ -158,6 +160,9 @@ class DecoderReplayTail:
+@@ -161,6 +163,9 @@ class DecoderReplayTail:
              and max_rows > 0
              # Borrowed graph-pool storage forbids capturing mid-serving.
              and not envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.get()

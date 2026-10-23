@@ -1,6 +1,0 @@
-ok   plain: finish=tool_calls calls=[('get_weather', '{"city": "Tokyo"}')]
-ok   stream: finish=tool_calls calls=[{'name': 'get_weather', 'arguments': '{"city": "Tokyo"}'}]
-ok   result: finish=stop content="Right now in Tokyo it's **light rain** with a temperature of **14 °C** (about 57 °F). You'd probably want an umbrella if"
-ok   namespace: calls=[('get_weather', 'weather')]
-ok   thinking: reasoning 137 chars, calls=['get_weather']
-5 of 5 passed

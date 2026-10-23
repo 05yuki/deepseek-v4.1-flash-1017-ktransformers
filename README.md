@@ -10,7 +10,7 @@ to 1M tokens.
 
 This repository is everything needed: patches against two public upstream commits, a
 setup script that builds them, a launcher that reads the machine it runs on, and tests.
-It is a snapshot against those commits as of October 2026 (SGLang main at `9c0f6d6a`,
+It is a snapshot against those commits as of October 2026 (SGLang main at `8b9f7241`,
 KTransformers `95009ea`, torch 2.14.1 with CUDA 13 wheels, FlashInfer 0.7.2, CUDA toolkit
 13.1); later upstream versions are not tracked.
 
@@ -22,32 +22,6 @@ MODEL=/models/dsv41-1017 ./serve.sh
 
 `MODEL=/models/dsv41-1017 tools/check.sh` starts the server once, sends one short request,
 checks that an answer comes back, and stops the server: the one command that says a setup works.
-
-## Current SM89 validation
-
-On the frozen `00fd12a` recipe and full tier 1, a single **experimental 32 GiB RTX
-4080 SUPER** with dual EPYC 7543 and eight NUMA nodes/56 expert workers passed
-`tools/check.sh`, all five `tools/tool-call-check.py` cases, and the additional
-component and retrieval checks. The 24-piece checkpoint comparison scored 11,496
-exactly aligned positions: reference mean NLL **0.714111** versus served **0.715096**,
-change **+0.000985 ± 0.004106 nats/token** (paired piece standard error). This is a
-small observed average shift, not numerical identity or a general quality guarantee.
-
-The four default `tools/bench.py` decode prompts had a median **31.0 completion
-tokens/s**; the two 35K-token probes took **41.63 s** and **29.65 s**. Six
-`--other-text` prompts ranged from **24.7 to 28.1 tokens/s**. These are client
-wall-time rates that include prompt work, with a prepared compiler cache. The
-server configured **1,048,576** tokens and left tier-1 host-KV at its default,
-but its 32 GiB GPU held the full allocated compressed pool: no host-KV paging or
-1M-token request was exercised. Full configuration, individual rows, provenance,
-and raw tool outputs: [current SM89 evidence](docs/benchmarks/sm89-00fd12a-20261024.json).
-
-This run used an exclusive GPU, all eight host NUMA nodes with strict local
-expert allocation, a 440 GiB cgroup cap and no scope swap. The input GGUF and
-Engram adapters, physical NUMA mapping, original-path FlashInfer cache, and
-pre-request file-cache trim are recorded in the evidence. The historical
-six-node/64K measurements in [docs/sm89.md](docs/sm89.md) use a different
-profile; they are not a speedup comparison with this run.
 
 The server speaks SGLang's OpenAI-compatible API on `127.0.0.1:8080`, one request at a
 time. To serve other machines, set `SGLANG_HOST=0.0.0.0` and `SGLANG_API_KEY=<key>`
@@ -83,8 +57,8 @@ pages on the GPU. If the server runs out of memory at launch, a shorter context
   The launcher makes one expert pool per NUMA node and uses every physical core.
   kt-kernel is built for the CPU it is built on (`CPUINFER_CPU_INSTRUCT=NATIVE`). Its
   MXFP4 kernels need AVX2.
-- **GPU architecture:** SM89 (Ada) uses the [dual-scope Triton attention fallback](docs/sm89.md); SM90, SM100 and SM120 retain their native paths. Older architectures are not enabled by this port.
-  Ada keeps the V4 cache layout. Tier-1 host-KV remains enabled by default, so the configured pool can extend into host memory when it exceeds the GPU budget.
+- **GPU:** SM90 and newer on their own attention; SM89 (Ada, RTX 40) on a Triton
+  fallback that keeps the V4 cache layout ([docs/sm89.md](docs/sm89.md)).
 - **VRAM: 16 GB a card.** The dense layers and the KV pool's GPU part have to fit; the
   prefill chunks and the extra hot experts take the rest, so the cards show nearly full
   whatever room is left. `CUDA_VISIBLE_DEVICES` picks the GPUs, one tensor-parallel rank each.
@@ -112,7 +86,7 @@ pages on the GPU. If the server runs out of memory at launch, a shorter context
 
 ## What setup.sh does
 
-1. Clones sgl-project/sglang at `9c0f6d6a` on its main branch and applies the SGLang patches
+1. Clones sgl-project/sglang at `8b9f7241` on its main branch and applies the SGLang patches
    up to `TIER` (default 2), each tier on top of the ones below it:
 
    | `TIER` | patch | what it adds |
@@ -204,7 +178,7 @@ The earlier release did not have this step; 1017's weights were made with it.
   checkpoint's own `inference/model.py`. The step therefore turns on for 1017 (block
   32) and stays off for the earlier release.
 - `patches/sglang-dsv4-o-fp8-qdq.py` installs the same step in another SGLang tree on
-  its own. It applies to SGLang main at `9c0f6d6a` unmodified.
+  its own. It applies to SGLang main at `8b9f7241` unmodified.
 
 It works the same at any tensor-parallel size. Its 32-value blocks lie inside a head
 (512 values), so splitting heads across GPUs never cuts a block.
@@ -345,6 +319,7 @@ English, teacher-forced. Measured at tag `2026-10-23-1702`, `serve.sh` defaults:
 | reference (`inference/model.py`) | 0.7185 | |
 | served, two GPUs | 0.7181 | -0.0004 (0.0040) |
 | served, one GPU (KV past the GPU in host memory) | 0.7194 | +0.0008 (0.0050) |
+| served, one RTX 4080 SUPER 32 GB (SM89), against its own reference run (0.7141) | 0.7151 | +0.0010 (0.0041) |
 
 The texts are well known, so the model predicts them closely and the NLL is low. They
 serve to compare the two implementations on the same tokens, not to measure the model.
@@ -367,17 +342,14 @@ padding-page fix (#3) is no longer carried: SGLang main's sparse attention with 
 
 ## Not done
 
-- The upstream results above use 2 × RTX 5070 Ti (SM120) with Zen 2 CPUs.
-  Separate historical SM89 results and the current validation limits are in
-  [docs/sm89.md](docs/sm89.md).
+- Results are on 2 × RTX 5070 Ti (SM120) with Zen 2 CPUs; SM89 was checked by a
+  contributor on one card ([docs/sm89.md](docs/sm89.md)).
 - CPUs with AVX-512 should work: the experts run on the AVX2 kernels, which those CPUs
   also have.
 - More than two GPUs: `serve.sh` sets tensor parallelism from the GPUs it sees; not
   tested.
-- Other NVIDIA GPUs: SM89 (Ada, including RTX 40) uses the fallback described above;
-  SM90 and newer retain their existing attention paths. RTX 30 and A100 are not
-  enabled by this port. With `SGLANG_MXFP4_MOE_FP32=0`, the MXFP4 Marlin path still
-  needs SM90 or SM120.
+- Older NVIDIA GPUs: RTX 30 and A100 do not run; DeepSeek-V4's attention here needs SM89
+  or newer. With `SGLANG_MXFP4_MOE_FP32=0`, the MXFP4 Marlin path also needs SM90 or SM120.
 - AMD GPUs: not supported (kv-vmm and kt-kernel use CUDA).
 
 ## License

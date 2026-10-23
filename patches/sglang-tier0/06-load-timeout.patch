@@ -1,4 +1,4 @@
-From 3ed47c0fa017e846446283a3c1f598d938096060 Mon Sep 17 00:00:00 2001
+From 985a47236d0c41f8591f676054ca0476be88ef49 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:33 +0900
 Subject: [PATCH] [tier 0] model-loader: make the unbalanced load barrier

@@ -1,3 +1,0 @@
-ref.json                 mean NLL 0.7141 over 11496 tokens
-served-nll.json          mean NLL 0.7151 over 11496 tokens
-served-nll.json          minus ref.json: +0.0010 nats a token, SE 0.0041 over 24 pieces (z +0.24); mean |diff| a token 0.1175; 654 of 11496 tokens identical
