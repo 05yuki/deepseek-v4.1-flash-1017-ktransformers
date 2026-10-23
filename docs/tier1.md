@@ -33,7 +33,7 @@ the code" are on as soon as the patch is applied.
 | 14 | [`14-stream-prefill.patch`](#14-stream-prefill) | +2045 / -14 | `loading`, `placement`, `prefill-lend` |
 | 15 | [`15-kv-lend-plan.patch`](#15-kv-lend-plan) | +1751 / -5 | `kv-vmm`, `prefill-lend` |
 | 16 | [`16-hot-lend.patch`](#16-hot-lend) | +674 / -34 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan` |
-| 17 | [`17-host-kv.patch`](#17-host-kv) | +453 / -7 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan`, `hot-lend` |
+| 17 | [`17-host-kv.patch`](#17-host-kv) | +477 / -7 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan`, `hot-lend` |
 
 ## Effect of each patch
 
@@ -450,7 +450,7 @@ The compressed KV is `KVLayout.V41_FP4`, 288 bytes an entry, in the kv_source la
 
 **Decode.**
 
-- After each index source's top-k, a Triton kernel gathers its 512 rows into a device staging buffer in the pool's page layout. The rows are renumbered for attention.
+- After each index source's top-k, a Triton kernel gathers its 512 rows into a device staging buffer in the pool's page layout. The rows are renumbered for attention. The kernel takes the data, scale and page bytes from the pool's own `KVLayout`, so V4, V41 and V41_FP4 pools all work.
 - The following layers reuse the staging buffer, as they reuse the top-k.
 - The gather costs about 10 µs an index source. Attention reading host memory in place would cost about 100 µs a layer.
 
@@ -470,6 +470,7 @@ Numerics: Bit-identical to the pools on the GPU:
 - With the hot experts held fixed, the 24-piece NLL with the compressed KV in host memory equals the run with it on the GPU (2.5979).
 - Greedy outputs are the same on three prompts up to 8,417 tokens.
 - On two 16 GB cards the 1M pool fits the GPUs: no host part, NLL equal to the previous build (2.5826).
+- The V4 layout (`SGLANG_DSV4_KV_LAYOUT=v4`) on one card: the 1M pool, with 1.43 GiB in host memory, gives the same greedy outputs on prompts up to 8,417 tokens as the pool the budget holds (89,344 tokens).
 
 Effect (one RTX 5070 Ti, `serve.sh` defaults; the compressed KV all in host memory, 0.70 GiB):
 

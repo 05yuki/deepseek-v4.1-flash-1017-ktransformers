@@ -1,4 +1,4 @@
-From 4a6c2dcfc1ee66f07f2c7bce6770621ec0016096 Mon Sep 17 00:00:00 2001
+From a7ab9d319c6eaecf24c49e8499931efe728aebed Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 23 Oct 2026 12:16:53 +0900
 Subject: [PATCH] [tier 1] host-kv: DeepSeek-V4.1's KV pool covers the whole
@@ -19,7 +19,9 @@ of the GPU's NUMA node. When the whole context fits the GPU nothing changes.
 - The allocator hands out the lowest free pages first (freed pages go back
   in order), so requests fill the GPU's part before host memory.
 - Decode: after each index source's top-k, a Triton kernel gathers its 512
-  rows into a per-ratio device staging laid out as the pool's pages, and
+  rows into a per-ratio device staging laid out as the pool's pages (the
+  data, scale and page bytes read from the pool's own KVLayout, so V4, V41
+  and V41_FP4 pools all work), and
   attention reads the staging with the rows renumbered; the following
   layers reuse it as they reuse the top-k. (Attention reading host memory
   in place costs ~100 us a layer; the gather is ~10 us an index source.)
@@ -46,6 +48,9 @@ DeepSeek-V4.1-Flash-1017, serve.sh defaults:
   8,417 tokens; with mem fraction 0.82 (the first 203,776 tokens' compressed
   KV on the GPU) a 300K-token prompt across the boundary prefills at 764 and
   decodes at 24.6 tok/s.
+- the V4 layout (SGLANG_DSV4_KV_LAYOUT=v4) on one card: the pool at 1M with
+  1.43 GiB in host memory gives the same greedy outputs on prompts up to
+  8,417 tokens as the pool by the budget (89,344 tokens).
 
 Prerequisites: kv-vmm, prefill-lend, stream-prefill, kv-lend-plan, hot-lend;
 kv-vmm/kv_vmm.c with kv_vmm_malloc_split.
@@ -56,10 +61,10 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  .../layers/attention/deepseek_v4_backend.py   |  50 ++++
  .../srt/layers/moe/kt_kv_prefill_lend.py      |  34 ++-
  python/sglang/srt/layers/moe/kt_kv_vmm.py     |  35 ++-
- .../srt/mem_cache/deepseek_v4_memory_pool.py  |  49 +++-
- python/sglang/srt/mem_cache/dsv41_host_kv.py  | 262 ++++++++++++++++++
+ .../srt/mem_cache/deepseek_v4_memory_pool.py  |  57 +++-
+ python/sglang/srt/mem_cache/dsv41_host_kv.py  | 278 ++++++++++++++++++
  .../srt/model_executor/pool_configurator.py   |  30 ++
- 6 files changed, 453 insertions(+), 7 deletions(-)
+ 6 files changed, 477 insertions(+), 7 deletions(-)
  create mode 100644 python/sglang/srt/mem_cache/dsv41_host_kv.py
 
 diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
@@ -277,7 +282,7 @@ index cf20823569..4b62f98233 100644
      return int(_load().kv_vmm_chunk_bytes(device))
  
 diff --git a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
-index 522a38cace..987adaeb2e 100644
+index 522a38cace..2a37a76677 100644
 --- a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
 +++ b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
 @@ -1,6 +1,7 @@
@@ -320,7 +325,7 @@ index 522a38cace..987adaeb2e 100644
  class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
      # object.__new__ stubs (disagg wire test) skip __init__; False is the env
      # default, so the fp8 PD/HiCache refuses don't AttributeError on them.
-@@ -1299,6 +1318,26 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+@@ -1299,6 +1318,34 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
              kv_pool_cls=kv_pool_cls,
          )
  
@@ -329,8 +334,16 @@ index 522a38cace..987adaeb2e 100644
 +            from sglang.srt.mem_cache.dsv41_host_kv import HostLowRatioKV
 +
 +            self.host_low_ratio = HostLowRatioKV(
-+                ratios=[r for r, p in self.kv_pools.items() if getattr(p, "host_part", False)],
-+                page_size=page_size,
++                layouts={
++                    r: (
++                        p.kv_layout.data_bytes,
++                        p.kv_layout.scale_bytes,
++                        p.page_size,
++                        p.bytes_per_page_padded,
++                    )
++                    for r, p in self.kv_pools.items()
++                    if getattr(p, "host_part", False)
++                },
 +                topk=int(os.environ.get("SGLANG_DSV41_HOST_KV_TOPK", "512")),
 +                max_rows=int(os.environ.get("SGLANG_DSV41_HOST_KV_MAX_ROWS", "16")),
 +                device=device,
@@ -347,7 +360,7 @@ index 522a38cace..987adaeb2e 100644
          # The distinct compress ratios this stage has, sorted. Registry pools kept
          # for a ratio the model lacks (wire-layout alignment) do not count.
          model_ratios = set(self.compression_ratios)
-@@ -1599,6 +1638,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+@@ -1599,6 +1646,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                      cls=pool_cls,
                      kv_layout=self.compressed_kv_layout(ratio),
                  )
@@ -362,7 +375,7 @@ index 522a38cace..987adaeb2e 100644
              for ratio, sources in low_ratio_sources.items():
                  self.kv_pools[ratio] = self._make_kv_pool(
                      size=self.full_size // ratio,
-@@ -1608,7 +1655,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+@@ -1608,7 +1663,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                      device=device,
                      enable_memory_saver=enable_memory_saver,
                      global_page_size=page_size,
@@ -373,13 +386,14 @@ index 522a38cace..987adaeb2e 100644
  
 diff --git a/python/sglang/srt/mem_cache/dsv41_host_kv.py b/python/sglang/srt/mem_cache/dsv41_host_kv.py
 new file mode 100644
-index 0000000000..4b5e18d8e7
+index 0000000000..942f7a5efb
 --- /dev/null
 +++ b/python/sglang/srt/mem_cache/dsv41_host_kv.py
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,278 @@
 +"""DeepSeek-V4.1's ratio-1/2 compressed KV in host memory (SGLANG_DSV41_HOST_KV=1).
 +
-+The compressed KV pools (KVLayout.V41_FP4, 288 bytes an entry, kv_source layers only) live in
++The compressed KV pools (on 1017 KVLayout.V41_FP4, 288 bytes an entry; any KVLayout, the
++geometry read from the pool; kv_source layers only) live in
 +pinned host memory mapped into the GPU's address space and presented as CUDA tensors, so every
 +writer stores into them unchanged. Decode reads only the indexer's top-k entries: each index
 +source gathers its rows into a small device buffer laid out as the pool's pages, and attention
@@ -403,8 +417,6 @@ index 0000000000..4b5e18d8e7
 +
 +logger = logging.getLogger(__name__)
 +
-+_DATA_BYTES = tl.constexpr(256)  # e2m1 payload of one V41_FP4 entry
-+_SCALE_BYTES = tl.constexpr(32)  # its e4m3 scales, stored after the page's payloads
 +
 +
 +def host_kv_enabled() -> bool:
@@ -505,55 +517,65 @@ index 0000000000..4b5e18d8e7
 +    idx_stride,
 +    K: tl.constexpr,
 +    P: tl.constexpr,
++    DATA: tl.constexpr,
++    SCALE: tl.constexpr,
++    PAGE_BYTES: tl.constexpr,
++    DATA_WORDS_P2: tl.constexpr,
++    SCALE_WORDS_P2: tl.constexpr,
 +    BLOCK: tl.constexpr,
 +):
++    # A page holds P entries' data rows (DATA bytes each), then their scale rows
++    # (SCALE bytes each), padded to PAGE_BYTES: every KVLayout (kv_layout.py).
 +    row = tl.program_id(0)
 +    j = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
 +    s = tl.load(idx + row * idx_stride + j)
 +    valid = s >= 0
 +    s = tl.where(valid, s, 0).to(tl.int64)
 +    d = row.to(tl.int64) * K + j
-+    page_bytes: tl.constexpr = P * (_DATA_BYTES + _SCALE_BYTES)
-+    w = tl.arange(0, _DATA_BYTES // 4)
-+    src_data = (src + (s // P * page_bytes + s % P * _DATA_BYTES)[:, None] + w[None, :] * 4).to(
-+        tl.pointer_type(tl.int32)
-+    )
-+    dst_data = (stage + (d // P * page_bytes + d % P * _DATA_BYTES)[:, None] + w[None, :] * 4).to(
-+        tl.pointer_type(tl.int32)
-+    )
-+    tl.store(dst_data, tl.load(src_data, mask=valid[:, None]), mask=valid[:, None])
-+    v = tl.arange(0, _SCALE_BYTES // 4)
-+    src_sc = (
-+        src + (s // P * page_bytes + P * _DATA_BYTES + s % P * _SCALE_BYTES)[:, None] + v[None, :] * 4
-+    ).to(tl.pointer_type(tl.int32))
-+    dst_sc = (
-+        stage + (d // P * page_bytes + P * _DATA_BYTES + d % P * _SCALE_BYTES)[:, None] + v[None, :] * 4
-+    ).to(tl.pointer_type(tl.int32))
-+    tl.store(dst_sc, tl.load(src_sc, mask=valid[:, None]), mask=valid[:, None])
++    w = tl.arange(0, DATA_WORDS_P2)
++    wm = valid[:, None] & (w[None, :] < DATA // 4)
++    src_data = (src + (s // P * PAGE_BYTES + s % P * DATA)[:, None] + w[None, :] * 4).to(tl.pointer_type(tl.int32))
++    dst_data = (stage + (d // P * PAGE_BYTES + d % P * DATA)[:, None] + w[None, :] * 4).to(tl.pointer_type(tl.int32))
++    tl.store(dst_data, tl.load(src_data, mask=wm), mask=wm)
++    if SCALE > 0:
++        v = tl.arange(0, SCALE_WORDS_P2)
++        vm = valid[:, None] & (v[None, :] < SCALE // 4)
++        src_sc = (src + (s // P * PAGE_BYTES + P * DATA + s % P * SCALE)[:, None] + v[None, :] * 4).to(
++            tl.pointer_type(tl.int32)
++        )
++        dst_sc = (stage + (d // P * PAGE_BYTES + P * DATA + d % P * SCALE)[:, None] + v[None, :] * 4).to(
++            tl.pointer_type(tl.int32)
++        )
++        tl.store(dst_sc, tl.load(src_sc, mask=vm), mask=vm)
 +    tl.store(remap + row * K + j, tl.where(valid, d, -1).to(tl.int32))
++
++
++def _p2(n: int) -> int:
++    return 1 << max(0, (max(1, n) - 1).bit_length())
 +
 +
 +class HostLowRatioKV:
 +    """Device staging for the host-resident ratio-1/2 pools: per ratio, room for `max_rows`
 +    query rows of `topk` entries in the pool's page layout, and the renumbered indices."""
 +
-+    def __init__(self, ratios, page_size: int, topk: int, max_rows: int, device):
++    def __init__(self, layouts, topk: int, max_rows: int, device):
++        """layouts: {ratio: (data bytes, scale bytes, entries a page, page bytes)}, read
++        from each pool's own KVLayout when it is made, so any layout works."""
 +        self.topk = topk
 +        self.max_rows = max_rows
++        self.geometry: Dict[int, tuple] = {}
 +        self.entries_per_page: Dict[int, int] = {}
 +        self.stage: Dict[int, torch.Tensor] = {}
 +        self.remap: Dict[int, torch.Tensor] = {}
++        for r, (data, scale, p, page_bytes) in layouts.items():
++            assert data % 4 == 0 and scale % 4 == 0 and (topk % p == 0 or p % topk == 0)
++            pages = max(1, max_rows * topk // p)
++            self.geometry[r] = (data, scale, p, page_bytes)
++            self.entries_per_page[r] = p
++            self.stage[r] = torch.zeros(pages, page_bytes, dtype=torch.uint8, device=device)
++            self.remap[r] = torch.full((max_rows, topk), -1, dtype=torch.int32, device=device)
 +        self.check = os.environ.get("SGLANG_DSV41_HOST_KV_CHECK", "0") == "1"
 +        self._checks = self._direct = 0
-+        for r in ratios:
-+            p = page_size // r
-+            assert topk % p == 0 or p % topk == 0
-+            pages = max(1, max_rows * topk // p)
-+            self.entries_per_page[r] = p
-+            self.stage[r] = torch.zeros(
-+                pages, p * (_DATA_BYTES + _SCALE_BYTES), dtype=torch.uint8, device=device
-+            )
-+            self.remap[r] = torch.full((max_rows, topk), -1, dtype=torch.int32, device=device)
 +
 +    def prefill_copy(self, fb, ratio: int, pool_layer: int, src: torch.Tensor, max_slot, layer_id: int):
 +        """The GPU copy of a pool layer's pages up to the batch's highest token slot (a
@@ -584,9 +606,10 @@ index 0000000000..4b5e18d8e7
 +        byte for byte (the pool is typed float8: a value comparison calls NaN bytes unequal)."""
 +        m, src = m.view(torch.uint8), src.view(torch.uint8)
 +        now = src[: m.shape[0]].clone()
-+        p = self.entries_per_page[ratio]
-+        data_m, data_n = m[:, : p * 256].reshape(-1, 256), now[:, : p * 256].reshape(-1, 256)
-+        sc_m, sc_n = m[:, p * 256 : p * 288].reshape(-1, 32), now[:, p * 256 : p * 288].reshape(-1, 32)
++        data, scale, p, _ = self.geometry[ratio]
++        data_m, data_n = m[:, : p * data].reshape(-1, data), now[:, : p * data].reshape(-1, data)
++        sc_m = m[:, p * data : p * (data + scale)].reshape(-1, max(1, scale))
++        sc_n = now[:, p * data : p * (data + scale)].reshape(-1, max(1, scale))
 +        bad_d = (data_m != data_n).any(1).nonzero().flatten()
 +        if bad_d.numel():
 +            # the CPU's view of the same host bytes: who is stale?
@@ -596,7 +619,7 @@ index 0000000000..4b5e18d8e7
 +            host = torch.frombuffer((ctypes.c_uint8 * nb).from_address(src.data_ptr()), dtype=torch.uint8)
 +            host = host.view(m.shape[0], src.stride(0))[:, : src.shape[1]]
 +            torch.cuda.current_stream().synchronize()
-+            data_h = host[:, : p * 256].reshape(-1, 256)
++            data_h = host[:, : p * data].reshape(-1, data)
 +            i = bad_d[:64].cpu()
 +            same_copy = int((data_h[i] == data_m[bad_d[:64]].cpu()).all(1).sum())
 +            same_now = int((data_h[i] == data_n[bad_d[:64]].cpu()).all(1).sum())
@@ -628,6 +651,7 @@ index 0000000000..4b5e18d8e7
 +            return
 +        assert indices.dtype == torch.int32 and indices.stride(-1) == 1
 +        block = 32
++        data, scale, p, page_bytes = self.geometry[ratio]
 +        _gather_rows_kernel[(rows, self.topk // block)](
 +            src,
 +            indices,
@@ -635,7 +659,12 @@ index 0000000000..4b5e18d8e7
 +            self.remap[ratio],
 +            indices.stride(0),
 +            K=self.topk,
-+            P=self.entries_per_page[ratio],
++            P=p,
++            DATA=data,
++            SCALE=scale,
++            PAGE_BYTES=page_bytes,
++            DATA_WORDS_P2=_p2(data // 4),
++            SCALE_WORDS_P2=_p2(max(1, scale // 4)),
 +            BLOCK=block,
 +            num_warps=4,
 +        )

@@ -89,7 +89,7 @@ pages on the GPU. If the server runs out of memory at launch, a shorter context
 
    | `TIER` | patch | what it adds |
    |---|---|---|
-   | 0 | `sglang-tier0/` (eleven patches, one concern each) | what 1017 needs to run correctly on the KTransformers hybrid MoE: the FP8 step below, the SwiGLU clamp passed to the CPU experts, the expert mask kt-kernel takes, `-1` ids kept out of the Marlin MoE, zero GPU experts, a configurable load barrier, the tool namespaces of the current reference's chat encoding, the V4.1 indexer on its torch path on SM12x (RTX 50, RTX PRO Blackwell, DGX Spark), which has no DeepGEMM build, its torch scoring done in place, the routed experts scaled by `routed_scaling_factor` once, and V4.1's own KV cache formats on SM120 (below) |
+   | 0 | `sglang-tier0/` (twelve patches, one concern each) | what 1017 needs to run correctly on the KTransformers hybrid MoE: the FP8 step below, the SwiGLU clamp passed to the CPU experts, the expert mask kt-kernel takes, `-1` ids kept out of the Marlin MoE, zero GPU experts, a configurable load barrier, the tool namespaces of the current reference's chat encoding, the V4.1 indexer on its torch path on SM12x (RTX 50, RTX PRO Blackwell, DGX Spark), which has no DeepGEMM build, its torch scoring done in place, the routed experts scaled by `routed_scaling_factor` once, V4.1's own KV cache formats on SM120 (below), and the KV pool sized by those formats' own entry bytes |
    | 1 | `sglang-tier1/` (one patch per feature, [docs/tier1.md](docs/tier1.md); `SGLANG_FEATURES` picks some) | streamed prefill, the lends, hot experts and placement, the KV pool on remappable memory, the GPU MoE and FP8 kernels (the streamed prefill needs SM89 or newer) |
    | 2 | `sglang-tier2-no-p2p.patch` | all-reduce through pinned host memory, for two GPUs without peer access |
 
@@ -303,6 +303,32 @@ most of its routes on the CPU.
 | 35,000 | 776 | 45 s |
 | 65,536 | 863 | 76 s |
 | 1,000,000 | 670 | 25 min |
+
+## Accuracy
+
+The served model is scored against the checkpoint's own reference implementation:
+DeepSeek's `inference/model.py`, run one layer at a time on one 16 GB GPU
+([tools/ref-nll.py](tools/ref-nll.py)). Both score the same 24 pieces of 480 tokens, taken
+from two public-domain texts in [tools/nll-text/](tools/nll-text/), one Japanese and one
+English, teacher-forced. Measured at tag `2026-10-23-1702`, `serve.sh` defaults:
+
+| run | mean NLL | minus the reference (SE over the 24 pieces) |
+|---|---|---|
+| reference (`inference/model.py`) | 0.7185 | |
+| served, two GPUs | 0.7181 | -0.0004 (0.0040) |
+| served, one GPU (KV past the GPU in host memory) | 0.7194 | +0.0008 (0.0050) |
+
+The texts are well known, so the model predicts them closely and the NLL is low. They
+serve to compare the two implementations on the same tokens, not to measure the model.
+
+To repeat it:
+
+```
+python tools/ref-nll.py <checkpoint dir> ref.json      # about 4 minutes on one 16 GB GPU, no server
+MODEL=<checkpoint dir> ./serve.sh --background
+python tools/nll.py score <checkpoint dir> served.json
+python tools/nll.py compare ref.json served.json
+```
 
 ## Fixes from dsv41-flash-dual-epyc
 
