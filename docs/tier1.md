@@ -32,7 +32,8 @@ the code" are on as soon as the patch is applied.
 | 13 | [`13-prefill-lend.patch`](#13-prefill-lend) | +1658 / -1 | none |
 | 14 | [`14-stream-prefill.patch`](#14-stream-prefill) | +2045 / -14 | `loading`, `placement`, `prefill-lend` |
 | 15 | [`15-kv-lend-plan.patch`](#15-kv-lend-plan) | +1751 / -5 | `kv-vmm`, `prefill-lend` |
-| 16 | [`16-hot-lend.patch`](#16-hot-lend) | +664 / -32 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan` |
+| 16 | [`16-hot-lend.patch`](#16-hot-lend) | +674 / -34 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan` |
+| 17 | [`17-host-kv.patch`](#17-host-kv) | +453 / -7 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan`, `hot-lend` |
 
 ## Effect of each patch
 
@@ -421,3 +422,71 @@ Files (under `python/sglang/`):
 
 - `srt/layers/moe/fused_moe_triton/layer.py`
 - `srt/layers/moe/kt_ep_wrapper.py`
+
+## 17 host-kv
+
+On by default (`SGLANG_DSV41_HOST_KV=0` turns it off). When the GPU budget cannot hold the KV pool for the whole context, the pool is made at the context length anyway (1M tokens on 1017). The ratio-1/2 compressed KV it cannot hold lives in host memory.
+
+**What stays on the GPU.**
+
+- the window cache;
+- the indexer keys, which decode scores in full at every index source;
+- as much of the compressed KV as the budget leaves.
+
+The compressed KV is `KVLayout.V41_FP4`, 288 bytes an entry, in the kv_source layers 2, 8, 14 and 20: 720 bytes a full token.
+
+**Where the rest goes.**
+
+- Each ratio-1/2 pool layer is one `kv-vmm` range (`kv_vmm_malloc_split` in `kv-vmm/kv_vmm.c`).
+- Its first pages are device chunks; the rest are host chunks on the GPU's NUMA node.
+- Every writer and reader addresses the range as before.
+- A device chunk lent to a prefill or to hot experts reads as zeros.
+- Without `kv-vmm`, a layer that cannot fit goes wholly to pinned host memory.
+
+**Who uses which pages.**
+
+- The allocator hands out the lowest free pages first, so requests fill the GPU's part before host memory.
+- The hot lend lends only device pages. When none are free, it runs on the driver's idle memory alone.
+
+**Decode.**
+
+- After each index source's top-k, a Triton kernel gathers its 512 rows into a device staging buffer in the pool's page layout. The rows are renumbered for attention.
+- The following layers reuse the staging buffer, as they reuse the top-k.
+- The gather costs about 10 µs an index source. Attention reading host memory in place would cost about 100 µs a layer.
+
+**Prefill.**
+
+- The pool layer's pages up to the batch's highest slot are copied to the GPU through an SM kernel, at the first attention that reads them in the forward.
+- The copy waits for every writer. The bounded-replay tail rewrites the kv_source's entries after its own pass, and a copy taken earlier missed that.
+- Only one layer's copy is held at a time: 288 MB at 1M tokens.
+
+Switches (code / serve.sh):
+
+- `SGLANG_DSV41_HOST_KV`: 1 / unset (0: the pool is what the GPU budget holds)
+- `SGLANG_DSV41_HOST_KV_MAX_ROWS`: 16 (query rows a decode step gathers for; more read host memory in place)
+
+Numerics: Bit-identical to the pools on the GPU:
+
+- With the hot experts held fixed, the 24-piece NLL with the compressed KV in host memory equals the run with it on the GPU (2.5979).
+- Greedy outputs are the same on three prompts up to 8,417 tokens.
+- On two 16 GB cards the 1M pool fits the GPUs: no host part, NLL equal to the previous build (2.5826).
+
+Effect (one RTX 5070 Ti, `serve.sh` defaults; the compressed KV all in host memory, 0.70 GiB):
+
+- The KV pool goes from 180,480 to 1,048,576 tokens.
+- Decode runs at 31.6 tok/s on Japanese prose (32.0 before).
+- The 35K prompt prefills at 776 tok/s (774 before).
+- A 300K-token prompt prefills at 868 tok/s and decodes at 24.6 tok/s, against 24.7 tok/s at 8K (random token ids).
+- A 1M-token prompt prefills in 24.8 min and decodes at 23.8 tok/s.
+- With the first 203,776 tokens' compressed KV on the GPU (mem fraction 0.82), a 300K-token prompt across the boundary prefills at 764 tok/s and decodes at 24.6 tok/s.
+
+Prerequisites: `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan`, `hot-lend`.
+
+Files (under `python/sglang/`):
+
+- `srt/layers/attention/deepseek_v4_backend.py`
+- `srt/layers/moe/kt_kv_prefill_lend.py`
+- `srt/layers/moe/kt_kv_vmm.py`
+- `srt/mem_cache/deepseek_v4_memory_pool.py`
+- `srt/mem_cache/dsv41_host_kv.py` (new)
+- `srt/model_executor/pool_configurator.py`

@@ -1,4 +1,4 @@
-From 6bb5704f942d507e480d7caf2dee1275d2726405 Mon Sep 17 00:00:00 2001
+From 6f5083d99693211a9bd689678613a7045e01b281 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 1] prefill-lend: lend the GPU-resident weights' memory

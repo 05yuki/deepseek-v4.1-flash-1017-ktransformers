@@ -1,0 +1,689 @@
+From 4a6c2dcfc1ee66f07f2c7bce6770621ec0016096 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Fri, 23 Oct 2026 12:16:53 +0900
+Subject: [PATCH] [tier 1] host-kv: DeepSeek-V4.1's KV pool covers the whole
+ context, the compressed KV past the GPU's share in host memory
+
+When the KV pool the GPU budget buys is shorter than the context, the pool
+is made at the context length (1M tokens for V4.1-Flash-1017) instead. The
+GPU keeps every byte but the ratio-1/2 compressed KV's (KVLayout.V41_FP4,
+288 bytes an entry, kv_source layers 2/8/14/20): the index-K pools, which
+decode scores in full at every index source, and as much of the compressed
+KV as the budget leaves. The rest of the compressed KV lives in host memory
+of the GPU's NUMA node. When the whole context fits the GPU nothing changes.
+
+- Each ratio-1/2 pool layer is one kv_vmm range (kv_vmm_malloc_split): its
+  first pages are device chunks, the rest host-NUMA chunks, so every writer
+  and reader addresses it as before. A lent device chunk reads as zeros.
+  Without kv_vmm a layer that cannot fit goes wholly to pinned host memory.
+- The allocator hands out the lowest free pages first (freed pages go back
+  in order), so requests fill the GPU's part before host memory.
+- Decode: after each index source's top-k, a Triton kernel gathers its 512
+  rows into a per-ratio device staging laid out as the pool's pages, and
+  attention reads the staging with the rows renumbered; the following
+  layers reuse it as they reuse the top-k. (Attention reading host memory
+  in place costs ~100 us a layer; the gather is ~10 us an index source.)
+- Prefill: the pool layer's pages up to the batch's highest slot are copied
+  to the GPU at the first attention that reads them in the forward, after
+  every writer (the bounded-replay tail rewrites the kv_source's entries),
+  one layer's copy at a time (288 MB at 1M tokens), through an SM kernel (a
+  range with host-NUMA chunks is not a valid cudaMemcpy source).
+- The hot lend lends device pages only, and runs on the driver's spare alone
+  when there is no device page to lend.
+
+SGLANG_DSV41_HOST_KV=0 sizes the pool by the budget as before.
+
+DeepSeek-V4.1-Flash-1017, serve.sh defaults:
+- two RTX 5070 Ti: the 1M pool fits, no host part; 24-piece NLL bit-identical
+  to the previous build (2.5826).
+- one RTX 5070 Ti: the pool goes from 180,480 to 1,048,576 tokens, the
+  compressed KV all in host memory (0.70 GiB); decode 31.6 tok/s on Japanese
+  prose (32.0 before), 35K prefill 776 tok/s (774); a 300K-token prompt
+  prefills at 868 tok/s and decodes at 24.6 tok/s (24.7 at 8K, random ids);
+  a 1M-token prompt prefills in 24.8 min and decodes at 23.8 tok/s.
+- with hot experts fixed, the pools in host memory give an NLL bit-identical
+  to the pools on the GPU, and the same greedy outputs on prompts up to
+  8,417 tokens; with mem fraction 0.82 (the first 203,776 tokens' compressed
+  KV on the GPU) a 300K-token prompt across the boundary prefills at 764 and
+  decodes at 24.6 tok/s.
+
+Prerequisites: kv-vmm, prefill-lend, stream-prefill, kv-lend-plan, hot-lend;
+kv-vmm/kv_vmm.c with kv_vmm_malloc_split.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+---
+ .../layers/attention/deepseek_v4_backend.py   |  50 ++++
+ .../srt/layers/moe/kt_kv_prefill_lend.py      |  34 ++-
+ python/sglang/srt/layers/moe/kt_kv_vmm.py     |  35 ++-
+ .../srt/mem_cache/deepseek_v4_memory_pool.py  |  49 +++-
+ python/sglang/srt/mem_cache/dsv41_host_kv.py  | 262 ++++++++++++++++++
+ .../srt/model_executor/pool_configurator.py   |  30 ++
+ 6 files changed, 453 insertions(+), 7 deletions(-)
+ create mode 100644 python/sglang/srt/mem_cache/dsv41_host_kv.py
+
+diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+index e7602f5b28..cb41b56685 100644
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -1218,6 +1218,10 @@ class DeepseekV4AttnBackend(
+         assert self.token_to_kv_pool.swa_page_size % SWA_WINDOW == 0
+         self.hisparse_coordinator = model_runner.hisparse_coordinator
+         self.req_to_token = model_runner.req_to_token_pool.req_to_token
++        if getattr(self.token_to_kv_pool, "host_low_ratio", None) is not None:
++            from sglang.srt.mem_cache.dsv41_host_kv import keep_free_pages_sorted
++
++            keep_free_pages_sorted(model_runner.token_to_kv_pool_allocator)
+         # Nothing is built for a compress ratio outside the pool's set.
+         self.present_ratios: Tuple[int, ...] = self.token_to_kv_pool.present_ratios
+         self.low_ratios: Tuple[int, ...] = tuple(
+@@ -3262,6 +3266,31 @@ class DeepseekV4AttnBackend(
+             self._low_ratio_compress(layer, x, req, pos, forward_batch)
+         if run_indexer and layer.indexer is not None:
+             self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
++        self._stage_host_low_ratio(layer, forward_batch)
++
++    def _stage_host_low_ratio(self, layer, forward_batch: ForwardBatch) -> None:
++        """SGLANG_DSV41_HOST_KV: after an index source's top-k, gather its rows of the
++        host-resident compressed KV into the device staging this ratio's decode attention
++        reads (the following layers of the ratio reuse it, as they reuse the top-k)."""
++        host_kv = getattr(self.token_to_kv_pool, "host_low_ratio", None)
++        if host_kv is None or layer.indexer is None:
++            return
++        ratio = self.token_to_kv_pool.layer_mapping[layer.layer_id][0]
++        indices = self.forward_metadata.core_attn_metadata.sparse_page_indices(ratio)
++        src = self.token_to_kv_pool.get_extra_key_buffer(layer.layer_id)
++        if forward_batch.forward_mode.is_decode():
++            if host_kv.covers(ratio, indices):
++                host_kv.gather(ratio, src, indices)
++
++    def _max_token_slot(self, fb: ForwardBatch) -> int:
++        """The highest KV slot any request of the batch holds (prefix and this chunk)."""
++        cached = getattr(fb, "dsv41_max_token_slot", None)
++        if cached is None:
++            locs = self.req_to_token[fb.req_pool_indices, : int(fb.seq_lens.max())]
++            live = torch.arange(locs.shape[1], device=locs.device) < fb.seq_lens[:, None]
++            cached = int(locs[live].max())
++            fb.dsv41_max_token_slot = cached
++        return cached
+ 
+     def _forward_low_ratio_sources_cp(
+         self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
+@@ -3947,6 +3976,27 @@ class DeepseekV4AttnBackend(
+                 extra_topk_lengths = core_attn_metadata.sparse_topk_lengths(
+                     compress_ratio
+                 )
++                host_kv = getattr(token_to_kv_pool, "host_low_ratio", None)
++                if (
++                    host_kv is not None
++                    and forward_batch.forward_mode.is_decode()
++                    and host_kv.covers(compress_ratio, extra_indices)
++                ):
++                    # The index source's rows, gathered from host memory; renumbered.
++                    extra_k_cache = host_kv.stage[compress_ratio]
++                    extra_indices = host_kv.remap[compress_ratio][: extra_indices.shape[0]]
++                elif host_kv is not None and forward_batch.forward_mode.is_extend():
++                    # Prefill: the pool layer's used pages, copied to the GPU at the first
++                    # layer that reads them in this forward and shared by the rest
++                    pool_layer = token_to_kv_pool.layer_mapping[layer_id][1]
++                    extra_k_cache = host_kv.prefill_copy(
++                        forward_batch,
++                        compress_ratio,
++                        pool_layer,
++                        extra_k_cache,
++                        lambda: self._max_token_slot(forward_batch),
++                        layer_id,
++                    )
+ 
+             swa_kv_page_size = token_to_kv_pool.get_swa_key_page_size()
+             assert swa_k_cache.ndim == 2
+diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
+index ea5ba22626..610ed859ab 100644
+--- a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
++++ b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
+@@ -152,7 +152,7 @@ def _whole_chunks(tensors, mark, n: int, dev):
+ 
+ def _setup(runner) -> bool:
+     if STATE["alloc"] is not None:
+-        return True
++        return not STATE.get("spare_only")
+     if STATE.get("off"):
+         return False
+     STATE["off"] = True  # until set up
+@@ -173,9 +173,17 @@ def _setup(runner) -> bool:
+     n = int(getattr(a, "num_pages", 0) or a.size // a.page_size)
+     tensors = _kv_tensors(kvp, n, a.page_size)
+     if not tensors:
++        if HOT:
++            # nothing to unmap (V4.1's compressed KV in host memory): the hot lend can
++            # still take the driver's spare, and gives it back at the same windows
++            STATE.update(alloc=a, tensors=[], chunk=0, ps=a.page_size, n=n, off=False, spare_only=True)
++            _log("the hot lend takes the driver's spare only")
+         return False
+     chunk = max(t[2] for t in tensors)
+-    STATE.update(alloc=a, tensors=tensors, chunk=chunk, ps=a.page_size, n=n, off=False)
++    # pages wholly in every tensor's device part (a split range's tail is host memory)
++    dev_pages = min(kt_kv_vmm.device_bytes(t[0]) // t[1] for t in tensors)
++    STATE.update(alloc=a, tensors=tensors, chunk=chunk, ps=a.page_size, n=n, off=False,
++                 dev_pages=dev_pages if dev_pages < n + 1 else None)
+     _wrap_allocator(a)
+     _log(f"{len(tensors)} K/V tensors of {kvp.__class__.__name__}, {n} pages of {a.page_size} tokens "
+          f"({min(t[1] for t in tensors)}-{max(t[1] for t in tensors)} B a page per tensor), "
+@@ -267,6 +275,11 @@ def _release_free(keep_pages: int):
+     if free.numel() <= keep_pages:
+         return None
+     cand = free[keep_pages:]
++    if STATE.get("dev_pages") is not None:
++        # a pool whose tail is host memory (dsv41_host_kv): only device pages lend
++        cand = cand[cand < STATE["dev_pages"]]
++        if cand.numel() == 0:
++            return None
+     mark = torch.zeros(n + 2, dtype=torch.int32, device=dev)
+     mark[cand] = 1
+     torch.cuda.synchronize(dev)
+@@ -288,18 +301,31 @@ def decode_lend(runner, reserve_tokens: int, min_bytes: int) -> int:
+     """The hot lend, outside prefill: every free page beyond reserve_tokens (and a
+     page a running request) leaves the free list and its whole chunks are unmapped,
+     when that is at least min_bytes. Returns the bytes unmapped (0: nothing lent)."""
+-    if not HOT or STATE["lent"] is not None or runner is None or not _setup(runner):
++    if not HOT or STATE["lent"] is not None or runner is None:
+         return 0
++    if not _setup(runner):
++        if not STATE.get("spare_only") or min_bytes > 1:
++            return 0
++        STATE.update(lent=STATE["alloc"].free_pages[:0].clone(), ranges=[], bytes=0, owner="hot")
++        STATE["hot_lends"] += 1
++        return 1
+     a, ps = STATE["alloc"], STATE["ps"]
+     keep = -(-reserve_tokens // ps) + 1
+     free = _free_count(a)
+     if free <= keep:
+         return 0
++    if STATE.get("dev_pages") is not None:
++        free = min(free, STATE["dev_pages"])  # only device pages lend
+     est = sum(max(0, (free - keep) * pb - 2 * c) for _, pb, c, _ in STATE["tensors"])
+-    if est < min_bytes:
++    if est < min_bytes and not (STATE.get("dev_pages") is not None and min_bytes <= 1):
+         return 0
+     got = _release_free(keep)
+     if got is None:
++        if STATE.get("dev_pages") is not None and min_bytes <= 1:
++            # a split pool with no free device page to lend: the driver's spare alone
++            STATE.update(lent=a.free_pages[:0].clone(), ranges=[], bytes=0, owner="hot")
++            STATE["hot_lends"] += 1
++            return 1
+         return 0
+     cand, _, ranges, total = got
+     STATE.update(lent=cand, ranges=ranges, bytes=total, owner="hot")
+diff --git a/python/sglang/srt/layers/moe/kt_kv_vmm.py b/python/sglang/srt/layers/moe/kt_kv_vmm.py
+index cf20823569..4b62f98233 100644
+--- a/python/sglang/srt/layers/moe/kt_kv_vmm.py
++++ b/python/sglang/srt/layers/moe/kt_kv_vmm.py
+@@ -77,6 +77,11 @@ def _load():
+     if hasattr(_lib, "kv_vmm_malloc_shadow"):
+         _lib.kv_vmm_malloc_shadow.restype = ctypes.c_void_p
+         _lib.kv_vmm_malloc_shadow.argtypes = [ctypes.c_ssize_t, ctypes.c_int]
++    if hasattr(_lib, "kv_vmm_malloc_split"):
++        _lib.kv_vmm_malloc_split.restype = ctypes.c_void_p
++        _lib.kv_vmm_malloc_split.argtypes = [ctypes.c_ssize_t, ctypes.c_int, ctypes.c_size_t, ctypes.c_int]
++        _lib.kv_vmm_device_bytes.restype = ctypes.c_size_t
++        _lib.kv_vmm_device_bytes.argtypes = [ctypes.c_void_p]
+     _lib.kv_vmm_free.restype = None
+     _lib.kv_vmm_free.argtypes = [ctypes.c_void_p, ctypes.c_ssize_t, ctypes.c_int, ctypes.c_void_p]
+     if not DIRECT:
+@@ -89,9 +94,11 @@ class _Block:
+     """One kv_vmm allocation, owned by the tensor made over it (torch keeps the
+     object of a __cuda_array_interface__ alive as long as the tensor)."""
+ 
+-    def __init__(self, nbytes: int, device: int, lazy: bool = False, shadow: bool = False):
++    def __init__(self, nbytes: int, device: int, lazy: bool = False, shadow: bool = False, split=None):
+         self.nbytes, self.device = nbytes, device
+-        if shadow:
++        if split is not None:
++            self.ptr = _lib.kv_vmm_malloc_split(nbytes, device, split[0], split[1])
++        elif shadow:
+             self.ptr = _lib.kv_vmm_malloc_shadow(nbytes, device)
+         else:
+             self.ptr = _lib.kv_vmm_malloc_lazy(nbytes, device) if lazy else _lib.kv_vmm_malloc(nbytes, device, None)
+@@ -209,6 +216,30 @@ def shadow_tensor(shape, dtype, device: int) -> torch.Tensor:
+     return t[:size_b].view(dtype).view(tuple(int(d) for d in shape))
+ 
+ 
++def split_tensor(shape, dtype, device: int, device_bytes: int, numa: int) -> torch.Tensor:
++    """A zeroed tensor whose first device_bytes are device memory and the rest host
++    memory of NUMA node numa, one range the GPU addresses as a whole (DeepSeek-V4.1's
++    compressed KV past what the GPU holds). release / restore leave the host part."""
++    lib = _load()
++    if not hasattr(lib, "kv_vmm_malloc_split"):
++        raise RuntimeError(f"{_LIB_PATH} has no kv_vmm_malloc_split: rebuild it from kv_vmm.c")
++    n = 1
++    for d in shape:
++        n *= int(d)
++    size_b = n * dtype.itemsize
++    with torch.cuda.device(device):
++        t = torch.as_tensor(_Block(max(1, size_b), device, split=(max(0, device_bytes), numa)), device=f"cuda:{device}")
++    return t[:size_b].view(dtype).view(tuple(int(d) for d in shape)).zero_()
++
++
++def device_bytes(t: torch.Tensor) -> int:
++    """How many bytes from the start of t's kv_vmm range are device memory."""
++    lib = _load()
++    if not hasattr(lib, "kv_vmm_device_bytes"):
++        return t.nbytes
++    return int(lib.kv_vmm_device_bytes(ctypes.c_void_p(t.data_ptr())))
++
++
+ def chunk_bytes(device: int) -> int:
+     return int(_load().kv_vmm_chunk_bytes(device))
+ 
+diff --git a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
+index 522a38cace..987adaeb2e 100644
+--- a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
++++ b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import os
+ from contextlib import nullcontext
+ from typing import (
+     FrozenSet,
+@@ -332,6 +333,15 @@ class DeepSeekV4SingleKVPool(KVCache):
+             )
+         assert self.store_dtype == torch.uint8
+ 
++        device_tokens = getattr(self, "device_tokens", None)
++        if device_tokens is not None:
++            from sglang.srt.mem_cache.dsv41_host_kv import make_pool_buffer
++
++            # a pool page holds one full page's entries; page 0 is the reserved one
++            device_pages = 1 + device_tokens // self.global_page_size
++            self.host_part = device_pages < num_pages
++            self.device_pages = device_pages
++            return make_pool_buffer((num_pages, self.bytes_per_page_padded), self.device, device_pages)
+         return torch.zeros(
+             num_pages,
+             self.bytes_per_page_padded,
+@@ -952,6 +962,15 @@ class DeepSeekV4UnifiedKVPool:
+         return data_ptrs, data_lens, item_lens
+ 
+ 
++class HostMappedSingleKVPool(DeepSeekV4SingleKVPool):
++    """A ratio-1/2 compressed KV pool whose pages past `device_tokens` live in host memory
++    (dsv41_host_kv.make_pool_buffer); subclassed with device_tokens set."""
++
++    device_tokens = None
++    host_part = False
++    device_pages = 0
++
++
+ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+     # object.__new__ stubs (disagg wire test) skip __init__; False is the env
+     # default, so the fp8 PD/HiCache refuses don't AttributeError on them.
+@@ -1299,6 +1318,26 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+             kv_pool_cls=kv_pool_cls,
+         )
+ 
++        self.host_low_ratio = None
++        if any(getattr(p, "host_part", False) for p in self.kv_pools.values()):
++            from sglang.srt.mem_cache.dsv41_host_kv import HostLowRatioKV
++
++            self.host_low_ratio = HostLowRatioKV(
++                ratios=[r for r, p in self.kv_pools.items() if getattr(p, "host_part", False)],
++                page_size=page_size,
++                topk=int(os.environ.get("SGLANG_DSV41_HOST_KV_TOPK", "512")),
++                max_rows=int(os.environ.get("SGLANG_DSV41_HOST_KV_MAX_ROWS", "16")),
++                device=device,
++            )
++            parts = [p for p in self.kv_pools.values() if getattr(p, "host_part", False)]
++            host_b = sum((p.kv_buffer[0].shape[0] - p.device_pages) * p.kv_buffer[0].shape[1] * len(p.kv_buffer) for p in parts)
++            dev_b = sum(min(p.device_pages, p.kv_buffer[0].shape[0]) * p.kv_buffer[0].shape[1] * len(p.kv_buffer) for p in parts)
++            logger.info(
++                f"DSV4.1 host KV: the ratio-1/2 compressed KV's first {parts[0].device_pages} of "
++                f"{parts[0].kv_buffer[0].shape[0]} pages on the GPU ({dev_b / 2**30:.2f} GiB), "
++                f"the rest in host memory ({host_b / 2**30:.2f} GiB)"
++            )
++
+         # The distinct compress ratios this stage has, sorted. Registry pools kept
+         # for a ratio the model lacks (wire-layout alignment) do not count.
+         model_ratios = set(self.compression_ratios)
+@@ -1599,6 +1638,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+                     cls=pool_cls,
+                     kv_layout=self.compressed_kv_layout(ratio),
+                 )
++            from sglang.srt.mem_cache.dsv41_host_kv import PLAN
++
++            device_tokens = PLAN["device_tokens"] if kv_pool_cls is DeepSeekV4SingleKVPool else None
++            split_cls = (
++                type("SplitSingleKVPool", (HostMappedSingleKVPool,), {"device_tokens": device_tokens})
++                if device_tokens is not None
++                else None
++            )
+             for ratio, sources in low_ratio_sources.items():
+                 self.kv_pools[ratio] = self._make_kv_pool(
+                     size=self.full_size // ratio,
+@@ -1608,7 +1655,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+                     device=device,
+                     enable_memory_saver=enable_memory_saver,
+                     global_page_size=page_size,
+-                    cls=kv_pool_cls,
++                    cls=split_cls or kv_pool_cls,
+                     kv_layout=self.compressed_kv_layout(ratio),
+                 )
+ 
+diff --git a/python/sglang/srt/mem_cache/dsv41_host_kv.py b/python/sglang/srt/mem_cache/dsv41_host_kv.py
+new file mode 100644
+index 0000000000..4b5e18d8e7
+--- /dev/null
++++ b/python/sglang/srt/mem_cache/dsv41_host_kv.py
+@@ -0,0 +1,262 @@
++"""DeepSeek-V4.1's ratio-1/2 compressed KV in host memory (SGLANG_DSV41_HOST_KV=1).
++
++The compressed KV pools (KVLayout.V41_FP4, 288 bytes an entry, kv_source layers only) live in
++pinned host memory mapped into the GPU's address space and presented as CUDA tensors, so every
++writer stores into them unchanged. Decode reads only the indexer's top-k entries: each index
++source gathers its rows into a small device buffer laid out as the pool's pages, and attention
++reads that buffer with the rows renumbered row * k + j. Attention reading host memory directly
++would cost ~100 us a layer on PCIe; the gather is ~10 us an index source.
++
++Prefill copies each kv_source pool layer's used pages to the GPU once a chunk instead.
++
++The index-K pools stay on the GPU: decode scores the whole context of them at every index
++source, before any top-k exists.
++"""
++
++import logging
++import mmap
++import os
++from typing import Dict, Optional
++
++import torch
++import triton
++import triton.language as tl
++
++logger = logging.getLogger(__name__)
++
++_DATA_BYTES = tl.constexpr(256)  # e2m1 payload of one V41_FP4 entry
++_SCALE_BYTES = tl.constexpr(32)  # its e4m3 scales, stored after the page's payloads
++
++
++def host_kv_enabled() -> bool:
++    """On by default: the pool covers the context, and what the GPU cannot hold of the
++    compressed KV goes to host memory. SGLANG_DSV41_HOST_KV=0: the pool is what fits."""
++    return os.environ.get("SGLANG_DSV41_HOST_KV", "1") != "0"
++
++
++# Set by the pool configurator: how many full tokens of the ratio-1/2 compressed KV the GPU
++# holds (None: all of it, the pools are plain device tensors).
++PLAN = {"device_tokens": None}
++
++
++def _gpu_numa_node(index: int) -> int:
++    try:
++        p = torch.cuda.get_device_properties(index)
++        path = f"/sys/bus/pci/devices/{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}.0/numa_node"
++        return max(0, int(open(path).read().strip()))
++    except Exception:
++        return 0
++
++
++def make_pool_buffer(shape, device, device_pages: int) -> torch.Tensor:
++    """A ratio-1/2 pool layer: its first device_pages pages on the GPU, the rest in host
++    memory on the GPU's NUMA node, one range (kv_vmm). Without kv_vmm the whole layer goes
++    to host memory when any of it must."""
++    index = torch.device(device).index
++    index = torch.cuda.current_device() if index is None else index
++    page_bytes = shape[1]
++    from sglang.srt.layers.moe import kt_kv_vmm
++
++    if kt_kv_vmm.ENABLED:
++        return kt_kv_vmm.split_tensor(shape, torch.uint8, index, device_pages * page_bytes, _gpu_numa_node(index))
++    if device_pages >= shape[0]:
++        return torch.zeros(shape, dtype=torch.uint8, device=device)
++    return host_mapped_uint8(shape, device)
++
++
++class _CudaArray:
++    def __init__(self, ptr: int, shape):
++        self.__cuda_array_interface__ = {
++            "shape": tuple(shape),
++            "typestr": "|u1",
++            "data": (ptr, False),
++            "version": 3,
++            "strides": None,
++        }
++
++
++def host_mapped_uint8(shape, device) -> torch.Tensor:
++    """A zeroed uint8 tensor in pinned host memory (2 MiB pages where THP allows), registered
++    with CUDA and returned as a CUDA tensor on `device` (UVA: the host address)."""
++    nbytes = 1
++    for s in shape:
++        nbytes *= s
++    mm = mmap.mmap(
++        -1,
++        max(nbytes, mmap.PAGESIZE),
++        flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
++        prot=mmap.PROT_READ | mmap.PROT_WRITE,
++    )
++    mm.madvise(mmap.MADV_HUGEPAGE)
++    host = torch.frombuffer(mm, dtype=torch.uint8)[:nbytes]
++    host.zero_()
++    err = torch.cuda.cudart().cudaHostRegister(host.data_ptr(), nbytes, 0)
++    if int(err) != 0:
++        raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
++    t = torch.as_tensor(_CudaArray(host.data_ptr(), shape), device=device)
++    t._host_kv_keep = (mm, host)  # the mapping lives as long as the tensor
++    return t
++
++
++def keep_free_pages_sorted(allocator) -> None:
++    """Freed pages go back in order, so the lowest free pages (the device part of a split
++    pool) are handed out first; the paged allocator otherwise puts them in front, and a
++    long request's host pages would come before device pages nobody used."""
++    a = getattr(allocator, "full_attn_allocator", None) or allocator
++    if getattr(a, "_dsv41_sorted", False) or not hasattr(a, "_release_page_ids"):
++        return
++    orig = a._release_page_ids
++
++    def release(*page_ids):
++        if getattr(a, "need_sort", False):
++            return orig(*page_ids)
++        a.free_pages = torch.sort(torch.cat((*page_ids, a.free_pages))).values
++
++    a._release_page_ids = release
++    a._dsv41_sorted = True
++    logger.info(f"DSV4.1 host KV: {type(a).__name__} hands out the lowest free pages first")
++
++
++@triton.jit
++def _gather_rows_kernel(
++    src,
++    idx,
++    stage,
++    remap,
++    idx_stride,
++    K: tl.constexpr,
++    P: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0)
++    j = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    s = tl.load(idx + row * idx_stride + j)
++    valid = s >= 0
++    s = tl.where(valid, s, 0).to(tl.int64)
++    d = row.to(tl.int64) * K + j
++    page_bytes: tl.constexpr = P * (_DATA_BYTES + _SCALE_BYTES)
++    w = tl.arange(0, _DATA_BYTES // 4)
++    src_data = (src + (s // P * page_bytes + s % P * _DATA_BYTES)[:, None] + w[None, :] * 4).to(
++        tl.pointer_type(tl.int32)
++    )
++    dst_data = (stage + (d // P * page_bytes + d % P * _DATA_BYTES)[:, None] + w[None, :] * 4).to(
++        tl.pointer_type(tl.int32)
++    )
++    tl.store(dst_data, tl.load(src_data, mask=valid[:, None]), mask=valid[:, None])
++    v = tl.arange(0, _SCALE_BYTES // 4)
++    src_sc = (
++        src + (s // P * page_bytes + P * _DATA_BYTES + s % P * _SCALE_BYTES)[:, None] + v[None, :] * 4
++    ).to(tl.pointer_type(tl.int32))
++    dst_sc = (
++        stage + (d // P * page_bytes + P * _DATA_BYTES + d % P * _SCALE_BYTES)[:, None] + v[None, :] * 4
++    ).to(tl.pointer_type(tl.int32))
++    tl.store(dst_sc, tl.load(src_sc, mask=valid[:, None]), mask=valid[:, None])
++    tl.store(remap + row * K + j, tl.where(valid, d, -1).to(tl.int32))
++
++
++class HostLowRatioKV:
++    """Device staging for the host-resident ratio-1/2 pools: per ratio, room for `max_rows`
++    query rows of `topk` entries in the pool's page layout, and the renumbered indices."""
++
++    def __init__(self, ratios, page_size: int, topk: int, max_rows: int, device):
++        self.topk = topk
++        self.max_rows = max_rows
++        self.entries_per_page: Dict[int, int] = {}
++        self.stage: Dict[int, torch.Tensor] = {}
++        self.remap: Dict[int, torch.Tensor] = {}
++        self.check = os.environ.get("SGLANG_DSV41_HOST_KV_CHECK", "0") == "1"
++        self._checks = self._direct = 0
++        for r in ratios:
++            p = page_size // r
++            assert topk % p == 0 or p % topk == 0
++            pages = max(1, max_rows * topk // p)
++            self.entries_per_page[r] = p
++            self.stage[r] = torch.zeros(
++                pages, p * (_DATA_BYTES + _SCALE_BYTES), dtype=torch.uint8, device=device
++            )
++            self.remap[r] = torch.full((max_rows, topk), -1, dtype=torch.int32, device=device)
++
++    def prefill_copy(self, fb, ratio: int, pool_layer: int, src: torch.Tensor, max_slot, layer_id: int):
++        """The GPU copy of a pool layer's pages up to the batch's highest token slot (a
++        compressed page holds one full page's entries), made once a forward at the first
++        attention that reads the layer: after every writer of the forward (the kv_source's
++        own pass and the bounded-replay tail rewrite), which a copy at the kv_source missed.
++        Rows x top-k gathers would move ~1.2 GB for an 8K-token chunk."""
++        copies = getattr(fb, "dsv41_host_kv_copies", None)
++        if copies is None:
++            copies = fb.dsv41_host_kv_copies = {}
++        m = copies.get((ratio, pool_layer))
++        if m is None:
++            # the layers run in order and a pool layer's readers are consecutive (2-7,
++            # 8-13, 14-19, 20-39): the previous copy has no reader left
++            copies.clear()
++            pages = max_slot() // (self.entries_per_page[ratio] * ratio) + 1
++            m = torch.empty((pages, src.shape[1]), dtype=src.dtype, device=self.stage[ratio].device)
++            # an SM kernel, not cudaMemcpy: a kv_vmm range whose tail is host-NUMA memory
++            # is not a valid copy-engine source ("invalid argument")
++            torch.add(src[:pages].view(torch.int32), 0, out=m.view(torch.int32))
++            copies[(ratio, pool_layer)] = m
++        elif self.check:
++            self.check_mirror(ratio, m, src, layer_id)
++        return m
++
++    def check_mirror(self, ratio: int, m: torch.Tensor, src: torch.Tensor, layer_id: int) -> None:
++        """SGLANG_DSV41_HOST_KV_CHECK=1: a later layer's view of the copy against the host pool,
++        byte for byte (the pool is typed float8: a value comparison calls NaN bytes unequal)."""
++        m, src = m.view(torch.uint8), src.view(torch.uint8)
++        now = src[: m.shape[0]].clone()
++        p = self.entries_per_page[ratio]
++        data_m, data_n = m[:, : p * 256].reshape(-1, 256), now[:, : p * 256].reshape(-1, 256)
++        sc_m, sc_n = m[:, p * 256 : p * 288].reshape(-1, 32), now[:, p * 256 : p * 288].reshape(-1, 32)
++        bad_d = (data_m != data_n).any(1).nonzero().flatten()
++        if bad_d.numel():
++            # the CPU's view of the same host bytes: who is stale?
++            import ctypes
++
++            nb = m.shape[0] * src.stride(0)
++            host = torch.frombuffer((ctypes.c_uint8 * nb).from_address(src.data_ptr()), dtype=torch.uint8)
++            host = host.view(m.shape[0], src.stride(0))[:, : src.shape[1]]
++            torch.cuda.current_stream().synchronize()
++            data_h = host[:, : p * 256].reshape(-1, 256)
++            i = bad_d[:64].cpu()
++            same_copy = int((data_h[i] == data_m[bad_d[:64]].cpu()).all(1).sum())
++            same_now = int((data_h[i] == data_n[bad_d[:64]].cpu()).all(1).sum())
++            logger.info(f"host KV check: layer {layer_id}: of {i.numel()} differing entries the CPU sees the copy's bytes in "
++                        f"{same_copy}, the GPU's later read in {same_now}")
++        bad_s = (sc_m != sc_n).any(1).nonzero().flatten()
++        self._checks += 1
++        if bad_d.numel() or bad_s.numel() or self._checks <= 4:
++            nz = (data_n != 0).any(1).nonzero().flatten()
++            logger.info(
++                f"host KV check: layer {layer_id} ratio {ratio}: {m.shape[0]} pages copied, "
++                f"written entries {nz.numel()} (last {int(nz[-1]) if nz.numel() else -1}); "
++                f"differ: data {bad_d.numel()} {bad_d[:6].tolist()}, scales {bad_s.numel()} {bad_s[:6].tolist()}; "
++                f"zero in the copy among them {int((data_m[bad_d] == 0).all(1).sum()) if bad_d.numel() else 0}; "
++                f"bytes {((data_m[bad_d] != data_n[bad_d]).any(0).nonzero().flatten()[[0, -1]].tolist()) if bad_d.numel() else []}"
++            )
++
++    def covers(self, ratio: int, indices: Optional[torch.Tensor]) -> bool:
++        return (
++            ratio in self.stage
++            and indices is not None
++            and indices.shape[0] <= self.max_rows
++            and indices.shape[-1] == self.topk
++        )
++
++    def gather(self, ratio: int, src: torch.Tensor, indices: torch.Tensor) -> None:
++        rows = indices.shape[0]
++        if rows == 0:
++            return
++        assert indices.dtype == torch.int32 and indices.stride(-1) == 1
++        block = 32
++        _gather_rows_kernel[(rows, self.topk // block)](
++            src,
++            indices,
++            self.stage[ratio],
++            self.remap[ratio],
++            indices.stride(0),
++            K=self.topk,
++            P=self.entries_per_page[ratio],
++            BLOCK=block,
++            num_warps=4,
++        )
+diff --git a/python/sglang/srt/model_executor/pool_configurator.py b/python/sglang/srt/model_executor/pool_configurator.py
+index a943f439c2..b916dae611 100644
+--- a/python/sglang/srt/model_executor/pool_configurator.py
++++ b/python/sglang/srt/model_executor/pool_configurator.py
+@@ -9,6 +9,7 @@ from available GPU memory using a unified coeff+bias model:
+ from __future__ import annotations
+ 
+ import logging
++import os
+ from bisect import bisect_right
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Optional
+@@ -1639,6 +1640,35 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
+                 f"or SGLANG_SWA_EVICTION_INTERVAL, or increase --mem-fraction-static."
+             )
+ 
++        from sglang.srt.mem_cache import dsv41_host_kv
++
++        dsv41_host_kv.PLAN["device_tokens"] = None
++        if (
++            dsv41_host_kv.host_kv_enabled()
++            and not self._unified
++            and self.stage_owner_layers.keys() & {1, 2}
++            and full_token < self.context_len
++        ):
++            # The pool covers the whole context. The GPU keeps every byte but the
++            # ratio-1/2 compressed KV's, which it holds as far as the budget goes; the
++            # rest of it lives in host memory (dsv41_host_kv).
++            kv_part = sum(
++                self._get_paged_kv_bytes_per_token(ratio) / ratio * len(layers)
++                for ratio, layers in self.stage_owner_layers.items()
++                if ratio in (1, 2)
++            )
++            rest = self.bytes_per_full_token - kv_part
++            device_tokens = int(
++                max(0.0, available_bytes_for_tokens - self.context_len * rest) // kv_part
++            )
++            device_tokens = min(device_tokens, self.context_len) // page_size * page_size
++            logger.info(
++                f"DSV4.1 host KV: the pool covers the context, {full_token} -> {self.context_len} "
++                f"tokens; the GPU holds the compressed KV of {device_tokens} "
++                f"({kv_part:.0f} of {self.bytes_per_full_token:.0f} B a token), host memory the rest"
++            )
++            full_token = self.context_len
++            dsv41_host_kv.PLAN["device_tokens"] = device_tokens
+         sizes = self._compute_dsv4_sizes(full_token, page_size)
+         logger.info(
+             f"DSV4 memory calculation: unified={self._unified}, "

@@ -32,9 +32,11 @@ DeepSeek-V4.1-Flash release: point `MODEL` at it.
 
 RAM and VRAM play different parts here. RAM holds every routed expert and has to be
 large enough: nothing in this setup makes the experts smaller, and with too little RAM
-the server does not start. VRAM is different. Only the dense layers and the KV pool
-have to fit on the GPUs; the rest of the GPU memory is working room, measured at
-launch, and each use of it shrinks when there is less:
+the server does not start. VRAM is different. Only the dense layers and the part of the
+KV pool the attention scans in full have to fit on the GPUs: the KV pool always covers
+the whole context, and the compressed KV that does not fit the GPU lives in host memory
+([below](#the-kv-pool-past-the-gpu)). The rest of the GPU memory is working room, measured
+at launch, and each use of it shrinks when there is less:
 
 - the prefill chunk is calibrated on the first launch to the memory that is left, so a
   smaller card runs smaller chunks. Every chunk streams the experts to the GPU again,
@@ -46,7 +48,7 @@ launch, and each use of it shrinks when there is less:
   room fewer are kept, and decode is slower.
 
 The KV pool itself is never made smaller to gain speed: the lends take only its free
-pages. If the server runs out of memory at launch, a shorter context
+pages on the GPU. If the server runs out of memory at launch, a shorter context
 (`SGLANG_CONTEXT_LENGTH`) makes the pool smaller; it is the only setting memory needs.
 
 - **RAM: a 512 GB class machine.** The server uses about 420 GiB, most of it the MXFP4
@@ -55,12 +57,13 @@ pages. If the server runs out of memory at launch, a shorter context
   The launcher makes one expert pool per NUMA node and uses every physical core.
   kt-kernel is built for the CPU it is built on (`CPUINFER_CPU_INSTRUCT=NATIVE`). Its
   MXFP4 kernels need AVX2.
-- **VRAM: 16 GB a card.** The dense layers and the KV pool have to fit; the prefill chunks
-  and the extra hot experts take the rest, so the cards show nearly full whatever room is
-  left. `CUDA_VISIBLE_DEVICES` picks the GPUs, one tensor-parallel rank each.
+- **VRAM: 16 GB a card.** The dense layers and the KV pool's GPU part have to fit; the
+  prefill chunks and the extra hot experts take the rest, so the cards show nearly full
+  whatever room is left. `CUDA_VISIBLE_DEVICES` picks the GPUs, one tensor-parallel rank each.
   - Two 16 GB cards: 6.9 GB of weights each (half of the dense layers and one resident
     expert a layer) and the 1M-token KV pool.
-  - One 16 GB card: 11.7 GB of weights, and the KV pool gets what is left: about 88K tokens.
+  - One 16 GB card: 11.7 GB of weights, and the 1M-token KV pool too: its compressed KV
+    (0.70 GiB at 1M tokens) goes to host memory.
   - Smaller cards do not hold their share of this checkpoint's dense layers with room for a
     long prefill: a more quantized checkpoint is needed (not covered here).
 - **Disk: about 500 GB, NVMe.**
@@ -211,6 +214,27 @@ None of it needs a server change:
 - The card's sampling is `temperature` 1.0, `top_p` 1.0. These are already SGLang's
   defaults for a request that sets neither, since the checkpoint has no
   `generation_config.json`.
+
+## The KV pool past the GPU
+
+When the GPU budget cannot hold the KV pool for the whole context, the pool is made at the
+context length anyway, and the compressed KV it cannot hold lives in host memory
+(tier 1's `host-kv`, [docs/tier1.md](docs/tier1.md#17-host-kv)). Everything else stays on the
+GPU: the window cache, and the indexer keys, which decode scores in full at every step.
+The compressed KV is 720 bytes a token; at 1M tokens, 0.70 GiB of RAM.
+
+- **Where it goes:** each pool layer is one range on remappable memory (`kv-vmm`). Its first
+  pages are on the GPU, as many as the budget holds, and the rest is host memory of the
+  GPU's NUMA node. Requests fill the GPU's pages first. When the whole context fits, as on
+  two 16 GB cards, nothing changes.
+- **Decode:** each step reads only the 512 entries the indexer picks for each of 8 indexer
+  layers. They are gathered from host memory into a small GPU buffer, about 10 µs a layer.
+  On one card, decode runs at 24.6 tok/s with 300K tokens of context and 24.7 tok/s with
+  8K.
+- **Prefill:** each chunk copies the pages in use to the GPU once a layer group.
+- **Accuracy:** the output is bit-identical to the same pool on the GPU.
+
+`SGLANG_DSV41_HOST_KV=0` sizes the pool by the GPU budget instead.
 
 ## Results
 

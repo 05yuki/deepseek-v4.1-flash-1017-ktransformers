@@ -1,4 +1,4 @@
-From b8c8650fb5546d30346f6a7b9d2e375f05076a7c Mon Sep 17 00:00:00 2001
+From ea2abb7ad50c5b1ddaeec8860aa54cffdc70952c Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 22:58:32 +0900
 Subject: [PATCH] [tier 1] wo-a-fp8: keep wo_a in the checkpoint's FP8, read by

@@ -1,4 +1,4 @@
-From d2a82bd5dbd46e4c26e6ed031d494d1e380e1743 Mon Sep 17 00:00:00 2001
+From 1c6f517df2c7ba9384515ac38558fcdd298c16bf Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 22:59:06 +0900
 Subject: [PATCH] [tier 1] vision-on-demand: keep the vision tower in host
