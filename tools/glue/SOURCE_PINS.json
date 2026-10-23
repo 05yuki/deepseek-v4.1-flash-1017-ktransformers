@@ -1,0 +1,19 @@
+{
+  "kt": {
+    "kt-kernel/cpu_backend/cpuinfer.h": "d9faa3a8e20aaefffbd6f29abdf60250721c270bf38d90e831265fc3bc46eac8",
+    "kt-kernel/cpu_backend/worker_pool.cpp": "8675cd3f0c163c3c6c4d04526a7cc624aa49809989839ec53028339e01551060",
+    "kt-kernel/python/experts_base.py": "3366dab25b36f116703010a7e83a00dc54d90cd71c54dd13a8a1a0f6657e9eea"
+  },
+  "sglang": {
+    "python/sglang/kernels/ops/attention/dsv4/live_topk.py": "4726591bcbd75ac2db5fbcdb0d431cc5a1787c4846d5ba280ee29df0b530cee8",
+    "python/sglang/kernels/ops/attention/flash_mla_sm120_triton.py": "5240f4e80a02a64de3a5de757b3c44bb74c19a5ee7febeb7eaa86febc5d401c3",
+    "python/sglang/srt/layers/attention/dsv4/v41_indexer/dense_blocks.py": "d6b449f61a29b75736f9081af5c98689426a4ed19cc5e62957886c562d7800d0",
+    "python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py": "4babd41507d58e27e746d0936c9bb63696c83a79a7edd1d9a23f6c6bec9dccd4",
+    "python/sglang/srt/layers/moe/kt_ep_wrapper.py": "2dd094b057556ed5200764ae58ce1d452458afe59eeaa53b67a0647963ffbc61",
+    "python/sglang/srt/layers/moe/kt_handoff_pack.py": "3950c81352d0fc8287b025d27be017b90dfc5290310efc2eb530fd4568d283dc",
+    "python/sglang/srt/layers/moe/kt_kv_hot_lend.py": "e27d7e35c42d72428d0747711242b45582e67286d82f22401d15adf29311216c",
+    "python/sglang/srt/managers/scheduler.py": "cc76042dc22df27b63492579a97cab9a28cc01f2252fa7106ad4664031bd3c61",
+    "python/sglang/srt/models/deepseek_v2.py": "a6520ab579b5cc780baa3b20e63ea1dc325249b048d3b2462e55328f4f9dbf26",
+    "python/sglang/srt/utils/kt_service_affinity.py": "70d7d0777d619625ca4d548aa1d0fe06e3ad67a4a601750e4f4c5ebfb18efbbd"
+  }
+}

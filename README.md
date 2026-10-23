@@ -23,6 +23,9 @@ MODEL=/models/dsv41-1017 ./serve.sh
 `MODEL=/models/dsv41-1017 tools/check.sh` starts the server once, sends one short request,
 checks that an answer comes back, and stops the server: the one command that says a setup works.
 
+The [optional GPU glue and hot-slot bundle](docs/hot-glue-bundle.md) has separate
+build and runtime gates. The ordinary setup and serving defaults leave it off.
+
 The server speaks SGLang's OpenAI-compatible API on `127.0.0.1:8080`, one request at a
 time. To serve other machines, set `SGLANG_HOST=0.0.0.0` and `SGLANG_API_KEY=<key>`
 (clients then send `Authorization: Bearer <key>`). The same setup also serves the earlier

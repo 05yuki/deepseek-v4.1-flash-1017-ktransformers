@@ -170,6 +170,24 @@ if [[ "$gpu_experts" != "0" && "${KT_HOT_BACKEND:-marlin}" == "marlin" ]]; then
 fi
 
 # --- kt-kernel and the streamed prefill ---------------------------------------
+# The optional source bundle is inert unless explicitly enabled at service
+# launch. Individual overrides remain available for controlled ablations.
+case "${KT_GPU_GLUE:-0}" in
+  0) ;;
+  1)
+    has gpu-glue || { echo "KT_GPU_GLUE=1 requires HOT_GLUE_PATCH=1 at setup" >&2; exit 3; }
+    export KT_IDX_LIVE_TOPK="${KT_IDX_LIVE_TOPK:-1}"
+    export KT_SM89_FUSED_MERGE="${KT_SM89_FUSED_MERGE:-1}"
+    export KT_SHARED_AFTER_SUBMIT="${KT_SHARED_AFTER_SUBMIT:-1}"
+    export KT_HANDOFF_PACK="${KT_HANDOFF_PACK:-1}"
+    export KT_MEMOP_POLL_HINT="${KT_MEMOP_POLL_HINT:-1}"
+    export KT_TASKQUEUE_SPIN_US="${KT_TASKQUEUE_SPIN_US:-2000}"
+    ;;
+  *) echo "KT_GPU_GLUE must be 0 or 1" >&2; exit 2 ;;
+esac
+if [[ -n "${KT_SERVICE_CPUS+x}" ]]; then
+  has gpu-glue || { echo "KT_SERVICE_CPUS requires HOT_GLUE_PATCH=1 at setup" >&2; exit 3; }
+fi
 export KT_STREAM_MEMOPS="${KT_STREAM_MEMOPS:-1}"
 export KT_TASKQUEUE_SPIN_US="${KT_TASKQUEUE_SPIN_US:-300}"
 export KT_MXFP4_BACKEND="${KT_MXFP4_BACKEND:-avx2}"
