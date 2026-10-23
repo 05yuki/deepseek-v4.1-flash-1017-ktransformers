@@ -279,24 +279,30 @@ experts than real text, so these figures are lower than with text.
 
 ### One GPU
 
-The same machine and tag with `CUDA_VISIBLE_DEVICES=0`: one RTX 5070 Ti 16 GB (tensor
-parallel 1), the CPU experts on both sockets, `serve.sh` defaults, every row from one launch.
-The KV pool holds 98,560 tokens, and the hot lend holds 1-3 more experts a layer beside the one
-that stays, so every text runs most of its routes on the CPU.
+The same machine with `CUDA_VISIBLE_DEVICES=0`: one RTX 5070 Ti 16 GB (tensor parallel 1),
+the CPU experts on both sockets, `serve.sh` defaults, measured at tag `2026-10-23-1513`,
+every row from one launch.
+
+The KV pool covers the whole 1M-token context. Its compressed KV, 0.70 GiB, sits in host
+memory ([The KV pool past the GPU](#the-kv-pool-past-the-gpu)). The hot lend holds 1-2 more
+experts a layer beside the one that stays, in the driver's idle memory, so every text runs
+most of its routes on the CPU.
 
 | text | tok/s |
 |---|---|
-| Japanese prose (median of four prompts) | 32.0 |
-| English prose, math | 28.9 |
-| Chinese prose | 28.5 |
+| Japanese prose (median of four prompts) | 31.6 |
+| English prose | 29.0 |
+| math | 28.8 |
+| Chinese prose | 28.4 |
 | English technical prose | 28.2 |
-| JSON | 28.1 |
-| Python code | 27.8 |
+| JSON | 28.0 |
+| Python code | 27.7 |
 
 | prompt (tokens) | tok/s | time |
 |---|---|---|
-| 35,000 | 774 | 45 s |
+| 35,000 | 776 | 45 s |
 | 65,536 | 863 | 76 s |
+| 1,000,000 | 670 | 25 min |
 
 ## Fixes from dsv41-flash-dual-epyc
 
