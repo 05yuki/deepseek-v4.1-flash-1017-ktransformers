@@ -1,0 +1,129 @@
+{
+  "baseline": "portable control, SGLANG_SM89_ATTN_DUAL=0; warm-portable-r1",
+  "candidate": "dual scope, SGLANG_SM89_ATTN_DUAL=1; full-validation/dual",
+  "baseline_status": "PASS",
+  "candidate_status": "PASS",
+  "configuration_mismatches": {},
+  "metric": "aggregate completion tokens / client cohort wall seconds; includes prompt processing",
+  "protocol": "one excluded warmup and five measured rounds; 128 output tokens per request",
+  "results": {
+    "1": {
+      "before": {
+        "median": 8.119798546683564,
+        "minimum": 4.7934143667207865,
+        "maximum": 8.82377484724363,
+        "trials": [
+          4.7934143667207865,
+          5.69232820909024,
+          8.82377484724363,
+          8.119798546683564,
+          8.277694007376448
+        ]
+      },
+      "after": {
+        "median": 9.199547455767792,
+        "minimum": 3.502105162504113,
+        "maximum": 10.55680372589629,
+        "trials": [
+          3.502105162504113,
+          9.199547455767792,
+          9.18943804529778,
+          10.390099379500581,
+          10.55680372589629
+        ]
+      },
+      "improvement_percent": 13.2977302685082
+    },
+    "2": {
+      "before": {
+        "median": 13.84464005545207,
+        "minimum": 11.643727884650092,
+        "maximum": 14.522582160776125,
+        "trials": [
+          12.680279398106535,
+          14.178811423819866,
+          11.643727884650092,
+          13.84464005545207,
+          14.522582160776125
+        ]
+      },
+      "after": {
+        "median": 11.734152276552127,
+        "minimum": 9.143353227148182,
+        "maximum": 14.897932656899549,
+        "trials": [
+          14.897932656899549,
+          9.93262746512768,
+          9.143353227148182,
+          14.699415653757042,
+          11.734152276552127
+        ]
+      },
+      "improvement_percent": -15.244078361349844
+    },
+    "4": {
+      "before": {
+        "median": 16.029176468758127,
+        "minimum": 14.841930515950503,
+        "maximum": 16.25676122917079,
+        "trials": [
+          16.033235814735153,
+          14.841930515950503,
+          15.512286967406055,
+          16.029176468758127,
+          16.25676122917079
+        ]
+      },
+      "after": {
+        "median": 16.530006729685308,
+        "minimum": 14.587195817991988,
+        "maximum": 18.532365876437318,
+        "trials": [
+          14.587195817991988,
+          16.162664453699445,
+          17.495827143772562,
+          16.530006729685308,
+          18.532365876437318
+        ]
+      },
+      "improvement_percent": 3.1244915289524
+    }
+  },
+  "note": "Functional status and configuration only. Numerical comparison and source/build provenance require separate review.",
+  "configuration": {
+    "recipe_base": "a9ce91ca3d8da2df79f335c62c9c961dedd703e9",
+    "sglang": "9c0f6d6a610531bd16ad3513572e55226450b244",
+    "kt_kernel": "95009ea6856c0799e517e93cb12be5e8494bc7ce",
+    "gpu": "RTX4080SUPER experimental32GiB",
+    "torch": "2.14.1+cu130",
+    "cuda_runtime": "13.0",
+    "cuda_compiler": "13.4",
+    "driver": "595.91.07",
+    "cpu": "dualAMD EPYC7543",
+    "expert_threads": 42,
+    "numa_nodes": [
+      0,
+      1,
+      2,
+      4,
+      5,
+      6
+    ],
+    "thread_pools": 6,
+    "tensor_parallel": 1,
+    "context_length": 65536,
+    "max_total_tokens": 65536,
+    "chunked_prefill_size": 2048,
+    "resident_gpu_experts_per_layer": 1,
+    "hot_lend": false,
+    "dynamic_placement": false,
+    "speculation": false,
+    "deferred_experts": false,
+    "cuda_graphs": true,
+    "radix_cache": true,
+    "host_adapters": [
+      "physical NUMA IDs",
+      "lossless MXFP4 GGUF loader bridge"
+    ]
+  }
+}

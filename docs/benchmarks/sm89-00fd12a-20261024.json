@@ -1,0 +1,515 @@
+{
+  "schema_version": 1,
+  "campaign": "canonical A, 2026-10-24, strict eight-node placement",
+  "recipe_commit": "00fd12a0b3e59cbf7dcc62b7341415fcdd3fc9a6",
+  "sglang_commit": "9c0f6d6a610531bd16ad3513572e55226450b244",
+  "ktransformers_commit": "95009ea6856c0799e517e93cb12be5e8494bc7ce",
+  "started_utc": "2026-10-23T18:42:51.529222+00:00",
+  "finished_utc": "2026-10-23T19:29:03.692170+00:00",
+  "purpose": "SM89 compatibility enablement. Unmodified recipe does not support this device; no percentage speedup over it is claimed.",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 4080 SUPER, 32760 MiB, 8.9, 595.91.07",
+    "gpu_count": 1,
+    "gpu_note": "Experimental 32 GiB card; not a stock 16 GiB RTX 4080 SUPER.",
+    "cpu": "2 x AMD EPYC 7543",
+    "physical_cores": 64,
+    "numa_nodes": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "expert_workers": 56,
+    "service_cpus": "0-63"
+  },
+  "software": {
+    "pytorch": "2.14.1+cu130",
+    "cuda_runtime": "13.0",
+    "cuda_compiler": "13.4",
+    "driver": "595.91.07"
+  },
+  "profile": {
+    "context_length": 1048576,
+    "max_total_tokens": 1048576,
+    "mem_fraction_static": 0.81,
+    "chunked_prefill_size": 36864,
+    "max_running_requests": 1,
+    "kt_cpuinfer": 56,
+    "kt_threadpool_count": 8,
+    "numa_node": null,
+    "disable_radix_cache": true,
+    "tool_call_parser": "deepseekv41",
+    "reasoning_parser": "deepseek-v41",
+    "enable_hierarchical_cache": false,
+    "tier": 1,
+    "tensor_parallel": 1,
+    "prefill_calibration": true,
+    "calibrated_chunk_hint": 12288,
+    "effective_prefill_chunk": 36864,
+    "host_kv_default": true,
+    "compressed_c4_gpu_rows": 262144,
+    "compressed_c4_logical_rows": 262144,
+    "compressed_c128_gpu_rows": 8192,
+    "swa_rows": 77056,
+    "host_kv_paging_exercised": false,
+    "native_worker_policy": "strict_bind",
+    "memory_cap_gib": 440,
+    "scope_swap_limit_bytes": 0,
+    "kho": false,
+    "cma_total_bytes": 0,
+    "shmem_thp": "advise",
+    "gpu_exclusive": true
+  },
+  "adaptations": [
+    "Verified full-expert MXFP4 GGUF input and lossless native repack bridge; existing Engram storage adapter.",
+    "Launcher explicit --numa-node removed; external CPUs 0-63 and interleave across nodes 0-7, with strict per-node native expert arenas.",
+    "MAX_JOBS=1; prepared per-arm compiler cache, with exact-path generator/no-work proof. Normal upstream prefill calibration and prefetch remain enabled.",
+    "Before requests only: ordinary file-cache trim inside the owned cgroup to <=416 GiB, helper stopped, then two settled snapshots 20 seconds apart."
+  ],
+  "check_sh": "PASS",
+  "component_groups": {
+    "dispatch": {
+      "status": "PASS",
+      "result": {
+        "checks": 12
+      }
+    },
+    "alignment": {
+      "status": "PASS",
+      "result": {
+        "checks": 7
+      }
+    },
+    "encoding": {
+      "status": "PASS",
+      "result": {
+        "mandatory_checks": 69,
+        "golden_pairs": 5,
+        "advisory_other": [
+          [
+            "23",
+            "6"
+          ]
+        ]
+      }
+    },
+    "e4m3": {
+      "status": "PASS",
+      "result": {
+        "verdict": "PASS"
+      }
+    },
+    "decode_m1": {
+      "status": "PASS",
+      "result": {
+        "matched_rows": 16,
+        "reference": "same kernel, rows individually; not independent arithmetic"
+      }
+    },
+    "decode_m2": {
+      "status": "PASS",
+      "result": {
+        "matched_rows": 32,
+        "reference": "same kernel, rows individually; not independent arithmetic"
+      }
+    },
+    "decode_m4": {
+      "status": "PASS",
+      "result": {
+        "matched_rows": 64,
+        "reference": "same kernel, rows individually; not independent arithmetic"
+      }
+    },
+    "qdq": {
+      "status": "PASS",
+      "result": {
+        "verdict": "PASS"
+      }
+    },
+    "moe": {
+      "status": "PASS",
+      "result": {
+        "verdict": "PASS",
+        "marlin_advisory": [
+          "M    1: fp32 kernels 1.68e-03 (one rounding 1.68e-03), 0.120 ms | Marlin 4.90e-03, 0.128 ms",
+          "M    2: fp32 kernels 1.68e-03 (one rounding 1.68e-03), 0.176 ms | Marlin 4.75e-03, 0.187 ms",
+          "M    4: fp32 kernels 1.66e-03 (one rounding 1.66e-03), 0.284 ms | Marlin 4.79e-03, 0.216 ms",
+          "M    8: fp32 kernels 1.68e-03 (one rounding 1.68e-03), 0.531 ms | Marlin 4.76e-03, 0.246 ms",
+          "M   16: fp32 kernels 1.66e-03 (one rounding 1.66e-03), 0.728 ms (in a graph 1.66e-03) | Marlin 4.81e-03, 0.329 ms",
+          "M   64: fp32 kernels 1.66e-03 (one rounding 1.66e-03), 1.162 ms (in a graph 1.66e-03) | Marlin 4.78e-03, 0.515 ms",
+          "M  512: fp32 kernels 1.66e-03 (one rounding 1.66e-03), 3.533 ms (in a graph 1.66e-03) | Marlin 4.80e-03, 2.884 ms"
+        ],
+        "marlin_status": "REPORTED"
+      }
+    },
+    "sm89": {
+      "status": "PASS",
+      "result": {
+        "checks": 399
+      }
+    }
+  },
+  "tool_calls": {
+    "cases": [
+      {
+        "label": "plain",
+        "stock_pass": true,
+        "detail": "finish=tool_calls calls=[('get_weather', '{\"city\": \"Tokyo\"}')]"
+      },
+      {
+        "label": "stream",
+        "stock_pass": true,
+        "detail": "finish=tool_calls calls=[{'name': 'get_weather', 'arguments': '{\"city\": \"Tokyo\"}'}]"
+      },
+      {
+        "label": "result",
+        "stock_pass": true,
+        "detail": "finish=stop content=\"Right now in Tokyo it's **light rain** with a temperature of **14 °C** (about 57 °F). You'd probably want an umbrella if\""
+      },
+      {
+        "label": "namespace",
+        "stock_pass": true,
+        "detail": "calls=[('get_weather', 'weather')]"
+      },
+      {
+        "label": "thinking",
+        "stock_pass": true,
+        "detail": "reasoning 137 chars, calls=['get_weather']"
+      }
+    ],
+    "passed": 5,
+    "total": 5,
+    "stock_all_pass": true
+  },
+  "checkpoint_reference": {
+    "pieces": 24,
+    "scored_positions": 11496,
+    "reference_nll": 0.7141112515005389,
+    "served_nll": 0.7150963168424553,
+    "delta_nats_per_token": 0.000985065341916273,
+    "piece_se_nats_per_token": 0.00410569258109842,
+    "piece_deltas_nats_per_token": [
+      -0.02037221253740473,
+      0.06043475987126248,
+      -0.0033331628623305505,
+      0.014707220266670318,
+      -0.0208031207472053,
+      0.028585688143529426,
+      0.012398252359251384,
+      -0.013610615513596281,
+      0.00754724921177127,
+      -0.023927781704639293,
+      -0.040238289995147836,
+      0.0011918883214447626,
+      0.00887636217457043,
+      -0.004825337346377539,
+      0.002941675584421802,
+      -0.007410552897875344,
+      0.015955206379405215,
+      0.01255827004961168,
+      -0.007390262119170993,
+      -0.00453102437101664,
+      0.013627859234174231,
+      -0.00526348872851416,
+      -0.014425912483390464,
+      0.010948897916546683
+    ],
+    "mean_absolute_token_logprob_difference": 0.11747137608616477,
+    "identical_tokens": 654,
+    "z_descriptive_only": 0.23992671698101978,
+    "input_ids_sha256": "a05a310af5b8dc0baf14be9beebd365b167d6a66137bc97d15d31d7a684a0ad5",
+    "reference_sha256": "d21c571d45ecf23f137973652c16baadad4d6a86e2ec8017da7178a54035cc79",
+    "served_sha256": "b4129078016a5b58a243b8816bfb203f2b033be0c8d3874de0d4fe69213bf10c",
+    "stock_compare_stdout": "ref.json                 mean NLL 0.7141 over 11496 tokens\nserved-nll.json          mean NLL 0.7151 over 11496 tokens\nserved-nll.json          minus ref.json: +0.0010 nats a token, SE 0.0041 over 24 pieces (z +0.24); mean |diff| a token 0.1175; 654 of 11496 tokens identical\n"
+  },
+  "bench": {
+    "decode": [
+      {
+        "label": "p0",
+        "completion_tokens": 1024,
+        "seconds_printed": 32.4,
+        "tokens_per_second_printed": 31.6,
+        "below_1024_token_cap": false
+      },
+      {
+        "label": "p1",
+        "completion_tokens": 1024,
+        "seconds_printed": 32.9,
+        "tokens_per_second_printed": 31.1,
+        "below_1024_token_cap": false
+      },
+      {
+        "label": "p2",
+        "completion_tokens": 1024,
+        "seconds_printed": 34.9,
+        "tokens_per_second_printed": 29.3,
+        "below_1024_token_cap": false
+      },
+      {
+        "label": "p3",
+        "completion_tokens": 1024,
+        "seconds_printed": 33.2,
+        "tokens_per_second_printed": 30.8,
+        "below_1024_token_cap": false
+      }
+    ],
+    "rounded_stdout_values": true,
+    "caveat": "Request completion tokens/wall time includes prompt prefill; outputs are stochastic and may end before 1024 tokens. No raw completion text is saved by stock bench.py.",
+    "decode_median_tokens_per_second_printed": 31.0,
+    "prefill_35k": [
+      {
+        "label": "first",
+        "requested_tokens": 35000,
+        "seconds_printed": 41.63,
+        "tokens_per_second_printed": 841
+      },
+      {
+        "label": "second",
+        "requested_tokens": 35000,
+        "seconds_printed": 29.65,
+        "tokens_per_second_printed": 1180
+      }
+    ],
+    "prefill_caveat": "Keep both rows: first can include setup. Fixed random-ID prompts are transport/performance probes, not language or numerical correctness tests. Latency includes one generated token; stock tool does not record observed input-token count."
+  },
+  "bench_other_text": {
+    "decode": [
+      {
+        "label": "Chinese prose",
+        "completion_tokens": 1024,
+        "seconds_printed": 37.6,
+        "tokens_per_second_printed": 27.2,
+        "below_1024_token_cap": false
+      },
+      {
+        "label": "English prose",
+        "completion_tokens": 1024,
+        "seconds_printed": 36.4,
+        "tokens_per_second_printed": 28.1,
+        "below_1024_token_cap": false
+      },
+      {
+        "label": "English technical prose",
+        "completion_tokens": 1024,
+        "seconds_printed": 41.5,
+        "tokens_per_second_printed": 24.7,
+        "below_1024_token_cap": false
+      },
+      {
+        "label": "math",
+        "completion_tokens": 1024,
+        "seconds_printed": 37.6,
+        "tokens_per_second_printed": 27.2,
+        "below_1024_token_cap": false
+      },
+      {
+        "label": "JSON",
+        "completion_tokens": 1024,
+        "seconds_printed": 38.6,
+        "tokens_per_second_printed": 26.5,
+        "below_1024_token_cap": false
+      },
+      {
+        "label": "Python code",
+        "completion_tokens": 1024,
+        "seconds_printed": 40.0,
+        "tokens_per_second_printed": 25.6,
+        "below_1024_token_cap": false
+      }
+    ],
+    "rounded_stdout_values": true,
+    "caveat": "Request completion tokens/wall time includes prompt prefill; outputs are stochastic and may end before 1024 tokens. No raw completion text is saved by stock bench.py."
+  },
+  "quality": {
+    "nll": 0.8984456211165188,
+    "chunks": 12,
+    "scored_positions": 12276,
+    "corpus_sha256": "eb3abb55e9edaae45dbfe3dadc7f4574ffa6b80ff2b1af42d4d4e95ebfb2813b",
+    "per_chunk": [
+      {
+        "name": "rows0-chunk0",
+        "nll": 0.7661906154333147
+      },
+      {
+        "name": "rows0-chunk1",
+        "nll": 0.8258248751201771
+      },
+      {
+        "name": "rows0-chunk2",
+        "nll": 0.5108546126603698
+      },
+      {
+        "name": "rows0-chunk3",
+        "nll": 0.687147389530144
+      },
+      {
+        "name": "rows1000-chunk0",
+        "nll": 1.2192030159428822
+      },
+      {
+        "name": "rows1000-chunk1",
+        "nll": 1.0806180115205437
+      },
+      {
+        "name": "rows1000-chunk2",
+        "nll": 0.800189294776174
+      },
+      {
+        "name": "rows2000-chunk0",
+        "nll": 0.9288251817243829
+      },
+      {
+        "name": "rows3000-chunk0",
+        "nll": 1.0102543066988217
+      },
+      {
+        "name": "rows3000-chunk1",
+        "nll": 0.7680448364064075
+      },
+      {
+        "name": "rows3000-chunk2",
+        "nll": 1.1728637147121648
+      },
+      {
+        "name": "rows3000-chunk3",
+        "nll": 1.0113315988728437
+      }
+    ],
+    "caveat": "Fixed short WikiText excerpts; no independent checkpoint-reference scores for these excerpts and no broad-quality equivalence verdict."
+  },
+  "retrieval": {
+    "status": "PASS",
+    "checks": 3,
+    "actual_input_tokens": [
+      4002,
+      15912,
+      34971
+    ],
+    "scope": "Three sequential behavioral checks at approximately 4K/16K/35K; no timing or host-KV activation verdict"
+  },
+  "memory": {
+    "cache_trim_attribution": {
+      "memory_current_drop_bytes": 25803857920,
+      "ordinary_file_drop_bytes": 25792823296,
+      "anon_delta_bytes": -9228288,
+      "shmem_delta_bytes": 0
+    },
+    "client_event_deltas": {
+      "oom_kill": 0,
+      "oom_group_kill": 0,
+      "max": 0,
+      "high": 0,
+      "sock_throttled": 0,
+      "oom": 0,
+      "low": 0
+    },
+    "client_psi_fraction_of_wall": {
+      "some": 0.0,
+      "full": 0.0
+    },
+    "client_maximum_observed_swap_bytes": 0
+  },
+  "source": {
+    "selected_python_sha256": {
+      "python/sglang/kernels/ops/attention/flash_mla_sm120.py": "e579d8aba7c3746f67ca0a6039683c983075d90eb1d3935de4e3d9b5c65e6c7f",
+      "python/sglang/kernels/ops/attention/sm89_dual_scope.py": "ad723c6495a06af27caf0e024e77d0d24dbc3c1f693a6aeba1bc35dc93f4fd13",
+      "python/sglang/kernels/ops/gemm/fp8_kernel.py": "14189c5ded4673d5cd57673494fd215a1929da8fa91df56c977317003ed3e58b",
+      "python/sglang/kernels/ops/quantization/fp8_block_gemv.py": "50924c1012cf4c061dd1169fbce0b7a1dbfa52ad8febbea8764dadb503d3b7b6",
+      "python/sglang/srt/entrypoints/openai/encoding_dsv41.py": "0c25f4ddea4790fb4841c919cebae63c632f27c113526e8f4f961add6b88fa71",
+      "python/sglang/srt/entrypoints/openai/protocol.py": "4ccf66911eb6f8d213cab7cdee93000cb8ffbaf5b79c35ef2023ba55305e15af",
+      "python/sglang/srt/entrypoints/openai/serving_chat.py": "edc8187bd4f8482438076d7b5be8d3c2bbe0706533bb29b9ac69d727cef006ae",
+      "python/sglang/srt/environ.py": "cb50495147a6df26cfa8cde2ae57a7c3ff868dca36f8d0dd3c0f2152942268d2",
+      "python/sglang/srt/function_call/core_types.py": "99c0ca11a92b57ed6b9bb81e79162483c847611b303c820d14047075b466bbb2",
+      "python/sglang/srt/function_call/deepseekv41_detector.py": "366fd402bd8b9823578c10feb5dba72689596292b866220d552ba7af882d9dbd",
+      "python/sglang/srt/layers/attention/deepseek_v4_backend.py": "db334f7539f2ca49cdda4add0d9e291a98be875389ac133891e4a8cdab056034",
+      "python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py": "63825e3fcc860928f26d214d497f3badb5d866473644afef08e71d991f2d2a9f",
+      "python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py": "0b5885f29910848bc48af97d85481e7f360b2537ef0e8aba287665653472c157",
+      "python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py": "7e3b85dbc90ec1c1e7c1bd013b821d5b12ef3539dbdc7298bae84cb25cb721b2",
+      "python/sglang/srt/layers/engram.py": "f5a19c7a95adfad077f23079f08655a3205cc5dce2a2163e6f576e9aa29e7f3e",
+      "python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py": "d36fb601ea771d8d33c887157c01a30cd1a6d2a85a2a47604817bcb96defb5b7",
+      "python/sglang/srt/layers/moe/fused_moe_triton/layer.py": "fa48fc46691a6ff6f358bf68f38a343b8c772a47acf5a711c07c6c02639d2af2",
+      "python/sglang/srt/layers/moe/kt_ep_wrapper.py": "ebdc2b5878734adb3f49056433e5b1981036a5217a2745f7b04c529b5d83237c",
+      "python/sglang/srt/layers/moe/kt_kv_hot_lend.py": "ce618aec455fa921784de1d5959c2b031037f27d303c7062871f937611fa9d2f",
+      "python/sglang/srt/layers/moe/kt_kv_prefill_lend.py": "f054486700b09fc7cd7be9a111cc61ff5db74159423b1ffd73f6ed620bf29da8",
+      "python/sglang/srt/layers/moe/kt_kv_vmm.py": "56a582eb3c2f5e670229d4a6b76268a93ef1aab7fb80fff65d23436c0491de0c",
+      "python/sglang/srt/layers/moe/kt_launch_timing.py": "9bb2710119d3613757fc17cdc23a24b720cda65a5ff5e00fd0c3b1ec219c7c0b",
+      "python/sglang/srt/layers/moe/kt_lend.py": "29881d0acf037013b1f30f3f589845e2853888dbe0a2f328f38d367c276134bb",
+      "python/sglang/srt/layers/moe/kt_lend_probe.py": "fa13477d1b94b405e5267583287b9d4791c67830f1c8d6a4a28b93adbd68c7c1",
+      "python/sglang/srt/layers/moe/kt_pinned.py": "de389b73c7fb4ea71369fc0104017f68464b0710a647503d7cf9a5a72b76c29d",
+      "python/sglang/srt/layers/moe/kt_prefill_plan.py": "93555c7b13496e56f2dc610e252a2fc4428a8751dbcc93c16cb20a8d329e9bf8",
+      "python/sglang/srt/layers/moe/kt_stream_prefill.py": "f255f2193e5e5b0113b6a22fd0082aecd1f316326f8a5a01067f3d29a4cafe7c",
+      "python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py": "6bcce1c2a70f4ac627033b86f5d86d3affa8c4a221832378fadef7ec6437ee8e",
+      "python/sglang/srt/layers/moe/mxfp4_fp32_moe.py": "157447a6fbe674d70f12a34b3e8952e4d136d8a7b5d1e91c5c2d0a4777439590",
+      "python/sglang/srt/layers/quantization/fp8.py": "2e0bf14de7719f56d5334e1906ce6c8275e8837ece2c9b70fe79842c9c9a89da",
+      "python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py": "f37162715d230cfc4727022f6ff96fb1a15144047775ccb1fc9df86679d2903f",
+      "python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py": "4f5532c5541cc543e0f84943b6d3536249f1a06201a13744da766dd0ef25f001",
+      "python/sglang/srt/managers/schedule_batch.py": "5e5d7bc53cf9cafd7451263383d4bebc9f0b4af76803ddc2d200187e2406a13d",
+      "python/sglang/srt/managers/scheduler.py": "425d2bea64965435605c200e4a16b201705bb9d6967c382653339d396649460f",
+      "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py": "d0be410ca04dd0846e4869934af8eec2ce0860352cdc5fff3ee4d5a7f0b2ca93",
+      "python/sglang/srt/mem_cache/dsv41_host_kv.py": "4908e6371616dfb277042bafba945dfa9f2974c32ac3a3cc798e9dd9ea75ef2b",
+      "python/sglang/srt/mem_cache/kv_cache_configurator.py": "50a9de6469018368694eeb8f7c812f71419ea485abb16815cb400adab167af6a",
+      "python/sglang/srt/model_executor/model_runner.py": "c451168360000f0213078a49ab8d15ad5eb69e14772fa57ccfb93591379ead96",
+      "python/sglang/srt/model_executor/model_runner_components/load_model_utils.py": "98ff4babb33745b677d382eed150686ba54cfb17d775910e1817c1e75cefdb49",
+      "python/sglang/srt/model_executor/pool_configurator.py": "2d3878318884d6337c094fb4596c4d1821f5928e97a2e671c94112009dcefc97",
+      "python/sglang/srt/model_loader/loader.py": "21939b1d4d19dfedc8f2ad8446b00e38d440f845c813597d7a7d126f28bac7c7",
+      "python/sglang/srt/model_loader/weight_utils.py": "fb231b2def288cdce03f1dd12877c235fee760242f137855333ba2f8cf75f5cf",
+      "python/sglang/srt/models/deepseek_common/o_fp8_qdq.py": "8fcecfe39e01f76f3195329be82d2e56e6c4827de724d051b49d7c9a14766b43",
+      "python/sglang/srt/models/deepseek_common/wo_a_fp8_gemv.py": "6df7bb390a3ec60526fab564c00607ee7e842de693184e643de7b38e8f6905da",
+      "python/sglang/srt/models/deepseek_v2.py": "7636159338c2933a3e966b22c894cc4ddbbd72a3d71014f51526a328d0a662e5",
+      "python/sglang/srt/models/deepseek_v4.py": "1746c47e90142e019e1adcacf5725844841913815e9ddabf281e487debde2b4c",
+      "python/sglang/srt/models/deepseek_v4_dspark.py": "e346b1756f0cee3e8aa29c8fc6e7794155f955438cf5962d84be4f74d53ca070",
+      "python/sglang/srt/models/deepseek_v4_replay_tail.py": "29849cde77dec010d3b96c127d2780a8dd9edaf265855cca02d1b6e3065eb118",
+      "python/sglang/srt/utils/torch_memory_saver_adapter.py": "6368f699bc935df894da92c36c4d1ab5828bdc848e08c3b46e34bfb0a94e5886"
+    },
+    "pr_launcher_sha256": "e5b6a5caa587c7c09c0c1901d5a117c027041ba6045dc33d160ad4eb76561488",
+    "strict_native_wheel_sha256": "436156b6cf447b38903b89fa9cc8329a0e92872fcb757dc58f2896389b1bfe30",
+    "post_run_verification_sha256": "2c3f5f68dfd0c8624d60dbfeecc0d6417b249baa1a09be4ef2e9938f3bbb79e1"
+  },
+  "reference_reused": true,
+  "reference_reuse_note": "Authenticated independent checkpoint reference, after fresh storage/source preflight; served scores are fresh.",
+  "review_sha256": "d904acdb84e304f7c6a07795e858d55da92c2dab33aac25ce1b394cb08666f41",
+  "preserved_full_archive_sha256": "4d1cf302c76ad2cb7bb5cd1a61e4793fb174854c1bcfe111e109635cc1997507",
+  "public_raw_files": {
+    "reference.json": {
+      "sha256": "d21c571d45ecf23f137973652c16baadad4d6a86e2ec8017da7178a54035cc79",
+      "bytes": 256381
+    },
+    "input-ids.json": {
+      "sha256": "1c7aafd5eeafb664c3a6729e96ad76ee008da98257561719d8bd9288c51820ca",
+      "bytes": 114906
+    },
+    "served.json": {
+      "sha256": "b4129078016a5b58a243b8816bfb203f2b033be0c8d3874de0d4fe69213bf10c",
+      "bytes": 255896
+    },
+    "nll-compare.txt": {
+      "sha256": "25b005ad14e8ec1259727d1b7fbe4cd8c2b3ddb8ed26b6b6fcb6ce5117a15a20",
+      "bytes": 275
+    },
+    "bench.txt": {
+      "sha256": "f439e3b03b1fc2a166a9150136666324fd8e14f7812988dec4f5891808447293",
+      "bytes": 322
+    },
+    "bench-other-text.txt": {
+      "sha256": "5e55e38a4ab95800ed3ec436aa76380ffabed3a65b3d2b5a470c605fae894cec",
+      "bytes": 338
+    },
+    "tool-call-check.txt": {
+      "sha256": "cc9c846a9a59bfad841b6d490f4aa0b9c644cecc2c0213ce222bf35d4588e8e0",
+      "bytes": 453
+    }
+  },
+  "limitations": [
+    "This accepts the pinned 00fd12a recipe / SGLang 9c0f6d6 runtime and declared hardware/storage adapters, not newer upstream revisions or arbitrary devices/profiles.",
+    "Reference scores were reused from the authenticated immutable checkpoint run after fresh storage/source preflight; served scores are fresh. The very short CPU-only reference-copy scope exited before its first memory poll; telemetry there is unknown, not zero. Its 64 GiB scope, disabled GPU visibility, successful provenance receipt and cleanup are recorded. Measured model scopes have complete sampled/client-boundary evidence.",
+    "The 24 reference pieces are 480 input tokens each and do not exercise competitive index selection beyond top-k 512. Per-token scores differ; released-checkpoint V4.1 KV arithmetic identity and portable-reference identity are not claimed.",
+    "Sequential retrieval passed at 4,002, 15,912 and 34,971 actual input tokens. A configured 1M pool is not a 1M retrieval test, and default host-KV enablement does not establish host-page activation on a 32 GiB card.",
+    "One ordered A/B campaign provides observed workload comparisons, not a stable performance distribution. Default decode rates include short prefill, both 35K rows are retained, and stochastic other-text outputs reached the 1024-token cap.",
+    "The profile uses an exclusive experimental 32 GiB RTX 4080 SUPER, dual EPYC 7543,8 NUMA nodes / 56 expert workers, strict native binding, KHO/CMA off, shmem THP advise,440 GiB cap and zero allowed scope swap. Scoped ordinary file cache was trimmed to<=416 GiB before clients; first-use timings are not empty-JIT-cache or untrimmed-default cold-start measurements.",
+    "The fixed WikiText fixture, tool calls and short retrieval cases are narrow checks. Concurrency, optional prefix policies and other optimisation variants are outside A/B."
+  ]
+}

@@ -1,0 +1,179 @@
+{
+  "quality": {
+    "positions": 12276,
+    "chunks": [
+      {
+        "name": "rows0-chunk0",
+        "positions": 1023,
+        "nll_before": 0.7878566096626022,
+        "nll_after": 0.7712277647524921,
+        "nll_delta": -0.016628844910110102,
+        "mean_abs_delta": 0.13131839776651272,
+        "max_abs_delta": 9.254349827766418
+      },
+      {
+        "name": "rows0-chunk1",
+        "positions": 1023,
+        "nll_before": 0.8277880655089911,
+        "nll_after": 0.8192099307416377,
+        "nll_delta": -0.008578134767353458,
+        "mean_abs_delta": 0.09841240512724855,
+        "max_abs_delta": 5.032815933227539
+      },
+      {
+        "name": "rows0-chunk2",
+        "positions": 1023,
+        "nll_before": 0.4979336722794086,
+        "nll_after": 0.5127363735168022,
+        "nll_delta": 0.0148027012373936,
+        "mean_abs_delta": 0.08003648798664907,
+        "max_abs_delta": 4.107410907745361
+      },
+      {
+        "name": "rows0-chunk3",
+        "positions": 1023,
+        "nll_before": 0.6621271445368855,
+        "nll_after": 0.6835787971641633,
+        "nll_delta": 0.021451652627277752,
+        "mean_abs_delta": 0.12872776578376052,
+        "max_abs_delta": 3.696302652359009
+      },
+      {
+        "name": "rows1000-chunk0",
+        "positions": 1023,
+        "nll_before": 1.2117528821515071,
+        "nll_after": 1.2166343636602626,
+        "nll_delta": 0.0048814815087554215,
+        "mean_abs_delta": 0.13360701771956013,
+        "max_abs_delta": 7.629030227661133
+      },
+      {
+        "name": "rows1000-chunk1",
+        "positions": 1023,
+        "nll_before": 1.0895848060128452,
+        "nll_after": 1.0800840702350107,
+        "nll_delta": -0.009500735777834605,
+        "mean_abs_delta": 0.10853046030448617,
+        "max_abs_delta": 4.7426371574401855
+      },
+      {
+        "name": "rows1000-chunk2",
+        "positions": 1023,
+        "nll_before": 0.8103866487831538,
+        "nll_after": 0.7935365119018752,
+        "nll_delta": -0.016850136881278472,
+        "mean_abs_delta": 0.11694848293902307,
+        "max_abs_delta": 3.092824935913086
+      },
+      {
+        "name": "rows2000-chunk0",
+        "positions": 1023,
+        "nll_before": 0.9199162554613068,
+        "nll_after": 0.9303124150274121,
+        "nll_delta": 0.010396159566105324,
+        "mean_abs_delta": 0.13060314482213733,
+        "max_abs_delta": 3.8534107208251953
+      },
+      {
+        "name": "rows3000-chunk0",
+        "positions": 1023,
+        "nll_before": 0.9976279021376138,
+        "nll_after": 1.0052604668032303,
+        "nll_delta": 0.007632564665616525,
+        "mean_abs_delta": 0.13111478932951307,
+        "max_abs_delta": 2.8740673065185547
+      },
+      {
+        "name": "rows3000-chunk1",
+        "positions": 1023,
+        "nll_before": 0.7705364107911925,
+        "nll_after": 0.7783731702576165,
+        "nll_delta": 0.007836759466423976,
+        "mean_abs_delta": 0.1302985692037424,
+        "max_abs_delta": 5.202749252319336
+      },
+      {
+        "name": "rows3000-chunk2",
+        "positions": 1023,
+        "nll_before": 1.1488928960023168,
+        "nll_after": 1.1683373846972698,
+        "nll_delta": 0.019444488694952827,
+        "mean_abs_delta": 0.130513755334185,
+        "max_abs_delta": 2.5745763778686523
+      },
+      {
+        "name": "rows3000-chunk3",
+        "positions": 1023,
+        "nll_before": 1.0095327504053262,
+        "nll_after": 1.0102122997254002,
+        "nll_delta": 0.0006795493200740576,
+        "mean_abs_delta": 0.129274559296285,
+        "max_abs_delta": 2.090745687484741
+      }
+    ],
+    "nll_before": 0.8944946703110959,
+    "nll_after": 0.8974586290402644,
+    "nll_delta": 0.0029639587291685476,
+    "perplexity_before": 2.4460993904500525,
+    "perplexity_after": 2.4533602832685073,
+    "perplexity_change_percent": 0.2968355597815214,
+    "max_nll_increase": 0.02,
+    "screen_pass": true,
+    "note": "Fixed short-context test excerpts, not full WikiText-2 or broad task-quality equivalence.",
+    "provenance": {
+      "portable_campaign": "glue-model-r1/portable-quality",
+      "dual_campaign": "glue-dual-r1/dual-quality",
+      "common_addon": "KT_GPU_GLUE=1 in both quality arms; the full76/performance table was measured separately without this bundle.",
+      "cross_check": "Both short logprob probes were bit-identical with/without glue in each attention mode; this does not establish general identity.",
+      "source": "https://huggingface.co/datasets/Salesforce/wikitext",
+      "original_manifest_sha256": "f5df0a7bacb11e8d7301a8159b5b389eaa437ba73c3a08779ceb232e23b55ed2",
+      "canonical_text_sha256": "eb3abb55e9edaae45dbfe3dadc7f4574ffa6b80ff2b1af42d4d4e95ebfb2813b",
+      "protocol": "Four fixed100-row WikiText-2 test slices at offsets0,1000,2000,3000; up to four complete1024-token chunks each; first unscored boundary excluded, no chat template."
+    }
+  },
+  "real_attention": {
+    "calls": 80,
+    "selected_rows": "first/middle/last of each captured call, rerun as a small batch with split0 and split8",
+    "reference": "Independent FP64 decode of padded V4 pages and combined softmax with sink",
+    "error_budget": "At each element, abs(kernel-reference) <= abs(nearest_BF16(reference)-reference) + .02 * per-head row RMS(reference); dual mean absolute error <=3x portable.",
+    "guard_correction": "The original absolute .02-rowRMS guard was mathematically unattainable for nearest BF16 in31/40 portable-source captures. The failed original reports were retained; the corrected guard adds only the mandatory elementwise rounding floor, retaining the .02 arithmetic budget.",
+    "results": {
+      "portable": {
+        "status": "PASS",
+        "n_calls": 40,
+        "summary": {
+          "portable": {
+            "worst_excess_over_nearest_bf16_over_rowrms": 0.08597085589086005,
+            "mean_mean_abs": 0.0002663519246037069
+          },
+          "dual_s0": {
+            "worst_excess_over_nearest_bf16_over_rowrms": 0.017346302854462904,
+            "mean_mean_abs": 0.00020774829855079555
+          },
+          "dual_s8": {
+            "worst_excess_over_nearest_bf16_over_rowrms": 0.017346302854462904,
+            "mean_mean_abs": 0.00020679385788053097
+          }
+        }
+      },
+      "dual": {
+        "status": "PASS",
+        "n_calls": 40,
+        "summary": {
+          "portable": {
+            "worst_excess_over_nearest_bf16_over_rowrms": 0.08597085589086005,
+            "mean_mean_abs": 0.0002897160743570499
+          },
+          "dual_s0": {
+            "worst_excess_over_nearest_bf16_over_rowrms": 0.019202412710562312,
+            "mean_mean_abs": 0.0002133610535384467
+          },
+          "dual_s8": {
+            "worst_excess_over_nearest_bf16_over_rowrms": 0.019202412710562312,
+            "mean_mean_abs": 0.00021190719266238385
+          }
+        }
+      }
+    }
+  }
+}

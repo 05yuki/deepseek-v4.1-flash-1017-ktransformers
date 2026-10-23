@@ -1,0 +1,396 @@
+{
+  "recipe_base": "8719948e2c9fdd4945724cf9e654bc649c310ffe",
+  "sglang": "9c0f6d6a610531bd16ad3513572e55226450b244",
+  "kt_kernel": "95009ea6856c0799e517e93cb12be5e8494bc7ce",
+  "metric": "aggregate completion tokens / client cohort wall seconds",
+  "protocol": "One excluded warmup, five measured rounds, 128 output tokens; full functional suite before timing. These are separate validation launches, not an attention ABBA performance experiment.",
+  "configuration": {
+    "attention_controls": "portable separate scope vs dual scope",
+    "gpu": "RTX4080 SUPER experimental32GiB",
+    "cpu": "dualEPYC7543",
+    "expert_workers": 42,
+    "numa_nodes": [
+      0,
+      1,
+      2,
+      4,
+      5,
+      6
+    ],
+    "service_cpus": [
+      39,
+      47,
+      55
+    ],
+    "glue_enabled_in_all_runs": true,
+    "context_and_token_pool": 65536,
+    "prefill_chunk": 2048,
+    "fixed_gpu_experts_per_layer": 1,
+    "graphs": true,
+    "radix_cache": true,
+    "speculation": false,
+    "host_kv": false
+  },
+  "arms": {
+    "portable_first_attempt": {
+      "campaign": "latest-full-r2",
+      "attention": "portable",
+      "status": "FAIL",
+      "checks": 76,
+      "failed_checks": [
+        {
+          "label": "N2-tool-call-1",
+          "error": "RequestError: N2-tool-call-1: TimeoutError: timed out (exchange 0036-N2-tool-call-1.json)"
+        },
+        {
+          "label": "N2-tool-call-0",
+          "error": "RequestError: N2-tool-call-0: TimeoutError: timed out (exchange 0037-N2-tool-call-0.json)"
+        }
+      ],
+      "throughput": {
+        "1": {
+          "trials": [
+            21.492135405760003,
+            22.01643543729147,
+            21.89043217340072,
+            22.006029559192314,
+            21.82113679060013
+          ],
+          "median": 21.89043217340072,
+          "minimum": 21.492135405760003,
+          "maximum": 22.01643543729147,
+          "warmup_tokens_s": [
+            20.30822914609622
+          ]
+        },
+        "2": {
+          "trials": [
+            24.98453971841551,
+            25.61189360038564,
+            25.739069187427912,
+            25.944434156590766,
+            25.8337567735613
+          ],
+          "median": 25.739069187427912,
+          "minimum": 24.98453971841551,
+          "maximum": 25.944434156590766,
+          "warmup_tokens_s": [
+            23.806546365600248
+          ]
+        },
+        "4": {
+          "trials": [
+            27.943859771572168,
+            27.006169766089364,
+            31.649982454953726,
+            28.4880242877684,
+            31.567545877949293
+          ],
+          "median": 28.4880242877684,
+          "minimum": 27.006169766089364,
+          "maximum": 31.649982454953726,
+          "warmup_tokens_s": [
+            29.230712887180786
+          ]
+        }
+      },
+      "retrieval": [
+        {
+          "label": "retrieval-4k",
+          "passed": true,
+          "prompt_tokens": 4002,
+          "output_tokens": 13,
+          "wall_s": 23.84727027732879
+        },
+        {
+          "label": "retrieval-16k",
+          "passed": true,
+          "prompt_tokens": 15912,
+          "output_tokens": 13,
+          "wall_s": 75.64332257723436
+        },
+        {
+          "label": "retrieval-35k",
+          "passed": true,
+          "prompt_tokens": 34971,
+          "output_tokens": 13,
+          "wall_s": 144.54810212133452
+        }
+      ]
+    },
+    "portable_accepted": {
+      "campaign": "latest-portable-r3",
+      "attention": "portable",
+      "status": "PASS",
+      "checks": 76,
+      "failed_checks": [],
+      "throughput": {
+        "1": {
+          "trials": [
+            15.98886284951238,
+            18.210518478029645,
+            18.959058065368005,
+            18.829597096607024,
+            19.14991503028898
+          ],
+          "median": 18.829597096607024,
+          "minimum": 15.98886284951238,
+          "maximum": 19.14991503028898,
+          "warmup_tokens_s": [
+            16.797129716980717
+          ]
+        },
+        "2": {
+          "trials": [
+            19.527983004121378,
+            20.81307597015091,
+            21.431348368798766,
+            19.499811513534247,
+            18.78825930240946
+          ],
+          "median": 19.527983004121378,
+          "minimum": 18.78825930240946,
+          "maximum": 21.431348368798766,
+          "warmup_tokens_s": [
+            19.74017586092988
+          ]
+        },
+        "4": {
+          "trials": [
+            23.293508330253477,
+            23.380305226157514,
+            23.051750944939744,
+            21.55464009785662,
+            23.380666738299496
+          ],
+          "median": 23.293508330253477,
+          "minimum": 21.55464009785662,
+          "maximum": 23.380666738299496,
+          "warmup_tokens_s": [
+            20.722955795471535
+          ]
+        }
+      },
+      "retrieval": [
+        {
+          "label": "retrieval-4k",
+          "passed": true,
+          "prompt_tokens": 4002,
+          "output_tokens": 13,
+          "wall_s": 24.497027556877583
+        },
+        {
+          "label": "retrieval-16k",
+          "passed": true,
+          "prompt_tokens": 15912,
+          "output_tokens": 13,
+          "wall_s": 76.00344504555687
+        },
+        {
+          "label": "retrieval-35k",
+          "passed": true,
+          "prompt_tokens": 34971,
+          "output_tokens": 13,
+          "wall_s": 146.96645953087136
+        }
+      ]
+    },
+    "dual_accepted": {
+      "campaign": "latest-full-r2",
+      "attention": "dual",
+      "status": "PASS",
+      "checks": 76,
+      "failed_checks": [],
+      "throughput": {
+        "1": {
+          "trials": [
+            20.455304494228198,
+            20.387339636101515,
+            20.600732050624025,
+            20.83849925750773,
+            20.257683502242998
+          ],
+          "median": 20.455304494228198,
+          "minimum": 20.257683502242998,
+          "maximum": 20.83849925750773,
+          "warmup_tokens_s": [
+            17.543277191895967
+          ]
+        },
+        "2": {
+          "trials": [
+            22.266056365841955,
+            22.59902512521495,
+            20.85994404776972,
+            21.489900059653145,
+            20.869328907544617
+          ],
+          "median": 21.489900059653145,
+          "minimum": 20.85994404776972,
+          "maximum": 22.59902512521495,
+          "warmup_tokens_s": [
+            21.04324029718993
+          ]
+        },
+        "4": {
+          "trials": [
+            24.502300874102893,
+            22.384333368127972,
+            21.404518150868668,
+            25.513323873470963,
+            26.391766593319023
+          ],
+          "median": 24.502300874102893,
+          "minimum": 21.404518150868668,
+          "maximum": 26.391766593319023,
+          "warmup_tokens_s": [
+            22.46443612036238
+          ]
+        }
+      },
+      "retrieval": [
+        {
+          "label": "retrieval-4k",
+          "passed": true,
+          "prompt_tokens": 4002,
+          "output_tokens": 13,
+          "wall_s": 19.33135744696483
+        },
+        {
+          "label": "retrieval-16k",
+          "passed": true,
+          "prompt_tokens": 15912,
+          "output_tokens": 13,
+          "wall_s": 59.63459526794031
+        },
+        {
+          "label": "retrieval-35k",
+          "passed": true,
+          "prompt_tokens": 34971,
+          "output_tokens": 13,
+          "wall_s": 114.70974203711376
+        }
+      ]
+    }
+  },
+  "acceptance": {
+    "status": "PASS",
+    "note": "Per-arm acceptance from explicitly named same-source campaigns; original cold-compilation timeout remains preserved in latest-full-r2",
+    "arms": {
+      "portable": {
+        "checks": 76,
+        "probes_bit_identical": true,
+        "placement_before_after": "PASS",
+        "baseline": "/scratch/aster/bench/05yuki-sm89-pr3-b559e21/evidence/glue-model-r1/portable",
+        "campaign": "/scratch/aster/bench/05yuki-latest-8719948-glue/evidence/latest-portable-r3"
+      },
+      "dual": {
+        "checks": 76,
+        "probes_bit_identical": true,
+        "placement_before_after": "PASS",
+        "baseline": "/scratch/aster/bench/05yuki-sm89-pr3-b559e21/evidence/glue-dual-r1/dual",
+        "campaign": "/scratch/aster/bench/05yuki-latest-8719948-glue/evidence/latest-full-r2"
+      }
+    },
+    "serve_sha256": "4c349d13fcf01dfea64da3132895788d51939b5254ccaf98222b6512e0a28b87",
+    "placement_sources": {
+      "third_party/sglang/python/sglang/srt/managers/scheduler.py": "cc76042dc22df27b63492579a97cab9a28cc01f2252fa7106ad4664031bd3c61",
+      "third_party/sglang/python/sglang/srt/utils/kt_service_affinity.py": "70d7d0777d619625ca4d548aa1d0fe06e3ad67a4a601750e4f4c5ebfb18efbbd"
+    },
+    "restored": true
+  },
+  "source_identity": {
+    "serve_sha256": "4c349d13fcf01dfea64da3132895788d51939b5254ccaf98222b6512e0a28b87",
+    "patched_python": {
+      "python/sglang/kernels/ops/attention/dsv4/live_topk.py": "4726591bcbd75ac2db5fbcdb0d431cc5a1787c4846d5ba280ee29df0b530cee8",
+      "python/sglang/kernels/ops/attention/flash_mla_sm120.py": "e579d8aba7c3746f67ca0a6039683c983075d90eb1d3935de4e3d9b5c65e6c7f",
+      "python/sglang/kernels/ops/attention/flash_mla_sm120_triton.py": "5240f4e80a02a64de3a5de757b3c44bb74c19a5ee7febeb7eaa86febc5d401c3",
+      "python/sglang/kernels/ops/attention/sm89_dual_scope.py": "ad723c6495a06af27caf0e024e77d0d24dbc3c1f693a6aeba1bc35dc93f4fd13",
+      "python/sglang/kernels/ops/gemm/fp8_kernel.py": "14189c5ded4673d5cd57673494fd215a1929da8fa91df56c977317003ed3e58b",
+      "python/sglang/kernels/ops/quantization/fp8_block_gemv.py": "50924c1012cf4c061dd1169fbce0b7a1dbfa52ad8febbea8764dadb503d3b7b6",
+      "python/sglang/srt/entrypoints/openai/encoding_dsv41.py": "0c25f4ddea4790fb4841c919cebae63c632f27c113526e8f4f961add6b88fa71",
+      "python/sglang/srt/entrypoints/openai/protocol.py": "4ccf66911eb6f8d213cab7cdee93000cb8ffbaf5b79c35ef2023ba55305e15af",
+      "python/sglang/srt/entrypoints/openai/serving_chat.py": "edc8187bd4f8482438076d7b5be8d3c2bbe0706533bb29b9ac69d727cef006ae",
+      "python/sglang/srt/environ.py": "cb50495147a6df26cfa8cde2ae57a7c3ff868dca36f8d0dd3c0f2152942268d2",
+      "python/sglang/srt/function_call/core_types.py": "99c0ca11a92b57ed6b9bb81e79162483c847611b303c820d14047075b466bbb2",
+      "python/sglang/srt/function_call/deepseekv41_detector.py": "366fd402bd8b9823578c10feb5dba72689596292b866220d552ba7af882d9dbd",
+      "python/sglang/srt/layers/attention/deepseek_v4_backend.py": "db334f7539f2ca49cdda4add0d9e291a98be875389ac133891e4a8cdab056034",
+      "python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py": "63825e3fcc860928f26d214d497f3badb5d866473644afef08e71d991f2d2a9f",
+      "python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py": "0b5885f29910848bc48af97d85481e7f360b2537ef0e8aba287665653472c157",
+      "python/sglang/srt/layers/attention/dsv4/v41_indexer/dense_blocks.py": "d6b449f61a29b75736f9081af5c98689426a4ed19cc5e62957886c562d7800d0",
+      "python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py": "4babd41507d58e27e746d0936c9bb63696c83a79a7edd1d9a23f6c6bec9dccd4",
+      "python/sglang/srt/layers/engram.py": "f5a19c7a95adfad077f23079f08655a3205cc5dce2a2163e6f576e9aa29e7f3e",
+      "python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py": "d36fb601ea771d8d33c887157c01a30cd1a6d2a85a2a47604817bcb96defb5b7",
+      "python/sglang/srt/layers/moe/fused_moe_triton/layer.py": "fa48fc46691a6ff6f358bf68f38a343b8c772a47acf5a711c07c6c02639d2af2",
+      "python/sglang/srt/layers/moe/kt_ep_wrapper.py": "ca4cbb2bfa1b97ee12a83043728a27d032970d75a761df0eb057156dd2146a50",
+      "python/sglang/srt/layers/moe/kt_handoff_pack.py": "3950c81352d0fc8287b025d27be017b90dfc5290310efc2eb530fd4568d283dc",
+      "python/sglang/srt/layers/moe/kt_kv_hot_lend.py": "ce618aec455fa921784de1d5959c2b031037f27d303c7062871f937611fa9d2f",
+      "python/sglang/srt/layers/moe/kt_kv_prefill_lend.py": "f054486700b09fc7cd7be9a111cc61ff5db74159423b1ffd73f6ed620bf29da8",
+      "python/sglang/srt/layers/moe/kt_kv_vmm.py": "56a582eb3c2f5e670229d4a6b76268a93ef1aab7fb80fff65d23436c0491de0c",
+      "python/sglang/srt/layers/moe/kt_launch_timing.py": "9bb2710119d3613757fc17cdc23a24b720cda65a5ff5e00fd0c3b1ec219c7c0b",
+      "python/sglang/srt/layers/moe/kt_lend.py": "29881d0acf037013b1f30f3f589845e2853888dbe0a2f328f38d367c276134bb",
+      "python/sglang/srt/layers/moe/kt_lend_probe.py": "fa13477d1b94b405e5267583287b9d4791c67830f1c8d6a4a28b93adbd68c7c1",
+      "python/sglang/srt/layers/moe/kt_pinned.py": "de389b73c7fb4ea71369fc0104017f68464b0710a647503d7cf9a5a72b76c29d",
+      "python/sglang/srt/layers/moe/kt_prefill_plan.py": "93555c7b13496e56f2dc610e252a2fc4428a8751dbcc93c16cb20a8d329e9bf8",
+      "python/sglang/srt/layers/moe/kt_stream_prefill.py": "f255f2193e5e5b0113b6a22fd0082aecd1f316326f8a5a01067f3d29a4cafe7c",
+      "python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py": "6bcce1c2a70f4ac627033b86f5d86d3affa8c4a221832378fadef7ec6437ee8e",
+      "python/sglang/srt/layers/moe/mxfp4_fp32_moe.py": "157447a6fbe674d70f12a34b3e8952e4d136d8a7b5d1e91c5c2d0a4777439590",
+      "python/sglang/srt/layers/quantization/fp8.py": "2e0bf14de7719f56d5334e1906ce6c8275e8837ece2c9b70fe79842c9c9a89da",
+      "python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py": "f37162715d230cfc4727022f6ff96fb1a15144047775ccb1fc9df86679d2903f",
+      "python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py": "4f5532c5541cc543e0f84943b6d3536249f1a06201a13744da766dd0ef25f001",
+      "python/sglang/srt/managers/schedule_batch.py": "5e5d7bc53cf9cafd7451263383d4bebc9f0b4af76803ddc2d200187e2406a13d",
+      "python/sglang/srt/managers/scheduler.py": "cc76042dc22df27b63492579a97cab9a28cc01f2252fa7106ad4664031bd3c61",
+      "python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py": "d9706bba3220e0df70d9bc7c48d4e10fdfb6bbc050ca3f467da11566048910b2",
+      "python/sglang/srt/mem_cache/dsv41_host_kv.py": "55ed2559646f81d58d09c76d2bc014f8c4849afbeac113427f71398a052809ed",
+      "python/sglang/srt/mem_cache/kv_cache_configurator.py": "50a9de6469018368694eeb8f7c812f71419ea485abb16815cb400adab167af6a",
+      "python/sglang/srt/model_executor/model_runner.py": "c451168360000f0213078a49ab8d15ad5eb69e14772fa57ccfb93591379ead96",
+      "python/sglang/srt/model_executor/model_runner_components/load_model_utils.py": "98ff4babb33745b677d382eed150686ba54cfb17d775910e1817c1e75cefdb49",
+      "python/sglang/srt/model_executor/pool_configurator.py": "2d3878318884d6337c094fb4596c4d1821f5928e97a2e671c94112009dcefc97",
+      "python/sglang/srt/model_loader/loader.py": "21939b1d4d19dfedc8f2ad8446b00e38d440f845c813597d7a7d126f28bac7c7",
+      "python/sglang/srt/model_loader/weight_utils.py": "fb231b2def288cdce03f1dd12877c235fee760242f137855333ba2f8cf75f5cf",
+      "python/sglang/srt/models/deepseek_common/o_fp8_qdq.py": "8fcecfe39e01f76f3195329be82d2e56e6c4827de724d051b49d7c9a14766b43",
+      "python/sglang/srt/models/deepseek_common/wo_a_fp8_gemv.py": "6df7bb390a3ec60526fab564c00607ee7e842de693184e643de7b38e8f6905da",
+      "python/sglang/srt/models/deepseek_v2.py": "a6520ab579b5cc780baa3b20e63ea1dc325249b048d3b2462e55328f4f9dbf26",
+      "python/sglang/srt/models/deepseek_v4.py": "1746c47e90142e019e1adcacf5725844841913815e9ddabf281e487debde2b4c",
+      "python/sglang/srt/models/deepseek_v4_dspark.py": "e346b1756f0cee3e8aa29c8fc6e7794155f955438cf5962d84be4f74d53ca070",
+      "python/sglang/srt/models/deepseek_v4_replay_tail.py": "29849cde77dec010d3b96c127d2780a8dd9edaf265855cca02d1b6e3065eb118",
+      "python/sglang/srt/utils/kt_service_affinity.py": "70d7d0777d619625ca4d548aa1d0fe06e3ad67a4a601750e4f4c5ebfb18efbbd",
+      "python/sglang/srt/utils/torch_memory_saver_adapter.py": "6368f699bc935df894da92c36c4d1ab5828bdc848e08c3b46e34bfb0a94e5886"
+    },
+    "native": {
+      "status": "PASS",
+      "base": "95009ea6856c0799e517e93cb12be5e8494bc7ce",
+      "native_public_patch_sha256": "d58f60edde561ada68158e6103500584325ed2096c3ca8bbc7445e623092d28f",
+      "source_identity": {
+        "kt-kernel/cpu_backend/worker_pool.cpp": {
+          "public_patch": "8675cd3f0c163c3c6c4d04526a7cc624aa49809989839ec53028339e01551060",
+          "old_runtime": "8675cd3f0c163c3c6c4d04526a7cc624aa49809989839ec53028339e01551060",
+          "new_runtime": "8675cd3f0c163c3c6c4d04526a7cc624aa49809989839ec53028339e01551060",
+          "wheel_build": "8675cd3f0c163c3c6c4d04526a7cc624aa49809989839ec53028339e01551060"
+        },
+        "kt-kernel/cpu_backend/cpuinfer.h": {
+          "public_patch": "d9faa3a8e20aaefffbd6f29abdf60250721c270bf38d90e831265fc3bc46eac8",
+          "old_runtime": "d9faa3a8e20aaefffbd6f29abdf60250721c270bf38d90e831265fc3bc46eac8",
+          "new_runtime": "d9faa3a8e20aaefffbd6f29abdf60250721c270bf38d90e831265fc3bc46eac8",
+          "wheel_build": "d9faa3a8e20aaefffbd6f29abdf60250721c270bf38d90e831265fc3bc46eac8"
+        },
+        "kt-kernel/python/experts_base.py": {
+          "public_patch": "3366dab25b36f116703010a7e83a00dc54d90cd71c54dd13a8a1a0f6657e9eea",
+          "old_runtime": "3366dab25b36f116703010a7e83a00dc54d90cd71c54dd13a8a1a0f6657e9eea",
+          "new_runtime": "3366dab25b36f116703010a7e83a00dc54d90cd71c54dd13a8a1a0f6657e9eea",
+          "wheel_build": "3366dab25b36f116703010a7e83a00dc54d90cd71c54dd13a8a1a0f6657e9eea"
+        }
+      },
+      "macro_mentions": [],
+      "wheel_sha256": "44b58099fd4df210c76901030fc85d5e7bf032b0a419d317199d280f08954080",
+      "note": "Packaging the already-built physical-NUMA correction; all three changed source files byte-identical to both runtime trees and original wheel build. No native executable changed."
+    }
+  },
+  "gpu_fixture": {
+    "checks": 399,
+    "status": "PASS",
+    "campaign": "latest-full-r1",
+    "log_sha256": "9199aef2e10353496dbe71c01f12ad941844fc978e8ad7ffcecd8651c58de6c3"
+  },
+  "limitations": "The first portable attempt had two N2 tool-call request timeouts during first-use CUDA compilation. Its later timing observations are retained, not silently discarded. A complete warmed portable rerun passed76/76. The dual median lies between the two portable launch medians at every concurrency, so these measurements do not establish a consistent whole-model throughput improvement."
+}

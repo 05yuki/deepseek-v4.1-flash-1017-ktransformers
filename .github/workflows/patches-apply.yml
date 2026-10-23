@@ -41,6 +41,12 @@ jobs:
             git apply --whitespace=nowarn "$f"
           done
 
+      - name: SM89 dispatch contracts (CPU only)
+        run: python3 tools/test_sm89_dispatch.py sglang
+
+      - name: model-client logprob alignment (CPU only)
+        run: python3 tools/sm89_validation/test_logprob_alignment.py
+
       - name: ktransformers and its llama.cpp
         run: |
           git init -q kt && cd kt
@@ -57,3 +63,4 @@ jobs:
         run: |
           for f in setup.sh serve.sh lib/*.sh tools/*.sh; do bash -n "$f"; done
           python3 -m py_compile tools/*.py lib/*.py engram-adapter/*.py patches/*.py
+          python3 -m py_compile tools/sm89_validation/*.py
