@@ -1,0 +1,6 @@
+decode, Chinese prose: 1024 tokens in 31.8 s = 32.2 tok/s
+decode, English prose: 1024 tokens in 31.6 s = 32.4 tok/s
+decode, English technical prose: 1024 tokens in 33.4 s = 30.6 tok/s
+decode, math: 1024 tokens in 31.5 s = 32.5 tok/s
+decode, JSON: 1024 tokens in 31.7 s = 32.3 tok/s
+decode, Python code: 1024 tokens in 33.0 s = 31.0 tok/s
