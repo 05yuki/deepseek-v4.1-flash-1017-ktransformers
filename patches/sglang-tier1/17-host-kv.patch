@@ -1,4 +1,4 @@
-From a7ab9d319c6eaecf24c49e8499931efe728aebed Mon Sep 17 00:00:00 2001
+From d3eb175a11fcf0a90055934a31da6147c29c8f09 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 23 Oct 2026 12:16:53 +0900
 Subject: [PATCH] [tier 1] host-kv: DeepSeek-V4.1's KV pool covers the whole
@@ -68,10 +68,10 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  create mode 100644 python/sglang/srt/mem_cache/dsv41_host_kv.py
 
 diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-index e7602f5b28..cb41b56685 100644
+index 6fbaa06e29..eeee4cf64b 100644
 --- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 +++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-@@ -1218,6 +1218,10 @@ class DeepseekV4AttnBackend(
+@@ -1253,6 +1253,10 @@ class DeepseekV4AttnBackend(
          assert self.token_to_kv_pool.swa_page_size % SWA_WINDOW == 0
          self.hisparse_coordinator = model_runner.hisparse_coordinator
          self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -82,7 +82,7 @@ index e7602f5b28..cb41b56685 100644
          # Nothing is built for a compress ratio outside the pool's set.
          self.present_ratios: Tuple[int, ...] = self.token_to_kv_pool.present_ratios
          self.low_ratios: Tuple[int, ...] = tuple(
-@@ -3262,6 +3266,31 @@ class DeepseekV4AttnBackend(
+@@ -3432,6 +3436,31 @@ class DeepseekV4AttnBackend(
              self._low_ratio_compress(layer, x, req, pos, forward_batch)
          if run_indexer and layer.indexer is not None:
              self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
@@ -114,7 +114,7 @@ index e7602f5b28..cb41b56685 100644
  
      def _forward_low_ratio_sources_cp(
          self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
-@@ -3947,6 +3976,27 @@ class DeepseekV4AttnBackend(
+@@ -4103,6 +4132,27 @@ class DeepseekV4AttnBackend(
                  extra_topk_lengths = core_attn_metadata.sparse_topk_lengths(
                      compress_ratio
                  )
@@ -282,7 +282,7 @@ index cf20823569..4b62f98233 100644
      return int(_load().kv_vmm_chunk_bytes(device))
  
 diff --git a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
-index 522a38cace..2a37a76677 100644
+index f7a5d41dcc..28f1d27eee 100644
 --- a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
 +++ b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
 @@ -1,6 +1,7 @@
@@ -293,7 +293,7 @@ index 522a38cace..2a37a76677 100644
  from contextlib import nullcontext
  from typing import (
      FrozenSet,
-@@ -332,6 +333,15 @@ class DeepSeekV4SingleKVPool(KVCache):
+@@ -335,6 +336,15 @@ class DeepSeekV4SingleKVPool(KVCache):
              )
          assert self.store_dtype == torch.uint8
  
@@ -309,7 +309,7 @@ index 522a38cace..2a37a76677 100644
          return torch.zeros(
              num_pages,
              self.bytes_per_page_padded,
-@@ -952,6 +962,15 @@ class DeepSeekV4UnifiedKVPool:
+@@ -955,6 +965,15 @@ class DeepSeekV4UnifiedKVPool:
          return data_ptrs, data_lens, item_lens
  
  
@@ -325,7 +325,7 @@ index 522a38cace..2a37a76677 100644
  class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
      # object.__new__ stubs (disagg wire test) skip __init__; False is the env
      # default, so the fp8 PD/HiCache refuses don't AttributeError on them.
-@@ -1299,6 +1318,34 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+@@ -1303,6 +1322,34 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
              kv_pool_cls=kv_pool_cls,
          )
  
@@ -360,7 +360,7 @@ index 522a38cace..2a37a76677 100644
          # The distinct compress ratios this stage has, sorted. Registry pools kept
          # for a ratio the model lacks (wire-layout alignment) do not count.
          model_ratios = set(self.compression_ratios)
-@@ -1599,6 +1646,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+@@ -1603,6 +1650,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                      cls=pool_cls,
                      kv_layout=self.compressed_kv_layout(ratio),
                  )
@@ -375,7 +375,7 @@ index 522a38cace..2a37a76677 100644
              for ratio, sources in low_ratio_sources.items():
                  self.kv_pools[ratio] = self._make_kv_pool(
                      size=self.full_size // ratio,
-@@ -1608,7 +1663,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+@@ -1612,7 +1667,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                      device=device,
                      enable_memory_saver=enable_memory_saver,
                      global_page_size=page_size,

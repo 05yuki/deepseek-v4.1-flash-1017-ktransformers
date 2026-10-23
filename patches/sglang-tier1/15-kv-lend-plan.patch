@@ -1,4 +1,4 @@
-From ddef4553b07cd2352b340d9885d5f371c31788b3 Mon Sep 17 00:00:00 2001
+From f614c4365d532235a9b9a00a78fef2e29a4f95fb Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 1] kv-lend-plan: lend the KV pool's free pages to
@@ -1770,10 +1770,10 @@ index 0000000000..a2b878d9f2
 +              + f", cap {chunk})", flush=True)
 +    return c
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index 0133caafcf..b4f97bfc6c 100644
+index 6cab5b8066..f5bbc49dcb 100644
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -4107,11 +4107,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -4110,11 +4110,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                          if req.extend_batch_idx < 2:
                              continue
                          else:
@@ -1820,10 +1820,10 @@ index d31cf7da06..018756c5a9 100644
          # Prefill policy
          # Get BLOCK_M from the backend for tile-budget admission logic
 diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
-index ec0ec67f8a..70342afe0b 100644
+index fad48b1745..db8f7443ac 100644
 --- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
 +++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
-@@ -449,7 +449,11 @@ class KVCacheConfigurator:
+@@ -450,7 +450,11 @@ class KVCacheConfigurator:
              )
              config = self.memory_pool_config
          else:
@@ -1836,7 +1836,7 @@ index ec0ec67f8a..70342afe0b 100644
  
          sizes = self._derive_pool_sizes(config=config)
  
-@@ -458,6 +462,10 @@ class KVCacheConfigurator:
+@@ -459,6 +463,10 @@ class KVCacheConfigurator:
              req_to_token_pool=self.req_to_token_pool,
              token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
          )
@@ -1847,7 +1847,7 @@ index ec0ec67f8a..70342afe0b 100644
  
          swa_max_total_num_tokens = sizes.swa_max_total_num_tokens
          alloc = pools.token_to_kv_pool_allocator
-@@ -540,6 +548,15 @@ class KVCacheConfigurator:
+@@ -541,6 +549,15 @@ class KVCacheConfigurator:
          if is_deepseek_v4(self.model_config.hf_config):
              c4_state_dtype, c128_state_dtype = _get_dsv4_compress_state_dtypes()
  

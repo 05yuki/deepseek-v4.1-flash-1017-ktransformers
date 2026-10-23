@@ -1,4 +1,4 @@
-From 6f5083d99693211a9bd689678613a7045e01b281 Mon Sep 17 00:00:00 2001
+From 371c42510862a7049e20b8c4f2805f664929e4ca Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] [tier 1] prefill-lend: lend the GPU-resident weights' memory
@@ -1694,10 +1694,10 @@ index 1831160646..d31cf7da06 100644
          return role_switch.run_event_loop_supervisor(
              scheduler,
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 261b9db8c4..b3e7ffa007 100644
+index 1b318682ba..db5d0bc7d4 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -1857,6 +1857,11 @@ class ModelRunner:
+@@ -1859,6 +1859,11 @@ class ModelRunner:
                  forward_batch,
              ) as recorder_outputs,
          ):
@@ -1710,10 +1710,10 @@ index 261b9db8c4..b3e7ffa007 100644
                  forward_batch,
                  pp_proxy_tensors,
 diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
-index fdb3187567..62a35dd360 100644
+index 711af8a86b..4b7afbd023 100644
 --- a/python/sglang/srt/model_loader/loader.py
 +++ b/python/sglang/srt/model_loader/loader.py
-@@ -305,6 +305,10 @@ def _initialize_model(
+@@ -307,6 +307,10 @@ def _initialize_model(
          model = model_class(**kwargs)
          check_stage_producers(model)
      model.shared_experts_config = shared_experts
@@ -1724,7 +1724,7 @@ index fdb3187567..62a35dd360 100644
      return model
  
  
-@@ -1083,6 +1087,14 @@ class DefaultModelLoader(BaseModelLoader):
+@@ -1085,6 +1089,14 @@ class DefaultModelLoader(BaseModelLoader):
              # parameters onto device for processing and back off after.
              with device_loading_context(module, target_device):
                  quant_method.process_weights_after_loading(module)
@@ -1740,10 +1740,10 @@ index fdb3187567..62a35dd360 100644
      @staticmethod
      def restore_weights_before_loading(model, target_device):
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 33f6f7fcd3..09d66d92ab 100644
+index aeefcd1114..cf7a2549d8 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -1336,7 +1336,11 @@ class MqaAttentionBase(nn.Module):
+@@ -1371,7 +1371,11 @@ class MqaAttentionBase(nn.Module):
              assert not getattr(meta, "q_pad_captured", False), (
                  "the padded query buffer grew after a CUDA graph captured it"
              )
@@ -1756,7 +1756,7 @@ index 33f6f7fcd3..09d66d92ab 100644
              if meta is not None:
                  try:
                      meta.q_pad_buffer = buf
-@@ -4242,6 +4246,10 @@ class DeepseekV4Model(nn.Module):
+@@ -4266,6 +4270,10 @@ class DeepseekV4Model(nn.Module):
              if tail is not None and i == self.late_layer_start:
                  if self.tail_writes_source_kv:
                      source = self.layers[i]
@@ -1768,10 +1768,10 @@ index 33f6f7fcd3..09d66d92ab 100644
                          # The previous FFN hc_post has not run yet, so run it here too.
                          source_x = fused_boundary_attn_input(source, state)
 diff --git a/python/sglang/srt/models/deepseek_v4_replay_tail.py b/python/sglang/srt/models/deepseek_v4_replay_tail.py
-index b5e5529298..1bb4497d6c 100644
+index 440f1186e3..990b8a0a13 100644
 --- a/python/sglang/srt/models/deepseek_v4_replay_tail.py
 +++ b/python/sglang/srt/models/deepseek_v4_replay_tail.py
-@@ -151,6 +151,8 @@ class DecoderReplayTail:
+@@ -154,6 +154,8 @@ class DecoderReplayTail:
  
      @classmethod
      def maybe_create(cls, model: torch.nn.Module) -> Optional[DecoderReplayTail]:
@@ -1780,7 +1780,7 @@ index b5e5529298..1bb4497d6c 100644
          max_rows = envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.get()
          if not (
              model.tail_writes_source_kv
-@@ -158,6 +160,9 @@ class DecoderReplayTail:
+@@ -161,6 +163,9 @@ class DecoderReplayTail:
              and max_rows > 0
              # Borrowed graph-pool storage forbids capturing mid-serving.
              and not envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.get()
