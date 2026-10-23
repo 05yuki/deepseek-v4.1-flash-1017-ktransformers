@@ -1,0 +1,419 @@
+Subject: [PATCH] [tier 0] Ada SM89 sparse attention fallback
+
+Select the existing dual-scope BF16 Triton kernels only on compute capability
+8.9. Skip FlashMLA metadata and the SM90+ sparse-prefill path on Ada. Native
+SM90, SM100 and SM120 dispatch remains unchanged. Keep V4 cache bytes, fixed
+SM89 launch settings, graph-owned scratch and bounded prefill row chunks.
+
+The separate-scope portable Triton path remains the query-shape fallback.
+Numerical differences from that reference are documented in docs/sm89.md.
+This patch reuses SGLang kernels; it does not introduce a new attention formula.
+
+---
+diff --git a/python/sglang/kernels/ops/attention/sm89_dual_scope.py b/python/sglang/kernels/ops/attention/sm89_dual_scope.py
+new file mode 100644
+index 0000000..623b0e8
+--- /dev/null
++++ b/python/sglang/kernels/ops/attention/sm89_dual_scope.py
+@@ -0,0 +1,349 @@
++"""SM89 sparse attention over V4 SWA and compressed KV pages.
++
++Reuses SGLang's dual-scope BF16 Triton kernels; native SM100/SM120
++attention is selected by the caller before this device-specific fallback.
++The BF16 probability rounding and split reductions need not match FlashMLA
++or the separate-scope CUDA-core reference bit for bit.
++"""
++
++import logging
++import os
++from typing import Optional
++
++import torch
++import triton
++
++from sglang.kernels.ops.attention.dsv4.triton_sparse_decode import (
++    triton_mla_kernels_decode_fused as _F,
++)
++from sglang.kernels.ops.attention.dsv4.triton_sparse_decode.triton_mla_kernels_decode_optimized import (
++    _should_use_fused_splitk,
++)
++
++_V4_BYTES_PER_TOKEN = 584  # 448 fp8 nope + 64 bf16 rope + 7 ue8m0 scales + 1 pad
++_D = 512
++_POOL_MAX_ROWS = 64
++
++_SPLITK_MODE = (
++    os.environ.get("SGLANG_SM89_ATTN_SPLITK", "auto").strip().lower() or "auto"
++)
++# Validated on SM89: 162 registers, 88 KiB shared memory, no spills.
++# Fixed launch configuration avoids autotuning during CUDA graph capture.
++_AUTOTUNE = False
++_BLOCK_H, _BLOCK_N, _NUM_WARPS = 16, 64, 8
++_MAX_ROWS = int(os.environ.get("SGLANG_SM89_ATTN_ROWS", "1024"))
++_DUAL_SCOPE = os.environ.get("SGLANG_SM89_ATTN_DUAL", "1") == "1"
++if _MAX_ROWS <= 0:
++    raise ValueError("SGLANG_SM89_ATTN_ROWS must be positive")
++if _SPLITK_MODE not in ("auto", "file", "0", "2", "4", "8"):
++    raise ValueError("SGLANG_SM89_ATTN_SPLITK must be auto, file, 0, 2, 4, or 8")
++_logged = set()
++logger = logging.getLogger(__name__)
++
++
++def _no(reason: str) -> bool:
++    if reason not in _logged:
++        _logged.add(reason)
++        logger.warning(
++            "SM89 attention: using the portable separate-scope path (%s)", reason
++        )
++    return False
++
++
++def supported(q, k_cache, extra_k_cache, head_dim_v, attn_sink) -> bool:
++    """Shapes the wrapper maps without copies; anything else stays on today's path."""
++    if q.ndim not in (3, 4):
++        return _no(f"query rank {q.ndim}")
++    if q.dtype != torch.bfloat16 or q.shape[-1] != _D or head_dim_v != _D:
++        return _no(f"q {q.dtype} d={q.shape[-1]} head_dim_v={head_dim_v}")
++    if q.ndim == 4 and q.shape[1] != 1:
++        return _no(f"q seq dim {q.shape[1]}")
++    for c in (k_cache, extra_k_cache):
++        if c is None:
++            continue
++        if c.ndim != 4 or c.shape[-1] != _V4_BYTES_PER_TOKEN or c.element_size() != 1:
++            return _no(
++                f"cache view {tuple(c.shape)} {c.dtype} (needs the V4 584 B layout)"
++            )
++        if c.stride(-1) != 1 or c.stride(1) != _V4_BYTES_PER_TOKEN:
++            return _no(f"cache strides {c.stride()}")
++    h = q.shape[-2]
++    if attn_sink is not None and attn_sink.numel() < h:
++        return _no(f"attn_sink {attn_sink.numel()} < heads {h}")
++    return True
++
++
++def _split_k(rows: int, h_q: int, total_topk: int) -> int:
++    mode = _SPLITK_MODE
++    if mode == "auto":
++        return 8 if rows <= 4 else (4 if rows <= 8 else 0)
++    if mode == "file":
++        if not _should_use_fused_splitk(rows, h_q, total_topk):
++            return 0
++        return _F._decide_splitk_dual_scope(rows, h_q, total_topk)
++    s = int(mode)
++    assert s in (0, 2, 4, 8), f"SGLANG_SM89_ATTN_SPLITK={mode!r}"
++    return s
++
++
++def _partials(split_k, rows, h_q, device):
++    # During capture, PyTorch's graph memory pool owns these allocations, just
++    # like out/lse below. Do not cache pointers by capture stream: two graphs
++    # captured on one stream can later replay concurrently on different streams.
++    return (
++        torch.empty(split_k, rows, h_q, _D, dtype=torch.float32, device=device),
++        torch.empty(split_k, rows, h_q, dtype=torch.float32, device=device),
++    )
++
++
++def _launch(kernel, grid, args, cfg=True):
++    if _AUTOTUNE or not cfg:
++        kernel[grid](*args[0], **args[1])
++    else:
++        jit = kernel.fn if hasattr(kernel, "configs") else kernel
++        jit[grid](
++            *args[0],
++            **args[1],
++            BLOCK_H=_BLOCK_H,
++            BLOCK_N=_BLOCK_N,
++            num_warps=_NUM_WARPS,
++            num_stages=1,
++        )
++
++
++def sm89_dual_scope_decode(
++    q: torch.Tensor,
++    k_cache: torch.Tensor,
++    indices: torch.Tensor,
++    topk_length: Optional[torch.Tensor],
++    attn_sink: Optional[torch.Tensor],
++    head_dim_v: int,
++    softmax_scale: Optional[float],
++    extra_k_cache: Optional[torch.Tensor] = None,
++    extra_indices: Optional[torch.Tensor] = None,
++    extra_topk_length: Optional[torch.Tensor] = None,
++) -> torch.Tensor:
++    """Same inputs as flash_mla_sparse_decode_triton; returns its output [B, 1, H, 512] bf16
++    (the LSE is not produced: the SM89 call site uses only the output)."""
++    if softmax_scale is None:
++        softmax_scale = q.shape[-1] ** (-0.5)
++    q3 = q[:, 0] if q.ndim == 4 else q  # [rows, H, 512] view
++    rows, h_q, _ = q3.shape
++    device = q.device
++    if rows == 0:
++        return torch.empty_like(q3).unsqueeze(1)
++
++    idx_main = indices.reshape(rows, -1)
++    kv_main = k_cache.view(torch.uint8)
++    topk_main = idx_main.shape[1]
++    has_extra = extra_k_cache is not None and extra_indices is not None
++    if has_extra:
++        idx_extra = extra_indices.reshape(rows, -1)
++        kv_extra = extra_k_cache.view(torch.uint8)
++        topk_extra = idx_extra.shape[1]
++    else:
++        # SWA-only layer: an empty extra scope (its loops run zero times)
++        idx_extra, kv_extra, topk_extra, extra_topk_length = idx_main, kv_main, 0, None
++
++    out = torch.empty(rows, h_q, _D, dtype=torch.bfloat16, device=device)
++    lse = torch.empty(rows, h_q, dtype=torch.float32, device=device)
++    tl_main = (
++        topk_length.reshape(-1).contiguous() if topk_length is not None else lse[:1, 0]
++    )
++    tl_extra = (
++        extra_topk_length.reshape(-1).contiguous()
++        if extra_topk_length is not None
++        else lse[:1, 0]
++    )
++    sink = attn_sink.contiguous() if attn_sink is not None else lse[0, :]
++    bucket = _F._bucket_total_tokens(rows)
++    block_h = 16 if _AUTOTUNE else _BLOCK_H
++    flags = dict(
++        HAS_TOPK_LENGTH_MAIN=topk_length is not None,
++        HAS_TOPK_LENGTH_EXTRA=extra_topk_length is not None,
++    )
++    common_head = (q3, kv_main, idx_main, tl_main, kv_extra, idx_extra, tl_extra)
++    shape_args = (
++        rows,
++        bucket,
++        h_q,
++        topk_main,
++        kv_main.shape[0],
++        kv_main.shape[1],
++        topk_extra,
++        kv_extra.shape[0],
++        kv_extra.shape[1],
++        1,  # s_q: rows are already flattened, lengths are per row
++    )
++    strides = (
++        q3.stride(0),
++        q3.stride(1),
++        q3.stride(2),
++        kv_main.stride(0),
++        kv_extra.stride(0),
++        idx_main.stride(0),
++        idx_main.stride(1),
++        idx_extra.stride(0),
++        idx_extra.stride(1),
++    )
++
++    split_k = _split_k(rows, h_q, topk_main + topk_extra)
++    if split_k == 0:
++        if _AUTOTUNE:
++            grid = lambda meta: (triton.cdiv(h_q, meta["BLOCK_H"]), rows)  # noqa: E731
++        else:
++            grid = (triton.cdiv(h_q, block_h), rows)
++        _launch(
++            _F._fused_gather_attn_dsv4_dual_scope_kernel,
++            grid,
++            (
++                (
++                    *common_head,
++                    sink,
++                    out,
++                    lse,
++                    softmax_scale,
++                    *shape_args,
++                    *strides,
++                    out.stride(0),
++                    out.stride(1),
++                    out.stride(2),
++                    lse.stride(0),
++                    lse.stride(1),
++                ),
++                dict(flags, HAS_ATTN_SINK=attn_sink is not None),
++            ),
++        )
++        return out.unsqueeze(1)
++
++    topk_per_split = (topk_main + topk_extra + split_k - 1) // split_k
++    po, plse = _partials(split_k, rows, h_q, device)
++    if _AUTOTUNE:
++        grid = lambda meta: (triton.cdiv(h_q, meta["BLOCK_H"]), rows, split_k)  # noqa: E731
++    else:
++        grid = (triton.cdiv(h_q, block_h), rows, split_k)
++    _launch(
++        _F._fused_gather_attn_dsv4_dual_scope_splitk_kernel,
++        grid,
++        (
++            (
++                *common_head,
++                po,
++                plse,
++                softmax_scale,
++                *shape_args[:-1],
++                1,
++                topk_per_split,
++                *strides,
++                *po.stride(),
++                *plse.stride(),
++            ),
++            flags,
++        ),
++    )
++    comb_args = (
++        po,
++        plse,
++        sink,
++        out,
++        lse,
++        rows,
++        bucket,
++        h_q,
++        _D,
++        *po.stride(),
++        *plse.stride(),
++        out.stride(0),
++        out.stride(1),
++        out.stride(2),
++        lse.stride(0),
++        lse.stride(1),
++    )
++    if split_k == 8:
++        if _AUTOTUNE:
++            _F._combine_splitk_kernel_8_optimized[
++                lambda meta: (rows, triton.cdiv(h_q, meta["BLOCK_H"]))
++            ](*comb_args, HAS_ATTN_SINK=attn_sink is not None)
++        else:
++            _F._combine_splitk_kernel_8_optimized.fn[(rows, triton.cdiv(h_q, 16))](
++                *comb_args,
++                HAS_ATTN_SINK=attn_sink is not None,
++                BLOCK_H=16,
++                BLOCK_D=512,
++                num_warps=4,
++                num_stages=1,
++            )
++    else:
++        kern = (
++            _F._combine_splitk_kernel_2 if split_k == 2 else _F._combine_splitk_kernel
++        )
++        kern[(rows, triton.cdiv(h_q, 16))](
++            *comb_args,
++            HAS_ATTN_SINK=attn_sink is not None,
++            BLOCK_H=16,
++            BLOCK_D=128,
++            num_warps=4,
++            num_stages=1,
++        )
++    return out.unsqueeze(1)
++
++
++def flash_mla_sparse_sm89(
++    q,
++    k_cache,
++    indices,
++    topk_length,
++    attn_sink,
++    head_dim_v,
++    softmax_scale,
++    extra_k_cache=None,
++    extra_indices=None,
++    extra_topk_length=None,
++):
++    """Bound prefill workspace; use dual scope on supported V4 cache shapes.
++
++    The portable reference handles unsupported dual-scope query shapes. Neither
++    implementation understands V41/FP4 cache bytes, so fail before interpreting
++    them as V4. SM89's default layout selection already stays on V4.
++    """
++    if q.ndim not in (3, 4) or (q.ndim == 4 and q.shape[1] != 1):
++        raise ValueError("SM89 attention expects q [N,H,D] or [N,1,H,D]")
++    for cache in (k_cache, extra_k_cache):
++        if cache is not None and (
++            cache.shape[-1] != _V4_BYTES_PER_TOKEN or cache.element_size() != 1
++        ):
++            raise ValueError("SM89 attention requires the V4 584-byte KV layout")
++    use_dual = _DUAL_SCOPE and supported(
++        q, k_cache, extra_k_cache, head_dim_v, attn_sink
++    )
++    if not use_dual:
++        from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
++            flash_mla_sparse_decode_triton,
++        )
++
++    def run(sl):
++        args = dict(
++            q=q[sl],
++            k_cache=k_cache,
++            indices=indices[sl],
++            topk_length=None if topk_length is None else topk_length[sl],
++            attn_sink=attn_sink,
++            head_dim_v=head_dim_v,
++            softmax_scale=softmax_scale,
++            extra_k_cache=extra_k_cache,
++            extra_indices=None if extra_indices is None else extra_indices[sl],
++            extra_topk_length=None
++            if extra_topk_length is None
++            else extra_topk_length[sl],
++        )
++        if use_dual:
++            return sm89_dual_scope_decode(**args)
++        return flash_mla_sparse_decode_triton(**args)[0]
++
++    rows = q.shape[0]
++    if rows <= _MAX_ROWS:
++        return run(slice(0, rows))
++    return torch.cat(
++        [run(slice(i, min(i + _MAX_ROWS, rows))) for i in range(0, rows, _MAX_ROWS)],
++        dim=0,
++    )
+diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+index 9c71a22..9859707 100644
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -203,6 +203,12 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
+     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
+ 
+ 
++def _use_sm89_sparse_attention() -> bool:
++    # Ada has BF16 tensor cores, but cannot run FlashMLA's SM90+ kernels.
++    # Match the runtime platform exactly; native SM90/SM100/SM120 paths stay intact.
++    return _is_cuda and get_platform().device_capability == (8, 9)
++
++
+ def _create_flashmla_metadata():
+-    if get_platform().is_sm120 or _is_xpu:
++    if get_platform().is_sm120 or _is_xpu or _use_sm89_sparse_attention():
+         return None
+@@ -2779,6 +2785,7 @@ class DeepseekV4AttnBackend(
+             and forward_batch.forward_mode.is_extend_without_speculative()
+             and not is_cp_active(forward_batch)
+             and not get_platform().is_sm120
++            and not _use_sm89_sparse_attention()
+             and self.forward_metadata.late_layer_tail is None
+             and (
+                 num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
+@@ -4188,7 +4195,24 @@ class DeepseekV4AttnBackend(
+                     extra_topk_lengths,
+                 )
+ 
+-            if get_platform().is_sm120:
++            if _use_sm89_sparse_attention():
++                from sglang.kernels.ops.attention.sm89_dual_scope import (
++                    flash_mla_sparse_sm89,
++                )
++
++                o = flash_mla_sparse_sm89(
++                    q=q,
++                    k_cache=swa_k_cache,
++                    indices=swa_page_indices,
++                    topk_length=swa_topk_lengths,
++                    attn_sink=attn_sink,
++                    head_dim_v=self.head_dim_v,
++                    softmax_scale=self.softmax_scale,
++                    extra_k_cache=extra_k_cache,
++                    extra_indices=extra_indices,
++                    extra_topk_length=extra_topk_lengths,
++                )
++            elif get_platform().is_sm120:
+                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
+                     SM120_DECODE_MAX_TOKENS,
+                     flash_mla_with_kvcache_sm120,

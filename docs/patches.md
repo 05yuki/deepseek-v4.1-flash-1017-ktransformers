@@ -47,6 +47,7 @@ patch goes and the pin moves past it.
 | `10-routed-scale-once` | [#45810](https://github.com/sgl-project/sglang/pull/45810) |
 | `11-v41-kv-layout` | [#45851](https://github.com/sgl-project/sglang/pull/45851) |
 | `12-low-ratio-pool-bytes` | [#45931](https://github.com/sgl-project/sglang/pull/45931) |
+| `13-sm89-attention` | [SM89 fallback and validation](sm89.md) |
 
 ### KTransformers wrapper
 

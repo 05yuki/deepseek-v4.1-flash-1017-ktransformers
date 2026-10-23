@@ -57,6 +57,8 @@ pages on the GPU. If the server runs out of memory at launch, a shorter context
   The launcher makes one expert pool per NUMA node and uses every physical core.
   kt-kernel is built for the CPU it is built on (`CPUINFER_CPU_INSTRUCT=NATIVE`). Its
   MXFP4 kernels need AVX2.
+- **GPU:** SM90 and newer on their own attention; SM89 (Ada, RTX 40) on a Triton
+  fallback that keeps the V4 cache layout ([docs/sm89.md](docs/sm89.md)).
 - **VRAM: 16 GB a card.** The dense layers and the KV pool's GPU part have to fit; the
   prefill chunks and the extra hot experts take the rest, so the cards show nearly full
   whatever room is left. `CUDA_VISIBLE_DEVICES` picks the GPUs, one tensor-parallel rank each.
@@ -89,7 +91,7 @@ pages on the GPU. If the server runs out of memory at launch, a shorter context
 
    | `TIER` | patch | what it adds |
    |---|---|---|
-   | 0 | `sglang-tier0/` (twelve patches, one concern each) | what 1017 needs to run correctly on the KTransformers hybrid MoE: the FP8 step below, the SwiGLU clamp passed to the CPU experts, the expert mask kt-kernel takes, `-1` ids kept out of the Marlin MoE, zero GPU experts, a configurable load barrier, the tool namespaces of the current reference's chat encoding, the V4.1 indexer on its torch path on SM12x (RTX 50, RTX PRO Blackwell, DGX Spark), which has no DeepGEMM build, its torch scoring done in place, the routed experts scaled by `routed_scaling_factor` once, V4.1's own KV cache formats on SM120 (below), and the KV pool sized by those formats' own entry bytes |
+   | 0 | `sglang-tier0/` (thirteen patches, one concern each) | what 1017 needs to run correctly on the KTransformers hybrid MoE: the FP8 step below, the SwiGLU clamp passed to the CPU experts, the expert mask kt-kernel takes, `-1` ids kept out of the Marlin MoE, zero GPU experts, a configurable load barrier, the tool namespaces of the current reference's chat encoding, the V4.1 indexer on its torch path on SM12x (RTX 50, RTX PRO Blackwell, DGX Spark), which has no DeepGEMM build, its torch scoring done in place, the routed experts scaled by `routed_scaling_factor` once, V4.1's own KV cache formats on SM120 (below), the KV pool sized by those formats' own entry bytes, and an automatic [SM89 attention fallback](docs/sm89.md) |
    | 1 | `sglang-tier1/` (one patch per feature, [docs/tier1.md](docs/tier1.md); `SGLANG_FEATURES` picks some) | streamed prefill, the lends, hot experts and placement, the KV pool on remappable memory, the GPU MoE and FP8 kernels (the streamed prefill needs SM89 or newer) |
    | 2 | `sglang-tier2-no-p2p.patch` | all-reduce through pinned host memory, for two GPUs without peer access |
 
@@ -317,6 +319,7 @@ English, teacher-forced. Measured at tag `2026-10-23-1702`, `serve.sh` defaults:
 | reference (`inference/model.py`) | 0.7185 | |
 | served, two GPUs | 0.7181 | -0.0004 (0.0040) |
 | served, one GPU (KV past the GPU in host memory) | 0.7194 | +0.0008 (0.0050) |
+| served, one RTX 4080 SUPER 32 GB (SM89), against its own reference run (0.7141) | 0.7151 | +0.0010 (0.0041) |
 
 The texts are well known, so the model predicts them closely and the NLL is low. They
 serve to compare the two implementations on the same tokens, not to measure the model.
@@ -339,14 +342,14 @@ padding-page fix (#3) is no longer carried: SGLang main's sparse attention with 
 
 ## Not done
 
-- Tested on 2 × RTX 5070 Ti (SM120) with Zen 2 CPUs only.
+- Results are on 2 × RTX 5070 Ti (SM120) with Zen 2 CPUs; SM89 was checked by a
+  contributor on one card ([docs/sm89.md](docs/sm89.md)).
 - CPUs with AVX-512 should work: the experts run on the AVX2 kernels, which those CPUs
   also have.
 - More than two GPUs: `serve.sh` sets tensor parallelism from the GPUs it sees; not
   tested.
-- Other NVIDIA GPUs: the DeepSeek-V4 attention in this SGLang branch is written for SM90
-  and newer, so RTX 30/40 and A100 are not expected to run. With
-  `SGLANG_MXFP4_MOE_FP32=0`, the MXFP4 Marlin path also needs SM90 or SM120.
+- Older NVIDIA GPUs: RTX 30 and A100 do not run; DeepSeek-V4's attention here needs SM89
+  or newer. With `SGLANG_MXFP4_MOE_FP32=0`, the MXFP4 Marlin path also needs SM90 or SM120.
 - AMD GPUs: not supported (kv-vmm and kt-kernel use CUDA).
 
 ## License
