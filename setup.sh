@@ -7,7 +7,8 @@
 #   engram-adapter/librow_store.so, build/libkv_vmm.so
 #   state/engram-<model>/engram-manifest.json   when MODEL=<checkpoint dir> is given
 #
-# usage: [MODEL=<checkpoint dir>] [TIER=0|1|2] [SGLANG_FEATURES=a,b,...] ./setup.sh
+# usage: [MODEL=<checkpoint dir>] [TIER=0|1|2] [SGLANG_FEATURES=a,b,...]
+#        [SESSION_CONCURRENCY_PATCH=0|1] ./setup.sh
 #
 # TIER picks how much of this repository's SGLang changes go in, each tier on top of the ones
 # below it (docs/patches.md):
@@ -33,6 +34,12 @@ KT_COMMIT=95009ea6856c0799e517e93cb12be5e8494bc7ce
 TIER="${TIER:-2}"
 [[ "$TIER" =~ ^[012]$ ]] || { echo "TIER must be 0, 1 or 2 (tiers 2 and 3 of before 10-21 are 1 and 2)" >&2; exit 2; }
 SGLANG_FEATURES="${SGLANG_FEATURES:-all}"
+SESSION_CONCURRENCY_PATCH="${SESSION_CONCURRENCY_PATCH:-0}"
+[[ "$SESSION_CONCURRENCY_PATCH" =~ ^[01]$ ]] || { echo "SESSION_CONCURRENCY_PATCH must be 0 or 1" >&2; exit 2; }
+if [[ "$SESSION_CONCURRENCY_PATCH" == 1 && ( "$TIER" == 0 || "$SGLANG_FEATURES" != all ) ]]; then
+  echo "SESSION_CONCURRENCY_PATCH requires TIER=1 or 2 and SGLANG_FEATURES=all" >&2
+  exit 2
+fi
 # the SGLang patches up to TIER, in order (paths under patches/)
 sglang_patches=()
 for f in "$here"/patches/sglang-tier0/[0-9][0-9]-*.patch; do sglang_patches+=("sglang-tier0/$(basename "$f")"); done
@@ -57,6 +64,7 @@ if (( TIER >= 1 )); then
   done < "$here/patches/sglang-tier1/requires.txt"
 fi
 (( TIER >= 2 )) && sglang_patches+=(sglang-tier2-no-p2p.patch)
+[[ "$SESSION_CONCURRENCY_PATCH" == 1 ]] && sglang_patches+=(sglang-optional/01-retained-session-admission.patch)
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 mkdir -p third_party build state
 step() { printf '\n== %s\n' "$*"; }
