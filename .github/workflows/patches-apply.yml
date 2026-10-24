@@ -36,10 +36,18 @@ jobs:
             grep -q "^$slug:" ../patches/sglang-tier1/requires.txt && continue
             git apply --check --whitespace=nowarn "$f"
           done
-          # all of tier 1 in order, then tier 2
-          for f in ../patches/sglang-tier1/[0-9][0-9]-*.patch ../patches/sglang-tier2-no-p2p.patch; do
+          # Full tier 1, then prove the opt-in admission patch in setup.sh order.
+          for f in ../patches/sglang-tier1/[0-9][0-9]-*.patch; do
             git apply --whitespace=nowarn "$f"
           done
+          git apply --check --whitespace=nowarn ../patches/sglang-optional/01-retained-session-admission.patch
+          git apply --whitespace=nowarn ../patches/sglang-optional/01-retained-session-admission.patch
+          git apply -R --whitespace=nowarn ../patches/sglang-optional/01-retained-session-admission.patch
+          # Production tier-2-before-optional order must also apply cleanly.
+          git apply --whitespace=nowarn ../patches/sglang-tier2-no-p2p.patch
+          git apply --check --whitespace=nowarn ../patches/sglang-optional/01-retained-session-admission.patch
+          git apply --whitespace=nowarn ../patches/sglang-optional/01-retained-session-admission.patch
+          git diff --check
 
       - name: SM89 dispatch contracts (CPU only)
         run: python3 tools/test_sm89_dispatch.py sglang
@@ -60,3 +68,5 @@ jobs:
         run: |
           for f in setup.sh serve.sh lib/*.sh tools/*.sh; do bash -n "$f"; done
           python3 -m py_compile tools/*.py lib/*.py engram-adapter/*.py patches/*.py
+          python3 -m unittest discover -s tools -p 'test_retained_setup_selection.py' -v
+          SGLANG_SOURCE_ROOT=sglang python3 -m unittest discover -s tools -p 'test_retained_session_admission.py' -v

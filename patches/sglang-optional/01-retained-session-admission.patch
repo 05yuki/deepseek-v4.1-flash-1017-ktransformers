@@ -1,0 +1,255 @@
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 018756c..ac1e755 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -3973,6 +3973,78 @@ class Scheduler(
+ 
+         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+ 
++    def _streaming_session_admission(self) -> bool:
++        if os.environ.get("KT_STREAMING_SESSION_ADMISSION", "0") != "1":
++            return False
++        # Retained streaming-session rows can exist only while a streaming
++        # session is open (closing it releases its row).
++        return any(
++            session.streaming for session in self.session_controller.sessions.values()
++        )
++
++    def _prefill_admission_budget(self, running_batch: ScheduleBatch) -> int:
++        if self._streaming_session_admission():
++            # Persistent KV rows are not active requests. Apply both configured
++            # active limits here; decide the row budget for each candidate below.
++            return max(0, min(self.max_running_requests,
++                              get_parallel().pp_max_micro_batch_size)
++                       - len(running_batch.reqs))
++        return self.get_num_allocatable_reqs(
++            len(running_batch.reqs), running_batch=running_batch)
++
++    def _streaming_row_available(
++        self, req: Req, admitted: List[Req], running_batch: Optional[ScheduleBatch] = None
++    ) -> bool:
++        if (req.to_finish is not None and not req.kv.holds_kv
++                and req.session is not None and req.session.streaming):
++            # Validation rejected this turn before it borrowed the retained KV.
++            # Detach it now, as StreamingSession.find_active_slot would at match
++            # time; otherwise four invalid continuations can pin every row.
++            req.release_mm_inputs_on_abort()
++            req.session.abort_req()
++            req.session = None
++        if req.kv.holds_kv:
++            return True
++        records = self.tree_cache.session_records()
++
++        def holds_row(session_id: str) -> bool:
++            kv = records.get(session_id)
++            return kv is not None and kv.holds_kv
++
++        if (req.session is not None and req.session.streaming
++                and req.to_finish is None
++                and holds_row(req.session.session_id)):
++            return True
++
++        # alloc reuses held rows; only newly admitted row-needing requests
++        # reserve free rows. Do not touch active, queued or chunked sessions.
++        needed = 1 + sum(
++            (r.beam_group.beam_width if r.beam_group is not None else 1)
++            - int(r.kv.holds_kv) for r in admitted
++        )
++        needed += self.beam_coordinator.pending_member_rows(
++            running_batch or self.running_batch)
++        if self.req_to_token_pool.available_size() >= needed:
++            self.tree_cache.set_session_row_reclaim_demand(0)
++            return True
++        idle = sorted(
++            (session.last_active_time, sid)
++            for sid, session in self.session_controller.sessions.items()
++            if session.streaming and not session._inflight and holds_row(sid)
++        )
++        if self.req_to_token_pool.available_size() + len(idle) < needed:
++            self.tree_cache.set_session_row_reclaim_demand(
++                needed - self.req_to_token_pool.available_size() - len(idle))
++            return False
++        self.tree_cache.set_session_row_reclaim_demand(0)
++        for _, sid in idle:
++            # Reuse the existing release path. Token history remains in the
++            # controller, so an evicted session can re-prefill on its next turn.
++            self.tree_cache.release_session(sid)
++            if self.req_to_token_pool.available_size() >= needed:
++                return True
++        return False
++
+     def get_num_allocatable_reqs(
+         self,
+         running_bs: int,
+@@ -4036,9 +4108,13 @@ class Scheduler(
+             for req in ready_grammar_requests:
+                 self._add_request_to_queue(req)
+ 
+-        if self.enable_priority_preemption or self.is_hybrid_swa:
++        streaming_admission = self._streaming_session_admission()
++        if (self.enable_priority_preemption or self.is_hybrid_swa
++                or streaming_admission):
+             # Reset batch_is_full to try preemption with a prefill adder.
+             running_batch.batch_is_full = False
++        if not streaming_admission or not self.waiting_queue:
++            self.tree_cache.set_session_row_reclaim_demand(0)
+         if running_batch.is_empty():
+             # An empty batch has no request left to leave, and only a leaving
+             # request clears the flag elsewhere, so admission would stay shut.
+@@ -4056,9 +4132,7 @@ class Scheduler(
+             and self.chunked_req is None
+             and self.min_free_slots_delayer.should_delay(
+                 running_bs=running_bs,
+-                num_allocatable_reqs=self.get_num_allocatable_reqs(
+-                    running_bs, running_batch=running_batch
+-                ),
++                num_allocatable_reqs=self._prefill_admission_budget(running_batch),
+             )
+         ):
+             return None, running_batch
+@@ -4067,7 +4141,7 @@ class Scheduler(
+         # chunks, and under PP it (or a dllm request) may finish in another
+         # microbatch, so holding it back here would leak its memory.
+         if (
+-            self.get_num_allocatable_reqs(running_bs, running_batch=running_batch) <= 0
++            self._prefill_admission_budget(running_batch) <= 0
+             and self.chunked_req is None
+             and not self.enable_priority_preemption
+         ):
+@@ -4177,7 +4251,23 @@ class Scheduler(
+                 req.beam_group.beam_width if req.beam_group is not None else None
+             )
+             num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
+-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
++            streaming_admission = (
++                self._streaming_session_admission()
++                and self.disaggregation_mode == DisaggregationMode.NULL
++                and candidate_beam_width is None
++            )
++            if streaming_admission:
++                if len(adder.can_run_list) >= self._prefill_admission_budget(running_batch):
++                    running_batch.batch_is_full = True
++                elif not self._streaming_row_available(req, adder.can_run_list, running_batch):
++                    if running_bs == 0 and not adder.can_run_list:
++                        # All rows may belong to queued continuations behind a
++                        # new request. Let a zero-new-row continuation progress;
++                        # once it finishes its idle row can serve the queue head.
++                        # Other row-needing requests fail the same check.
++                        continue
++                    break
++            elif len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                 running_bs,
+                 candidate_beam_width,
+                 running_batch=running_batch,
+diff --git a/python/sglang/srt/mem_cache/base_prefix_cache.py b/python/sglang/srt/mem_cache/base_prefix_cache.py
+index cfa94d5..6506bbf 100644
+--- a/python/sglang/srt/mem_cache/base_prefix_cache.py
++++ b/python/sglang/srt/mem_cache/base_prefix_cache.py
+@@ -722,6 +722,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
+     def release_session(self, session_id: str) -> None:
+         pass
+ 
++    def set_session_row_reclaim_demand(self, count: int) -> None:
++        """Request row release at safe session completion boundaries."""
++        pass
++
+     def release_radix_session(self, session_id: str) -> None:
+         pass
+ 
+diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
+index 2c5b195..df091ac 100644
+--- a/python/sglang/srt/mem_cache/unified_radix_cache.py
++++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
+@@ -423,6 +423,7 @@ class UnifiedRadixCache(BasePrefixCache):
+ 
+         # Reset Controller.
+         self.session.slots.clear()
++        self.session.set_session_row_reclaim_demand(0)
+         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
+         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
+         self.enable_storage = False
+@@ -3779,6 +3780,9 @@ class UnifiedRadixCache(BasePrefixCache):
+     def release_session(self, session_id: str) -> None:
+         self.session.release_session(session_id)
+ 
++    def set_session_row_reclaim_demand(self, count: int) -> None:
++        self.session.set_session_row_reclaim_demand(count)
++
+     def session_records(self) -> dict[str, ReqKvInfo]:
+         return {sid: slot.kv for sid, slot in self.session.slots.items()}
+ 
+diff --git a/python/sglang/srt/session/session_controller.py b/python/sglang/srt/session/session_controller.py
+index 41f29b1..e4e59db 100644
+--- a/python/sglang/srt/session/session_controller.py
++++ b/python/sglang/srt/session/session_controller.py
+@@ -13,6 +13,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import os
+ import time
+ import uuid
+ from array import array
+@@ -343,6 +344,10 @@ class Session:
+ 
+         if abort:
+             new_req.set_finish_with_abort(abort_message)
++            if self.streaming and os.environ.get("KT_STREAMING_SESSION_ADMISSION", "0") == "1":
++                # A rejected overlapping/invalid turn never acquired this session.
++                # Its abort must not clear another request's in-flight ownership.
++                new_req.session = None
+         elif self.streaming:
+             self.last_active_time = time.monotonic()
+             # req_nodes is NOT updated here — finish_req() handles it.
+diff --git a/python/sglang/srt/session/streaming_session.py b/python/sglang/srt/session/streaming_session.py
+index 280c36a..b6889c7 100644
+--- a/python/sglang/srt/session/streaming_session.py
++++ b/python/sglang/srt/session/streaming_session.py
+@@ -65,10 +65,16 @@ class StreamingSession:
+     def __init__(self, cache: UnifiedRadixCache):
+         self.cache = cache
+         self.slots: Dict[str, SessionSlot] = {}
++        self._row_reclaim_demand = 0
+ 
+     def any_holding_kv(self) -> bool:
+         return any(s.kv.holds_kv for s in self.slots.values())
+ 
++    def set_session_row_reclaim_demand(self, count: int) -> None:
++        if count < 0:
++            raise ValueError("negative session row reclaim demand")
++        self._row_reclaim_demand = count
++
+     # -- Try-handle entries (see class docstring) --
+ 
+     def find_active_slot(self, req: Req) -> Optional[SessionSlot]:
+@@ -168,6 +174,10 @@ class StreamingSession:
+         if isinstance(req.finished_reason, FINISH_ABORT):
+             # Hand the record and the tree lock back; the caller releases them.
+             del self.slots[req.session.session_id]
++            if slot.kv.holds_kv:
++                # The caller frees this row: it satisfies one unit of demand,
++                # as release_session does on the 1aa base's abort path.
++                self._row_reclaim_demand = max(0, self._row_reclaim_demand - 1)
+             req.lock, slot.lock = slot.lock, None
+             req.release_mm_inputs_on_abort()
+             req.session.abort_req()
+@@ -188,6 +198,11 @@ class StreamingSession:
+ 
+         # Update req_nodes to this successfully finished request.
+         req.session.finish_req(req)
++        if self._row_reclaim_demand:
++            # Free only after this forward has finished and token history is
++            # committed. A queued continuation must not indefinitely pin the
++            # next row needed by an earlier new request.
++            self.release_session(req.session.session_id)
+ 
+         return True
+ 
+@@ -243,6 +258,7 @@ class StreamingSession:
+         if slot.kv.holds_kv:
+             self.cache.free_kv_row(slot.kv, [(protected_len, slot.kv.kv_allocated_len)])
+             self.cache.req_to_token_pool.free(slot)
++            self._row_reclaim_demand = max(0, self._row_reclaim_demand - 1)
+ 
+         self._free_slot_mamba(slot)
+ 

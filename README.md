@@ -95,6 +95,15 @@ pages on the GPU. If the server runs out of memory at launch, a shorter context
    | 1 | `sglang-tier1/` (one patch per feature, [docs/tier1.md](docs/tier1.md); `SGLANG_FEATURES` picks some) | streamed prefill, the lends, hot experts and placement, the KV pool on remappable memory, the GPU MoE and FP8 kernels (the streamed prefill needs SM89 or newer) |
    | 2 | `sglang-tier2-no-p2p.patch` | all-reduce through pinned host memory, for two GPUs without peer access |
 
+   Retained streaming-session admission is a separate, default-off source
+   selection (`SESSION_CONCURRENCY_PATCH=1`) and runtime gate. See
+   [docs/retained-session-concurrency.md](docs/retained-session-concurrency.md)
+   for its four-request profile and validation limits. The
+   [reviewed experimental A5 evidence](https://github.com/howl9003/deepseek-v4.1-flash-1017-ktransformers/blob/3f36082fc3021998d2a6a1e588b11f94050cbcf6/docs/benchmarks/retained-session-00fd12a-20261024/RESULTS.md)
+   records completed lifecycle checks and material numerical differences on
+   `00fd12a` / `9c0f6d6`; it makes no equivalence, throughput-gain or current-pin
+   GPU-validation claim.
+
    Below tier 1 a long prompt's experts run on the CPU (about 40 tok/s of prefill here, decode
    about 11 tok/s); the speed in Results is tier 2's.
 
