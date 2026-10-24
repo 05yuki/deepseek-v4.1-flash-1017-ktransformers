@@ -1,0 +1,314 @@
+{
+  "status": "REVIEWED_EXPERIMENTAL_EVIDENCE",
+  "publication": "Prepared for experimental source review; this record does not assert publication or production readiness.",
+  "numerical_acceptance": "DESCRIPTIVE_REVIEW_COMPLETE_NO_EQUIVALENCE_CLAIM",
+  "measured_source": {
+    "recipe": "00fd12a0b3e59cbf7dcc62b7341415fcdd3fc9a6",
+    "sglang": "9c0f6d6a610531bd16ad3513572e55226450b244",
+    "kt": "95009ea6856c0799e517e93cb12be5e8494bc7ce",
+    "wheel_sha256": "436156b6cf447b38903b89fa9cc8329a0e92872fcb757dc58f2896389b1bfe30",
+    "serve_sha256": "339a4719b13f90b2e68ba4d95c3a2c43bd68f257ac17dfdaf077e884957d12d9",
+    "kv_vmm_sha256": "362026bbfeb714e1456c3a79153deae34fbeb2454ea4080bb6706218d2ae508c"
+  },
+  "concurrency_draft_commit": "187ec9ec0341447227d7b3c463df1e928adce0f1",
+  "applied_patches": [
+    {
+      "name": "18-prefix-cache-policy.patch",
+      "sha256": "4421e5366fc7edf31c0ec72df4d3b717980c214bdc306c095ae9e97fcbfc6a25"
+    },
+    {
+      "name": "03-retained-session-admission.patch",
+      "sha256": "9f88a710ef5857cf8f9b53d004b6290e06dcbda7db00cac94bc99e56793f8a09"
+    }
+  ],
+  "hardware_profile": {
+    "accelerator": "Experimental 32 GiB NVIDIA GeForce RTX 4080 SUPER",
+    "gpu_count": 1,
+    "owner_cpu_affinity": "0-63",
+    "numa_interleave_nodes": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "native_expert_threads": 56,
+    "native_numa_pools": 8,
+    "native_worker_policy": "strict_bind",
+    "scope_cap_gib": 440,
+    "swap_max_bytes": 0,
+    "cpu": "2 x AMD EPYC 7543",
+    "physical_cores": 64,
+    "gpu_memory_reported_mib": 32760
+  },
+  "feature_profile": {
+    "kind": "session-only",
+    "max_running_requests": 4,
+    "prefill_max_requests": 4,
+    "max_queued_requests": 4,
+    "schedule_policy": "fcfs",
+    "stream_interval": 1,
+    "context_length": 1048576,
+    "max_total_tokens": 1048576,
+    "chunked_prefill_size": 36864,
+    "decode_graph_batch_sizes": [
+      1,
+      2,
+      4
+    ],
+    "disable_radix_cache": true,
+    "enable_hierarchical_cache": false,
+    "KT_STREAMING_SESSION_ADMISSION": "1",
+    "SGLANG_CACHE_TTL": "0",
+    "KT_PREFILL_SWA_LEND": "0",
+    "KT_KV_HOT_SPARE_FLOOR_MB": "3072",
+    "physically_includes_KV_policy_patch": true,
+    "hot_glue_treatment_enabled": false
+  },
+  "collection": {
+    "feature_status": "MEASURED",
+    "supplemental_status": "TOOLS_COMPLETE_PENDING_NUMERICAL_REVIEW",
+    "cohorts": [
+      1,
+      2,
+      4
+    ],
+    "turns_per_cohort": 3,
+    "request_count": 44,
+    "control_count": 33,
+    "functional_history_lifecycle": true,
+    "queue_status": "PASS",
+    "winner_flip_rows": 1,
+    "replay_rows": 7,
+    "distinct_histories": 6,
+    "raw_status_label_scope": "Original collector labels are preserved faithfully; independent source/numerical/reference review is complete and no automatic acceptance follows."
+  },
+  "paired_metrics": {
+    "nll_reference_to_trial": {
+      "pieces": 24,
+      "scored_positions": 11496,
+      "reference_nll": 0.7141112515005389,
+      "served_nll": 0.7240040158039489,
+      "delta_nats_per_token": 0.009892764303409926,
+      "piece_se_nats_per_token": 0.00501819713374335
+    },
+    "nll_own_arm_to_trial": {
+      "pieces": 24,
+      "scored_positions": 11496,
+      "reference_nll": 0.7150963168424553,
+      "served_nll": 0.7240040158039489,
+      "delta_nats_per_token": 0.008907698961493652,
+      "piece_se_nats_per_token": 0.00488453572800428
+    },
+    "wikitext_own_arm_to_trial": {
+      "pieces": 12,
+      "scored_positions": 12276,
+      "reference_nll": 0.8984456211165188,
+      "served_nll": 0.9012321733598605,
+      "delta_nats_per_token": 0.002786552243341725,
+      "piece_se_nats_per_token": 0.002117528180760825
+    }
+  },
+  "resources": {
+    "window": "ready-to-after-client; excludes cleanup",
+    "seconds": 446.4963891506195,
+    "before": {
+      "utc": "2026-10-23T23:50:09.129799+00:00",
+      "current_bytes": 446484914176,
+      "peak_lifetime_bytes": 472446402560,
+      "events": {
+        "low": 0,
+        "high": 0,
+        "max": 3727,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0,
+        "sock_throttled": 0
+      },
+      "swap_bytes": 0,
+      "pressure_total_us": {
+        "some": 29666654,
+        "full": 29656150
+      },
+      "stat_bytes": {
+        "anon": 39934246912,
+        "file": 406207070208,
+        "shmem": 350486577152,
+        "inactive_file": 55503007744
+      }
+    },
+    "after": {
+      "utc": "2026-10-23T23:57:35.626188+00:00",
+      "current_bytes": 455698399232,
+      "peak_lifetime_bytes": 472446402560,
+      "events": {
+        "low": 0,
+        "high": 0,
+        "max": 3727,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0,
+        "sock_throttled": 0
+      },
+      "swap_bytes": 0,
+      "pressure_total_us": {
+        "some": 29667045,
+        "full": 29656540
+      },
+      "stat_bytes": {
+        "anon": 49021407232,
+        "file": 406365646848,
+        "shmem": 350585249792,
+        "inactive_file": 55530844160
+      }
+    },
+    "samples_including_boundaries": 220,
+    "all_phase_samples": 733,
+    "sampled_peak_current_bytes": 456211394560,
+    "max_swap_bytes": 0,
+    "events_delta": {
+      "low": 0,
+      "high": 0,
+      "max": 0,
+      "oom": 0,
+      "oom_kill": 0,
+      "oom_group_kill": 0,
+      "sock_throttled": 0
+    },
+    "events_max_delta": {
+      "low": 0,
+      "high": 0,
+      "max": 0,
+      "oom": 0,
+      "oom_kill": 0,
+      "oom_group_kill": 0,
+      "sock_throttled": 0
+    },
+    "pressure_delta_us": {
+      "some": 391,
+      "full": 390
+    },
+    "current_delta_bytes": 9213485056,
+    "stat_delta_bytes": {
+      "anon": 9087160320,
+      "file": 158576640,
+      "shmem": 98672640,
+      "inactive_file": 27836416
+    },
+    "scope_cap_gib": 440,
+    "caveat": "Lifetime peak and ready max events include loading. Current-byte peak is sampled within the client window, not isolated model RSS or a per-scorer peak."
+  },
+  "source_identity_summary": {
+    "selected_source_count": 62,
+    "selected_before_after_equal": true,
+    "selected_matches_prepared": true,
+    "canonical_sources_unchanged_receipt": true,
+    "embedded_profile_equal": true,
+    "profile_compact_json_sha256": "2953bdfb05dd43149b8242c58b51ab6191244e09df9777e6a2c46a517d562c72",
+    "environment_fields_verified": 99,
+    "server_arguments_verified": 542,
+    "scheduler_arguments_equal": true,
+    "client_tools_verified": 4,
+    "superseded_earlier_raw_receipts": [
+      {
+        "pid": "126881",
+        "earlier_summary_sha256": "0c4e34f93746e2cb3fa50c10ffca54ffb0d7ac68f0aef495482fc0d846217f03",
+        "archived_raw_sha256": "d224a51110904bac5bc6371a9ad05cc2b6867ea0c50acdac162ecc42ff1eecb8",
+        "reason": "earlier raw observer bytes superseded; earlier embedded module inventory remains bound by archived summary"
+      }
+    ]
+  },
+  "source_observer_limit": "One earlier raw observer receipt was superseded; its embedded summary remains preserved.36/37 earlier raw receipts and5/5 terminal raw receipts match; no source identity change inferred.",
+  "cleanup": {
+    "empty": true,
+    "final_scope_state": "removed",
+    "initial_graceful_stop_timeout_retained": true,
+    "owned_kill_succeeded": true
+  },
+  "prior_failure": "A4 flush remapped SWA before hot VMM loans were released; failed evidence preserved. A5 changes profile SWA lend1/spare1024 to lend0/spare3072; source admission/lender unchanged.",
+  "archive_sha256": "cd039258edeaf64def53fb6aeebe861676cef259f257d378961f11bb0e051b02",
+  "manifest_sha256": "22fff81601d97ae4231f2a0edbde527a3b61962e628a203c2fc68481234f08cc",
+  "source_sha256": {
+    "features/report.json": "3438a7454ee511c52990548fc6d986ab35d40ab9edd90fe6bd282936cd80fa5a",
+    "features/queue/QUEUE_CHECKS.json": "6b5d412e76d3fa9e5073073de293a74058bdbe806e0f99f2b559eb3daed129b9",
+    "RUN.json": "73dc92a954b2f727c23d32f913087665ce12c6582448e78095d728a4cec08a91",
+    "PREPARED.json": "25da04376a2ec808fe4ec69b5c1d1ebd9969aa927f708aa3bda8bcbf6112d6af",
+    "PROFILE.json": "2286414349b49e790b560f29bd440530f622723309c837e73db0ee7e57f2f4bf",
+    "LAUNCH.json": "2168b4c6d33cca0760d516144df4570bc658782db975d3c2ee99afb492bb3ea9",
+    "supplemental/RESULT.json": "19ebd671570bd02fd1cb86f5e3ba1cbac1adde2616b5557cd05b11197ec9a0d5",
+    "PAIRED_NUMERICAL.json": "279bad565172bd85da21b2f511ee2b6c2a11be86245d8a729b772ea4e27c8ddf",
+    "RESOURCE_SOURCE_BINDINGS.json": "73637e7900686a3c7475942a5b1c0c9265ef5be50dc9ba691533a18cbc77a4d3",
+    "A5_REPLAY_OBSERVATIONS.json": "9c6518f184a9804e9d68d91608720fdc3937207ee9925fac2a289439afc83a8c",
+    "A5_REPLAY_REVIEW.md": "81bd4be697b8e306a45f8b7fa9ea29377a75c3d363bb90202a32f73a16b54c89",
+    "EXPERT_ARITHMETIC_CONTRACTS.md": "2fceef276a432b4b8a6679238b60ab76b8d52d02ea8ff6e16d3b541db2d4f19c",
+    "reference/OWNER.json": "5a7e55b3231223808c4517001f0f080adf95cd82ee548352cbc05a73de0eb89a",
+    "reference/REFERENCE.json": "b7325d3990ee752f78ae65cfb8371a253fe682301817bf468366d5af8b99ac67",
+    "reference/ref.json": "e0260caf0259dc86e8204d7dec9e95c4d96dbd0bd66c9aac53f1e3febb2ee60d",
+    "reference/input-ids.json": "9b8ea7d20ac938683eb273768cf800590f4f8139c9bd419ef63d9f5d0b26461b",
+    "reference/independent-comparison.json": "946ee6a247d3a5181ee6823e1405fc07e9aaa41ea563aafdb32fd47e53b6764a",
+    "reference/REVIEW.md": "7851b9206cfa8e1b86481d1c3a47142b1f51ea4a44572f3c3a57273ee48b1e9d",
+    "canonical-hardware-record.json": "987fb169ea17f1ba7ec693a5b10c518eee75b8bfdb35b5426266836fd6729a21"
+  },
+  "limitations": [
+    "Single hardware/profile correctness run; upstream already provides concurrency/sessions/queue/cache facilities.",
+    "No isolated speedup, throughput, numerical identity, quality equivalence or newer-pin runtime claim.",
+    "One of seven retained/cold winners differs; actual probability changes preserved in REPLAY.json.",
+    "Bounded short fixtures do not validate four simultaneous 1M-token sessions or general long-context behavior.",
+    "Fixed-history reference favors 1 over 455 only for the measured pair; absolute serving probabilities differ. No causal attribution or correctness acceptance follows.",
+    "Original preview and reviewed source directory are preserved unchanged. This evidence supports experimental source review, not numerical equivalence or production readiness."
+  ],
+  "prior_failure_evidence_sha256": {
+    "evidence.tgz": "1cdc1f835c097dcc72d20cd680ecc822566a3d7d3b8b3b11645da9273b9c4128",
+    "MANIFEST.json": "87a8ca2ceaa1db81edba7645454829bf1fa55bd03ef26e7dbc7ed4601064c360",
+    "trial/RUN.json": "f199c1bc22f0d0bb7f046a3a10220bb4f82b2b57c1a6d1da4fcf75738073885c",
+    "trial/PROFILE.json": "41008cf532f0568c5585850e127b7495efca96164be38442def2436864842094"
+  },
+  "classification": "Experimental default-off admission/ownership fix; functionally validated on exact A5 profile; numerical differences disclosed without equivalence/readiness claim.",
+  "review_status": "Required A5 functional/numerical/source/resource collection and fixed-history reference collection/independent review are complete.",
+  "fixed_history_reference": {
+    "history_tokens": 538,
+    "piece_tokens": 539,
+    "scored_positions_per_piece": 538,
+    "candidate_ids": [
+      1,
+      455
+    ],
+    "logprob": [
+      -1.1851727962493896,
+      -3.4046218395233154
+    ],
+    "probability": [
+      0.3056933522699341,
+      0.033219379963577836
+    ],
+    "log_odds_1_over_455": 2.219449043273926,
+    "odds_1_over_455": 9.20225942221379,
+    "shared_prefix_target_scores": 537,
+    "shared_prefix_scores_exactly_equal": true,
+    "layers_completed": 40,
+    "fallback_projection_reads": 43560,
+    "scope": "Two candidates at one exact 538-token history; full-prefill, not full-vocabulary argmax or incremental equivalence."
+  },
+  "source_findings": "No concrete new admission or committed-history-reset defect identified in reviewed paths. Inherited arithmetic differences are documented plausible mechanisms; their causality is not proved.",
+  "reference_archive_sha256": "2d473a4d6cc286db8a1414f26f7de844e3db31f60ad75d3a0c124538a3e8bb80",
+  "reference_manifest_sha256": "dd75c6f003e10a3cfdee92ee0de756fa9ca5ac34aec6b605380c890f71a0dbd5",
+  "hardware_provenance": {
+    "A5_accelerator_model_reported": "NVIDIA GeForce RTX 4080 SUPER",
+    "same_host_canonical_record_sha256": "987fb169ea17f1ba7ec693a5b10c518eee75b8bfdb35b5426266836fd6729a21",
+    "same_boot_id": "298fc190-a9bf-4782-9ceb-7aad211c1470",
+    "canonical_campaign": "A-r8",
+    "reported_gpu_string": "NVIDIA GeForce RTX 4080 SUPER, 32760 MiB, 8.9, 595.91.07",
+    "CPU_and_capacity_scope": "Dual EPYC 7543 and 32760 MiB come from corroborating same-host canonical public record and root hardware confirmation; no new A5 hardware query was performed."
+  },
+  "publication_implementation": {
+    "commit": "b01f440cf93f5952962ba6a4b2b0ea0d614db9d8",
+    "recipe_base": "e8608a224c108c06c8dbe636bf0bfef295e82161",
+    "sglang_pin": "8b9f72417fa85a04de6193b0a52f4cec63370d77",
+    "admission_patch_sha256": "9f88a710ef5857cf8f9b53d004b6290e06dcbda7db00cac94bc99e56793f8a09",
+    "profile_sha256": "c6780ef0ed01654e09746adf37f781c32a6f1e28bea9f681650708ab06d658ac",
+    "scope": "Rebased source/CPU-checked implementation and reviewed profile. Model evidence remains on measured 00fd12a/9c0f6d6; no current-pin GPU claim."
+  }
+}

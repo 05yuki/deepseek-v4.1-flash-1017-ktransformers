@@ -1,0 +1,70 @@
+{
+  "status": "REVIEWED_EXPERIMENTAL_EVIDENCE",
+  "required_collection_and_independent_review_complete": true,
+  "numerical_acceptance": "DESCRIPTIVE_REVIEW_COMPLETE_NO_EQUIVALENCE_CLAIM",
+  "classification": "Experimental default-off admission/ownership fix; functionally validated on exact A5 profile; numerical differences disclosed without equivalence/readiness claim.",
+  "files": {
+    ".gitattributes": {
+      "bytes": 8,
+      "sha256": "705fd4d6451a31d36b3df7de96f83f30ac976c9b4a6d1e51671d8e2f33e2d0da"
+    },
+    "FIXED_HISTORY_REFERENCE.json": {
+      "bytes": 58885,
+      "sha256": "0d88ea51883a6d73e2b62aae93677ac0462039841cdd7d39dfa2f298530f2239"
+    },
+    "NUMERICAL.json": {
+      "bytes": 6473,
+      "sha256": "ff42ff0181157c2c47fd53cef84459561de516ee638758ab765a96c3f3116ec0"
+    },
+    "PROTOCOL.json": {
+      "bytes": 31330,
+      "sha256": "0c61385b73340abcbb9a086afb7a7b78b5fc67f536c035518b4115e1d4ab96d3"
+    },
+    "REPLAY.json": {
+      "bytes": 42967,
+      "sha256": "19ede5efd113c4d9c176aebafd3a9117a25ae098581d6fc91c15340278c82424"
+    },
+    "RESULTS.md": {
+      "bytes": 12813,
+      "sha256": "093585d56b84b4cc10fa6d3d8e469f496a49d81a9cd809cc512b774cca716ffd"
+    },
+    "SUMMARY.json": {
+      "bytes": 13375,
+      "sha256": "fa878be83da8a6e7643e10fd6266fdd82223488635865010779bb0f5aa476c3b"
+    }
+  },
+  "original_preview_manifest_sha256": "dff9b845c4ad59508fd66a71b2a7fee36ac3532357c074ab47020096f3ddcbf6",
+  "original_preview_unchanged": true,
+  "source_evidence": {
+    "A5_archive_sha256": "cd039258edeaf64def53fb6aeebe861676cef259f257d378961f11bb0e051b02",
+    "A5_manifest_sha256": "22fff81601d97ae4231f2a0edbde527a3b61962e628a203c2fc68481234f08cc",
+    "reference_archive_sha256": "2d473a4d6cc286db8a1414f26f7de844e3db31f60ad75d3a0c124538a3e8bb80",
+    "reference_manifest_sha256": "dd75c6f003e10a3cfdee92ee0de756fa9ca5ac34aec6b605380c890f71a0dbd5",
+    "same_host_hardware_record_sha256": "987fb169ea17f1ba7ec693a5b10c518eee75b8bfdb35b5426266836fd6729a21"
+  },
+  "validation": {
+    "source_hashes_rechecked": 19,
+    "all1076_reference_scores_preserved": true,
+    "reference_raw_score_file_bytes_reconstructed_from_projection": true,
+    "two539_token_inputs_exactly_reconstructed": true,
+    "reference_final_probabilities_and_odds_recomputed": true,
+    "all_piece_means_and_SE_recomputed": true,
+    "all7_replay_rows_and18_token_witness_preserved": true,
+    "all44_request_projection_rows_preserved": true,
+    "missing_top5_candidates_not_imputed": true,
+    "no_private_host_or_Windows_paths_in_projections": true,
+    "no_runtime_or_frozen_source_changes": true,
+    "no_push_or_pr": true
+  },
+  "raw_collector_status_note": "The historical supplemental receipt retains its original pending-numerical-review label; completed independent review is reported separately.",
+  "reviewed_source_manifest_sha256": "873c5b3ed38c337bd7b8bb337ed32046c959330fc60d7a211320e4ac3fba4962",
+  "reviewed_source_preserved_unchanged": true,
+  "publication_implementation": {
+    "commit": "b01f440cf93f5952962ba6a4b2b0ea0d614db9d8",
+    "recipe_base": "e8608a224c108c06c8dbe636bf0bfef295e82161",
+    "sglang_pin": "8b9f72417fa85a04de6193b0a52f4cec63370d77",
+    "admission_patch_sha256": "9f88a710ef5857cf8f9b53d004b6290e06dcbda7db00cac94bc99e56793f8a09",
+    "profile_sha256": "c6780ef0ed01654e09746adf37f781c32a6f1e28bea9f681650708ab06d658ac",
+    "scope": "Rebased source/CPU-checked implementation and reviewed profile. Model evidence remains on measured 00fd12a/9c0f6d6; no current-pin GPU claim."
+  }
+}
