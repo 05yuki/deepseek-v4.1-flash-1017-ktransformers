@@ -20,7 +20,23 @@ turn on the general radix cache. Keep the usual model, context, KV and host
 memory settings explicit in the deployment profile; this script does not
 claim that four active requests fit every host.
 
-The SGLang patch handles retained row admission when idle sessions hold all
+With the pinned non-speculative defaults and graph padding enabled, four
+running requests resolve to decode graph maximum `4` and batches `[1, 2, 4]`.
+An explicit graph JSON or convenience override takes precedence; use the
+matching `--cuda-graph-max-bs-decode 4 --cuda-graph-bs-decode 1 2 4` values
+if supplying such overrides for this profile.
+
+The opt-in hardware profile also sets `KT_PREFILL_SWA_LEND=0` and
+`KT_KV_HOT_SPARE_FLOOR_MB=3072`. SWA stays resident through session close and
+cache flush, avoiding an upstream clear-order interaction where SWA pages
+are remapped before hot expert loans are released. The larger spare floor
+keeps more GPU memory outside hot-expert lending for continuation workspace.
+This is a profile workaround, not a lender
+fix; flush and cold-replay checks remain required. The ordinary recipe's
+lending defaults and the admission patch's default-off gate are unchanged.
+
+SGLang already provides concurrent scheduling, streaming sessions and queues.
+This patch handles retained row admission when idle sessions hold all
 request-pool rows, evicts the oldest idle row for a fifth row-needing request,
 never evicts an in-flight session, and preserves the running turn's ownership
 when an overlapping turn is rejected. A later continuation of an evicted
@@ -31,10 +47,20 @@ reclaim demand starts at zero and only the selected scheduler path sets it.
 
 Run the CPU-only tests after setup with
 `python -B tools/test_retained_session_admission.py`. These execute the
-relevant methods from the patched source AST with fake rows and no model. The
-old r4 campaign exercised inheritance at 1/2/4, fifth-session eviction,
-overlap rejection, abort/recovery and queued cancellation on an earlier
-source tree. This port has not yet been run end to end on 00fd12a or under
-the eight-node A/B hardware profile. Before enabling it in service, repeat
-those lifecycle cases, explicit FIFO/503 queue limits, and N1/N2/N4
-throughput/quality measurements with a bounded four-request memory profile.
+relevant methods from the patched source AST with fake rows and no model.
+The A5 correctness run on recipe `00fd12a` / SGLang `9c0f6d6`, one SM89 GPU
+and eight NUMA nodes completed three retained turns at N1/N2/N4, fifth-row
+admission with exactly one idle-row eviction, overlap rejection, active and
+queued abort/recovery, FIFO order and HTTP 503 queue limits. It used the
+SWA-off/spare-3072 profile above, four-row decode graphs, and the KV-policy
+source patch with its TTL and HiCache policies disabled. The earlier A4
+SWA-lending profile failed during cache flush and remains failed evidence.
+
+Functional collection is separate from numerical acceptance. A5's exact-history
+retained/cold replays show material probability differences, and its NLL and
+WikiText screening require independent review; no numerical equivalence or
+general quality claim follows from the lifecycle checks. Its request timings
+come from a correctness run with different settings from the canonical
+single-request baseline, so they establish no throughput or speedup claim.
+The current `e8608a2` / SGLang `8b9f724` port has source/CPU checks only;
+the older-pin model results do not establish runtime behavior on this pin.
