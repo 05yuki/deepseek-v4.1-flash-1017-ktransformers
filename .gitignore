@@ -6,6 +6,3 @@
 engram-adapter/librow_store.so
 __pycache__/
 /.cache/
-/tools/sm89_validation/quality-corpus.json
-/evidence/
-/native_evidence/

@@ -36,24 +36,10 @@ jobs:
             grep -q "^$slug:" ../patches/sglang-tier1/requires.txt && continue
             git apply --check --whitespace=nowarn "$f"
           done
-          # Full tier 1, then prove the optional pair in the setup.sh order.
-          for f in ../patches/sglang-tier1/[0-9][0-9]-*.patch; do
+          # all of tier 1 in order, then tier 2
+          for f in ../patches/sglang-tier1/[0-9][0-9]-*.patch ../patches/sglang-tier2-no-p2p.patch; do
             git apply --whitespace=nowarn "$f"
           done
-          for f in ../patches/sglang-optional/01-gpu-glue.patch ../patches/sglang-optional/02-hot-slots.patch; do
-            git apply --check --whitespace=nowarn "$f"
-            git apply --whitespace=nowarn "$f"
-          done
-          # Restore exactly full tier 1, then prove production tier-2-before-optional order.
-          for f in ../patches/sglang-optional/02-hot-slots.patch ../patches/sglang-optional/01-gpu-glue.patch; do
-            git apply -R --whitespace=nowarn "$f"
-          done
-          git apply --whitespace=nowarn ../patches/sglang-tier2-no-p2p.patch
-          for f in ../patches/sglang-optional/01-gpu-glue.patch ../patches/sglang-optional/02-hot-slots.patch; do
-            git apply --check --whitespace=nowarn "$f"
-            git apply --whitespace=nowarn "$f"
-          done
-          git diff --check
 
       - name: SM89 dispatch contracts (CPU only)
         run: python3 tools/test_sm89_dispatch.py sglang
@@ -65,9 +51,8 @@ jobs:
           git checkout -q FETCH_HEAD
           git apply --check --whitespace=nowarn ../patches/kt-kernel-tree.patch
           git apply --whitespace=nowarn ../patches/kt-kernel-tree.patch
-          git apply --check --whitespace=nowarn ../patches/kt-kernel-gpu-glue-only.patch
-          git apply --whitespace=nowarn ../patches/kt-kernel-gpu-glue-only.patch
-          git diff --check
+          git apply --check --whitespace=nowarn ../patches/kt-kernel-cpu-handoff.patch
+          git apply --whitespace=nowarn ../patches/kt-kernel-cpu-handoff.patch
           llama=$(git ls-tree HEAD third_party/llama.cpp | awk '{print $3}')
           git init -q ../llama && cd ../llama
           git fetch -q --depth 1 https://github.com/ggerganov/llama.cpp.git "$llama"
@@ -78,4 +63,6 @@ jobs:
         run: |
           for f in setup.sh serve.sh lib/*.sh tools/*.sh; do bash -n "$f"; done
           python3 -m py_compile tools/*.py lib/*.py engram-adapter/*.py patches/*.py
-          python3 -m unittest discover -s tools -p 'test_hot_glue_setup_selection.py' -v
+
+      - name: CPU/GPU overlap contracts (CPU only)
+        run: python3 tools/test_cpu_gpu_overlap.py sglang

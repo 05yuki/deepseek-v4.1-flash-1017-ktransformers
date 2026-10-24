@@ -7,8 +7,7 @@
 #   engram-adapter/librow_store.so, build/libkv_vmm.so
 #   state/engram-<model>/engram-manifest.json   when MODEL=<checkpoint dir> is given
 #
-# usage: [MODEL=<checkpoint dir>] [TIER=0|1|2] [SGLANG_FEATURES=a,b,...]
-#        [HOT_GLUE_PATCH=0|1] ./setup.sh
+# usage: [MODEL=<checkpoint dir>] [TIER=0|1|2] [SGLANG_FEATURES=a,b,...] ./setup.sh
 #
 # TIER picks how much of this repository's SGLang changes go in, each tier on top of the ones
 # below it (docs/patches.md):
@@ -34,12 +33,6 @@ KT_COMMIT=95009ea6856c0799e517e93cb12be5e8494bc7ce
 TIER="${TIER:-2}"
 [[ "$TIER" =~ ^[012]$ ]] || { echo "TIER must be 0, 1 or 2 (tiers 2 and 3 of before 10-21 are 1 and 2)" >&2; exit 2; }
 SGLANG_FEATURES="${SGLANG_FEATURES:-all}"
-HOT_GLUE_PATCH="${HOT_GLUE_PATCH:-0}"
-[[ "$HOT_GLUE_PATCH" =~ ^[01]$ ]] || { echo "HOT_GLUE_PATCH must be 0 or 1" >&2; exit 2; }
-if [[ "$HOT_GLUE_PATCH" == 1 && ( "$TIER" == 0 || "$SGLANG_FEATURES" != all ) ]]; then
-  echo "HOT_GLUE_PATCH=1 requires TIER=1 or 2 and SGLANG_FEATURES=all" >&2
-  exit 2
-fi
 # the SGLang patches up to TIER, in order (paths under patches/)
 sglang_patches=()
 for f in "$here"/patches/sglang-tier0/[0-9][0-9]-*.patch; do sglang_patches+=("sglang-tier0/$(basename "$f")"); done
@@ -64,10 +57,6 @@ if (( TIER >= 1 )); then
   done < "$here/patches/sglang-tier1/requires.txt"
 fi
 (( TIER >= 2 )) && sglang_patches+=(sglang-tier2-no-p2p.patch)
-if [[ "$HOT_GLUE_PATCH" == 1 ]]; then
-  sglang_patches+=(sglang-optional/01-gpu-glue.patch sglang-optional/02-hot-slots.patch)
-  features+=(gpu-glue)
-fi
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 mkdir -p third_party build state
 step() { printf '\n== %s\n' "$*"; }
@@ -78,7 +67,9 @@ patch_hash() { (cd "$here/patches" && cat "$@") | sha256sum | cut -c1-12; }
 sglang_state="$TIER $(patch_hash "${sglang_patches[@]}")"
 kt_variant=pinned
 kt_patches=(kt-kernel-tree.patch kt-kernel-llama-cpp.patch kt-kernel-load-prefetch.py)
-[[ "$HOT_GLUE_PATCH" == 1 ]] && kt_patches+=(kt-kernel-gpu-glue-only.patch)
+if [[ " ${features[*]} " == *" cpu-gpu-overlap "* ]]; then
+  kt_patches+=(kt-kernel-cpu-handoff.patch)
+fi
 (( TIER >= 1 )) && kt_variant="patched $(patch_hash "${kt_patches[@]}")"
 # a patch is checked against the pinned tree first; nothing is applied when it does not fit
 apply_checked() {
@@ -117,8 +108,8 @@ if ! built_as third_party/ktransformers/.dsv41-1017-patched "$kt_variant"; then
   git -C third_party/ktransformers/third_party/llama.cpp clean -fdq
   if [[ "$kt_variant" == patched* ]]; then
     apply_checked third_party/ktransformers "$here/patches/kt-kernel-tree.patch"
-    if [[ "$HOT_GLUE_PATCH" == 1 ]]; then
-      apply_checked third_party/ktransformers "$here/patches/kt-kernel-gpu-glue-only.patch"
+    if [[ " ${features[*]} " == *" cpu-gpu-overlap "* ]]; then
+      apply_checked third_party/ktransformers "$here/patches/kt-kernel-cpu-handoff.patch"
     fi
     apply_checked third_party/ktransformers/third_party/llama.cpp "$here/patches/kt-kernel-llama-cpp.patch"
   fi
