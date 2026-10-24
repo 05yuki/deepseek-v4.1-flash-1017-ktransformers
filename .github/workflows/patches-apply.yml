@@ -60,3 +60,6 @@ jobs:
         run: |
           for f in setup.sh serve.sh lib/*.sh tools/*.sh; do bash -n "$f"; done
           python3 -m py_compile tools/*.py lib/*.py engram-adapter/*.py patches/*.py
+
+      - name: Dynamic hot launch contracts (CPU only)
+        run: python3 tools/test_dynamic_hot_launch.py sglang
