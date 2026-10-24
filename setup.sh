@@ -66,7 +66,11 @@ built_as() { [[ -f "$1" && "$(cat "$1")" == "$2" ]]; }
 patch_hash() { (cd "$here/patches" && cat "$@") | sha256sum | cut -c1-12; }
 sglang_state="$TIER $(patch_hash "${sglang_patches[@]}")"
 kt_variant=pinned
-(( TIER >= 1 )) && kt_variant="patched $(patch_hash kt-kernel-tree.patch kt-kernel-llama-cpp.patch kt-kernel-load-prefetch.py)"
+kt_patches=(kt-kernel-tree.patch kt-kernel-llama-cpp.patch kt-kernel-load-prefetch.py)
+if [[ " ${features[*]} " == *" cpu-gpu-overlap "* ]]; then
+  kt_patches+=(kt-kernel-cpu-handoff.patch)
+fi
+(( TIER >= 1 )) && kt_variant="patched $(patch_hash "${kt_patches[@]}")"
 # a patch is checked against the pinned tree first; nothing is applied when it does not fit
 apply_checked() {
   local tree="$1" patch="$2"
@@ -104,6 +108,9 @@ if ! built_as third_party/ktransformers/.dsv41-1017-patched "$kt_variant"; then
   git -C third_party/ktransformers/third_party/llama.cpp clean -fdq
   if [[ "$kt_variant" == patched* ]]; then
     apply_checked third_party/ktransformers "$here/patches/kt-kernel-tree.patch"
+    if [[ " ${features[*]} " == *" cpu-gpu-overlap "* ]]; then
+      apply_checked third_party/ktransformers "$here/patches/kt-kernel-cpu-handoff.patch"
+    fi
     apply_checked third_party/ktransformers/third_party/llama.cpp "$here/patches/kt-kernel-llama-cpp.patch"
   fi
   echo "$kt_variant" > third_party/ktransformers/.dsv41-1017-patched

@@ -178,6 +178,14 @@ if [[ "$gpu_experts" != "0" && "${KT_HOT_BACKEND:-marlin}" == "marlin" ]]; then
 fi
 
 # --- kt-kernel and the streamed prefill ---------------------------------------
+# The tier-1 feature keeps independent runtime switches for controlled use.
+if has cpu-gpu-overlap; then
+  export KT_SHARED_AFTER_SUBMIT="${KT_SHARED_AFTER_SUBMIT:-0}"
+  export KT_HANDOFF_PACK="${KT_HANDOFF_PACK:-0}"
+elif [[ "${KT_SHARED_AFTER_SUBMIT:-0}" != 0 || "${KT_HANDOFF_PACK:-0}" != 0 ]]; then
+  echo "KT_SHARED_AFTER_SUBMIT/KT_HANDOFF_PACK require the cpu-gpu-overlap tier-1 feature" >&2
+  exit 3
+fi
 export KT_STREAM_MEMOPS="${KT_STREAM_MEMOPS:-1}"
 export KT_TASKQUEUE_SPIN_US="${KT_TASKQUEUE_SPIN_US:-300}"
 export KT_MXFP4_BACKEND="${KT_MXFP4_BACKEND:-avx2}"

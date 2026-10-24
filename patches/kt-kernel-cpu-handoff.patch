@@ -1,0 +1,61 @@
+diff --git a/kt-kernel/python/experts_base.py b/kt-kernel/python/experts_base.py
+--- a/kt-kernel/python/experts_base.py
++++ b/kt-kernel/python/experts_base.py
+@@ -387,6 +387,7 @@
+         topk_ids: torch.Tensor,
+         topk_weights: torch.Tensor,
+         cuda_stream,
++        packer=None,
+     ):
+         """
+         Submit forward inference task to CPU (non-blocking).
+@@ -415,20 +416,35 @@
+ 
+         bsz_slot_tensor = bsz_tensor_cpu[current_slot]
+ 
+-        topk_ids_long = topk_ids.to(torch.long)
+-        immediate_ids: torch.Tensor
+-        deferred_ids: Optional[torch.Tensor]
+-        if self.max_deferred_experts_per_token > 0:
+-            protected_k = self.num_experts_per_tok - self.max_deferred_experts_per_token
+-
+-            immediate_ids, deferred_ids = self.select_deferred_experts(topk_ids_long, topk_weights, protected_k)
+-        else:
+-            immediate_ids = topk_ids_long
+-            deferred_ids = None
+-
+-        input_tensor_cpu[current_slot].copy_(flat_hidden_states, non_blocking=True)
+-        weights_cpu[current_slot].copy_(topk_weights, non_blocking=True)
+-        immediate_experts_ids_cpu[current_slot].copy_(immediate_ids, non_blocking=True)
++        # packer(x, weights, ids, host_x, host_w, host_ids) -> bool (KT_HANDOFF_PACK in
++        # SGLang): stages all three into the pinned buffers at once; False = the copies.
++        packed = bool(
++            packer is not None
++            and self.max_deferred_experts_per_token <= 0
++            and packer(
++                flat_hidden_states,
++                topk_weights,
++                topk_ids,
++                input_tensor_cpu[current_slot],
++                weights_cpu[current_slot],
++                immediate_experts_ids_cpu[current_slot],
++            )
++        )
++        deferred_ids: Optional[torch.Tensor] = None
++        if not packed:
++            topk_ids_long = topk_ids.to(torch.long)
++            immediate_ids: torch.Tensor
++            if self.max_deferred_experts_per_token > 0:
++                protected_k = self.num_experts_per_tok - self.max_deferred_experts_per_token
++
++                immediate_ids, deferred_ids = self.select_deferred_experts(topk_ids_long, topk_weights, protected_k)
++            else:
++                immediate_ids = topk_ids_long
++                deferred_ids = None
++
++            input_tensor_cpu[current_slot].copy_(flat_hidden_states, non_blocking=True)
++            weights_cpu[current_slot].copy_(topk_weights, non_blocking=True)
++            immediate_experts_ids_cpu[current_slot].copy_(immediate_ids, non_blocking=True)
+ 
+         incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
+         self.cpu_infer.submit_with_cuda_stream(

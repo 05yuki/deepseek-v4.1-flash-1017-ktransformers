@@ -50,6 +50,9 @@ jobs:
           git fetch -q --depth 1 https://github.com/kvcache-ai/ktransformers.git "$KT_COMMIT"
           git checkout -q FETCH_HEAD
           git apply --check --whitespace=nowarn ../patches/kt-kernel-tree.patch
+          git apply --whitespace=nowarn ../patches/kt-kernel-tree.patch
+          git apply --check --whitespace=nowarn ../patches/kt-kernel-cpu-handoff.patch
+          git apply --whitespace=nowarn ../patches/kt-kernel-cpu-handoff.patch
           llama=$(git ls-tree HEAD third_party/llama.cpp | awk '{print $3}')
           git init -q ../llama && cd ../llama
           git fetch -q --depth 1 https://github.com/ggerganov/llama.cpp.git "$llama"
@@ -60,3 +63,6 @@ jobs:
         run: |
           for f in setup.sh serve.sh lib/*.sh tools/*.sh; do bash -n "$f"; done
           python3 -m py_compile tools/*.py lib/*.py engram-adapter/*.py patches/*.py
+
+      - name: CPU/GPU overlap contracts (CPU only)
+        run: python3 tools/test_cpu_gpu_overlap.py sglang
