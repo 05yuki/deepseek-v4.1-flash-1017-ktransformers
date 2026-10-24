@@ -56,11 +56,20 @@ SWA-off/spare-3072 profile above, four-row decode graphs, and the KV-policy
 source patch with its TTL and HiCache policies disabled. The earlier A4
 SWA-lending profile failed during cache flush and remains failed evidence.
 
-Functional collection is separate from numerical acceptance. A5's exact-history
-retained/cold replays show material probability differences, and its NLL and
-WikiText screening require independent review; no numerical equivalence or
-general quality claim follows from the lifecycle checks. Its request timings
-come from a correctness run with different settings from the canonical
-single-request baseline, so they establish no throughput or speedup claim.
+The functional, numerical, source/resource and fixed-history reference reviews
+are complete. Across 24 pieces (11,496 scored positions), A5 minus the checkpoint
+reference is **+0.0098927643 nats/token**, with piece-level SE **0.0050181971**.
+One of seven retained/cold replay rows (six distinct histories) changes its
+selected token. Material probability changes also occur with unchanged winners,
+including the separate 18-token recovery witness. These completed descriptive
+checks establish neither numerical equivalence nor general quality or production
+readiness. The fixed-history reference covers one candidate pair, not every
+replay or incremental-session execution.
+
+[Reviewed experimental A5 results and compact evidence](https://github.com/howl9003/deepseek-v4.1-flash-1017-ktransformers/blob/3f36082fc3021998d2a6a1e588b11f94050cbcf6/docs/benchmarks/retained-session-00fd12a-20261024/RESULTS.md)
+preserve every replay, the independent reference, NLL/WikiText screening,
+prior failure, exact hardware/profile and cleanup limits. Request timings come
+from a correctness run with different settings from the canonical single-request
+baseline, so they establish no isolated throughput or speedup claim.
 The current `e8608a2` / SGLang `8b9f724` port has source/CPU checks only;
 the older-pin model results do not establish runtime behavior on this pin.
