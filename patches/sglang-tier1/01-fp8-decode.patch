@@ -1,4 +1,4 @@
-From 9650f4ad59adadd432c1f50432dbf3dc62ea2243 Mon Sep 17 00:00:00 2001
+From ccf4c5a28dd049c56a9618db9674cb6f9e6fac00 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 22:56:28 +0900
 Subject: [PATCH] [tier 1] fp8-decode: block-FP8 GEMV and split-K for

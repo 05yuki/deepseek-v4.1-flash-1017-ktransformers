@@ -1,4 +1,4 @@
-From 47c5e88cfbdc2766cb94f4081ccf36b52b27483c Mon Sep 17 00:00:00 2001
+From 6a6243a2f194497e734050e1ea50301c3329a880 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Thu, 22 Oct 2026 23:30:00 +0900
 Subject: [PATCH] [tier 0] kt: scale the routed output once when the top-k
@@ -15,7 +15,7 @@ checkpoint's own inference code: 2.878 before, 2.596 after (reference 2.594).
  1 file changed, 12 insertions(+), 2 deletions(-)
 
 diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
-index 60c7f4a27f..7b5627540c 100644
+index 9d77d00278..1cb177cd0f 100644
 --- a/python/sglang/srt/models/deepseek_v2.py
 +++ b/python/sglang/srt/models/deepseek_v2.py
 @@ -1233,7 +1233,12 @@ class DeepseekV2MoE(nn.Module):

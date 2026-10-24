@@ -55,6 +55,9 @@ jobs:
           done
           git diff --check
 
+      - name: SM89 dispatch contracts (CPU only)
+        run: python3 tools/test_sm89_dispatch.py sglang
+
       - name: ktransformers and its llama.cpp
         run: |
           git init -q kt && cd kt

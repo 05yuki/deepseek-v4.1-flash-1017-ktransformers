@@ -1,4 +1,4 @@
-From 8db916757e808e6d36de4b296a04a2c24faf881e Mon Sep 17 00:00:00 2001
+From c4ed809f0116120ef324d9c5521412f9863ecef5 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] [tier 1] thinking-default-parser: reasoning parser falls back
@@ -22,10 +22,10 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  1 file changed, 6 insertions(+), 4 deletions(-)
 
 diff --git a/python/sglang/srt/entrypoints/openai/serving_chat.py b/python/sglang/srt/entrypoints/openai/serving_chat.py
-index abc9b199ab..2b9ea28618 100644
+index adbe82845a..29df36c43a 100644
 --- a/python/sglang/srt/entrypoints/openai/serving_chat.py
 +++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
-@@ -3068,10 +3068,12 @@ class OpenAIServingChat(OpenAIServingBase):
+@@ -2990,10 +2990,12 @@ class OpenAIServingChat(OpenAIServingBase):
                  )
              if mode in ("explicit_thinking", "explicit_enable_thinking"):
                  toggle = mode.replace("explicit_", "")

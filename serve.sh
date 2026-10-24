@@ -59,11 +59,19 @@ fi
 n_gpus="${#gpus[@]}"
 tp="${KT_TP:-$n_gpus}"
 cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i "${gpus[0]}" | head -1)"
-# DeepSeek-V4's attention in this SGLang is written for SM90 and newer: older GPUs stop at
-# the first forward, after minutes of loading
-if [[ "${cap%%.*}" =~ ^[0-9]+$ ]] && (( ${cap%%.*} < 9 )); then
-  echo "GPU ${gpus[0]} is compute capability $cap: DeepSeek-V4's attention needs 9.0 or newer (H100, B200, RTX 50, RTX PRO Blackwell)" >&2
+# Tier 0 supplies a portable Triton attention fallback for Ada (SM89).
+# Other pre-Hopper architectures remain unsupported; do not load the model first.
+if [[ "$cap" != "8.9" && "${cap%%.*}" =~ ^[0-9]+$ ]] && (( ${cap%%.*} < 9 )); then
+  echo "GPU ${gpus[0]} is compute capability $cap: attention needs SM89 (Ada) or SM90+" >&2
   exit 3
+fi
+if [[ "$cap" == "8.9" ]]; then
+  # Ada uses the portable indexer and mHC paths as well as sparse attention.
+  # The DeepGEMM and TileLang alternatives require newer GPU architectures.
+  export SGLANG_OPT_USE_TOPK_V2="${SGLANG_OPT_USE_TOPK_V2:-0}"
+  export SGLANG_OPT_USE_TILELANG_MHC_PRE="${SGLANG_OPT_USE_TILELANG_MHC_PRE:-0}"
+  export SGLANG_OPT_DEEPGEMM_HC_PRENORM="${SGLANG_OPT_DEEPGEMM_HC_PRENORM:-0}"
+  export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH="${SGLANG_FP8_PAGED_MQA_LOGITS_TORCH:-1}"
 fi
 n_nodes="$(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l)"
 (( n_nodes > 0 )) || n_nodes=1

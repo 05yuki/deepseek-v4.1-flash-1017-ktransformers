@@ -1,4 +1,4 @@
-From 1856388e780fa2755739a4bceef2e610f0ec28f0 Mon Sep 17 00:00:00 2001
+From f58f44ac89c2c761e6616ec5c9bba1a5531136cf Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 23 Oct 2026 09:15:04 +0900
 Subject: [PATCH] [tier 0] deepseek-v4.1: size the KV pool by the ratio-1/2

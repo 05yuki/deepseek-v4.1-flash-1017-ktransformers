@@ -1,4 +1,4 @@
-From 6bb383bdaf5a1e4823b6f002af1c1efa5f48eda9 Mon Sep 17 00:00:00 2001
+From 49326a3ba55e0ed0ec0be930aa73ff69d7f51982 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 23 Oct 2026 00:40:00 +0900
 Subject: [PATCH] [tier 0] deepseek-v4.1: the V4.1 KV cache layouts on SM120 /
@@ -33,8 +33,8 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
  .../kernels/ops/attention/flash_mla_sm120.py  | 90 +++++++++++++++++++
  python/sglang/srt/environ.py                  |  2 +
- .../srt/mem_cache/deepseek_v4_memory_pool.py  | 13 ++-
- 3 files changed, 104 insertions(+), 1 deletion(-)
+ .../srt/mem_cache/deepseek_v4_memory_pool.py  | 19 +++-
+ 3 files changed, 109 insertions(+), 2 deletions(-)
 
 diff --git a/python/sglang/kernels/ops/attention/flash_mla_sm120.py b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
 index c57194d3c5..1ec816c7a9 100644
@@ -145,10 +145,10 @@ index c57194d3c5..1ec816c7a9 100644
      q,
      k_cache,
 diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
-index 10f20eb799..e3129a5968 100644
+index be871c7251..474f987cc2 100644
 --- a/python/sglang/srt/environ.py
 +++ b/python/sglang/srt/environ.py
-@@ -1679,6 +1679,8 @@ class Envs:
+@@ -1721,6 +1721,8 @@ class Envs:
      # Compressed-cache layout under "v41": "auto" (fp4 for the fp4-rounded
      # ratio-1 / ratio-2 latents, fp8 for ratios 4 / 128), "fp8" or "fp4" for all.
      SGLANG_DSV4_COMPRESSED_KV_LAYOUT = EnvStr("auto")
@@ -158,11 +158,11 @@ index 10f20eb799..e3129a5968 100644
      # bf16 rope pool, 640 B/token instead of 1024. The unified pool takes no
      # dtype, so --kv-cache-dtype has no effect there and this switch is the
 diff --git a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
-index 9f6f404018..522a38cace 100644
+index bc8f19fa2f..f7a5d41dcc 100644
 --- a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
 +++ b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
-@@ -229,9 +229,20 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
-                 "V4.1 KV layouts on HIP require gfx950 with aiter_sparse attention"
+@@ -228,10 +228,25 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
+                 "which reads the block-split v41 layout"
              )
          return KVLayout.V41, option
 +    # SM120 / SM121 read the V4.1 layouts through FlashInfer's SM120 sparse MLA
@@ -176,10 +176,16 @@ index 9f6f404018..522a38cace 100644
      if mode == "auto" and not is_sm100:
          return KVLayout.V4, None
 -    assert is_sm100, "the V4.1 KV cache layouts need an SM100 / SM103 GPU"
+-    return (KVLayout.V41_NEW if mode == "v41_new" else KVLayout.V41), option
++    if mode == "v41_new":
++        # the token-interleaved layout is read by SM100 / SM103 FlashMLA only
++        assert is_sm100, "the v41_new KV cache layout needs an SM100 / SM103 GPU"
++        return KVLayout.V41_NEW, option
 +    assert is_sm100 or is_sm12x_flashinfer, (
 +        "the V4.1 KV cache layouts need an SM100 / SM103 GPU, or SM120 / SM121 "
 +        "with SGLANG_SM120_FLASHMLA_BACKEND=flashinfer"
 +    )
-     return KVLayout.V41, option
++    return KVLayout.V41, option
  
  
+ class DeepSeekV4SingleKVPool(KVCache):
