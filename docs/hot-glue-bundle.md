@@ -1,7 +1,9 @@
 # Optional GPU glue and hot slots
 
 This bundle adds the candidate's GPU-side glue, CPU handoff poller, service-core
-affinity, and dynamic hot-slot machinery to the `00fd12a` recipe. It is a separate
+affinity, and dynamic hot-slot machinery to the current serving recipe. This
+integration is based on recipe `e8608a224c108c06c8dbe636bf0bfef295e82161`, with
+SGLang `8b9f72417fa85a04de6193b0a52f4cec63370d77`. It is a separate
 patch stack on top of the common SM89/base serving changes. The source bundle is
 off by default: `setup.sh` applies it only with `HOT_GLUE_PATCH=1`, and `serve.sh`
 activates the glue only with `KT_GPU_GLUE=1`. The tested source selection is
@@ -13,7 +15,8 @@ then `02-hot-slots.patch`, plus `patches/kt-kernel-gpu-glue-only.patch`. The nat
 patch leaves the already-common physical-NUMA `worker_pool.cpp` fix alone. The
 bundle does not include the temporary preferred-memory-policy experiment: the
 strict original native policy is common to both arms. `tools/glue/SOURCE_PINS.json`
-records the ten selected SGLang files and three native files from the B runtime;
+records the ten selected SGLang files and three native files from the measured
+`00fd12a` / `9c0f6d6` B runtime;
 `verify_source_bundle.py` checks all thirteen hashes. Its native comparison
 expects the common measured host-NUMA adapter described below, in addition to
 the optional B patch; the adapter is not applied by this draft's setup selector.
@@ -40,12 +43,29 @@ the same common checkpoint, GGUF, placement, SM89 host adapters, and benchmark
 scope settings as A. The profile alone is not a full replacement for those shared
 inputs or for the reviewed A/B launch controller.
 
-To check the source on an already-built candidate tree:
+To compare an already-built historical measured candidate with those source pins:
 
 ```bash
 python tools/glue/verify_source_bundle.py \
   --sglang third_party/sglang --kt third_party/ktransformers
 ```
+
+The historical source-pin verifier is not an equality gate for a newer upstream
+tree. In this integration, upstream changes alter `v41_indexer/scoring.py` and
+`models/deepseek_v2.py`; the other eight selected SGLang hashes still match.
+The historical pins and evidence stay unchanged.
+
+## Current-pin source and CPU checks
+
+The four bundle commits rebase cleanly onto the base above. The optional source
+patches, native patch, runtime gates and measured profile remain unchanged.
+Fresh reconstruction of 46 authenticated upstream patch-target files passes full
+tier 1 and both tier-2/optional-patch orders. The resulting 64/66 Python files
+parse. These are partial source reconstructions, not a complete upstream build.
+The SM89 dispatch, setup-selection, runtime-gate and service-affinity suites run
+54 CPU tests, with one Linux-only thread test skipped on Windows. Shell syntax
+checks pass. No native build, Triton/GPU kernel or model run was performed on the
+new pin; the model measurements below retain their original source identities.
 
 ## Completed single-request comparison
 
@@ -105,5 +125,5 @@ and strict policy. It handles sparse/reordered physical IDs safely. The
 separate this common host adaptation from the optional B delta and record the
 measured wheel/source identities. No byte-identical fresh-toolchain build is claimed.
 The measurements above remain tied to `00fd12a` / `9c0f6d6`; merging or applying
-the draft on newer upstream `d7f187` / `8b9f724` is a separate CPU/source check,
+the draft on newer upstream `e8608a2` / `8b9f724` is a separate CPU/source check,
 not a full-model numerical or performance result on that newer pin.
