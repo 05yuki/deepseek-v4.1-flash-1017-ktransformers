@@ -269,10 +269,10 @@ Prefill, one prompt of random token ids:
 
 | prompt (tokens) | tok/s | time |
 |---|---|---|
-| 35,000 | 1,301 | 27 s |
-| 131,072 | 1,515 | 1.4 min |
-| 524,288 | 1,209 | 7.2 min |
-| 1,000,000 | 943 | 18 min |
+| 35,000 | 1,254 | 28 s |
+| 131,072 | 1,447 | 1.5 min |
+| 524,288 | 1,137 | 7.7 min |
+| 1,000,000 | 871 | 19 min |
 
 Longer prompts run in smaller chunks: the prompt's own KV and the attention's working
 memory grow with its length, leaving less GPU memory for a chunk, and every chunk streams
