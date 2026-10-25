@@ -96,7 +96,23 @@ output is bit-identical.
 
 ### Chat encoding (dropped)
 
-SGLang main renders DeepSeek-V4/V4.1 chat prompts through DeepSeek's own `deepseek-recipe` package since #45315 (2026-10-23) and removed `encoding_dsv41.py`; version 0.2.0 has the tool namespaces (`with_namespace_tool_map`), so this patch is gone. `tools/dsv41-encoding-check.py` still imports the removed file and will be reworked against the recipe path.
+SGLang main renders DeepSeek-V4/V4.1 chat prompts through DeepSeek's own `deepseek-recipe` package
+(0.2.0) since #45315 (2026-10-23) and removed `encoding_dsv41.py`, so this patch is gone and the
+recipe follows main there. `tools/dsv41-recipe-check.py` compares what that path renders with the
+checkpoint's `encoding/encoding.py`, token for token, on the reference's own cases and on the
+scenarios this patch covered. On 2026-10-25 (main 65633129, deepseek-recipe 0.2.0) the plain cases
+match and three things differ, all inside the package's rendering:
+
+- tool namespaces are ignored: a tool with `"namespace": {"name": "search"}` renders as `lookup`
+  where the reference renders `search::lookup`, and same-named tools in different namespaces are
+  refused ("Tool names must be unique");
+- the current turn's reasoning before tool results is dropped: for `assistant(reasoning, tool_calls)`
+  + `tool` the reference keeps `<think>r2</think>`, the package renders `</think>` only;
+- an assistant message's `action` does not render as `<｜action｜>`.
+
+The package also validates requests more strictly (an `id` on every history tool call, a
+`tool_call_id` on every tool message, one `image_url` shape). Reported upstream; the old
+`tools/dsv41-encoding-check.py` (against the removed encoder) is kept for trees before #45315.
 
 
 `entrypoints/openai/encoding_dsv41.py`, `entrypoints/openai/protocol.py`,
