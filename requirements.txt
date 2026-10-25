@@ -209,3 +209,4 @@ xxhash==4.0.2
 yarl==1.25.1
 z3-solver==4.15.4.0
 zstandard==0.25.0
+deepseek-recipe==0.2.0  # DeepSeek's reference chat encoder; SGLang main renders DeepSeek-V4.1 prompts through it (#45315)
