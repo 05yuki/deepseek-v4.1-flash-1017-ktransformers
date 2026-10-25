@@ -230,6 +230,10 @@ def install(module):
             self.row_start = num_embeddings * rank // self.tp_size
             end = num_embeddings * (rank + 1) // self.tp_size
         self.rows, self.host_table = end - self.row_start, None
+        # SGLang main since #46180 reads rows from peer device shards at TP > 1 (finish_load connects
+        # them, forward asserts them ready); the adapter owns its rows itself, so no peer
+        self.peer = None
+        self._sort_host_reads, self.staged_by_scheduler = False, False
 
         table_dir = Path(os.environ["DSV41_ENGRAM_DIR"])
         name = os.environ.get("DSV41_ENGRAM_MANIFEST", "engram-manifest.json")
