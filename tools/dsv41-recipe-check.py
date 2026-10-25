@@ -57,8 +57,18 @@ def ref_ids(prompt: str):
     return tok.encode(prompt, add_special_tokens=False)
 
 
+def with_ids(messages):
+    """recipe's request adapter requires an id on every history tool call (the reference does not); clients
+    always send one, so both sides get the same ids."""
+    messages = copy.deepcopy(messages)
+    for m in messages:
+        for k, call in enumerate(m.get("tool_calls") or []):
+            call.setdefault("id", f"call_{k}")
+    return messages
+
+
 def sgl_ids(messages, tools=None, thinking=False, reasoning_effort=None):
-    body = {"messages": copy.deepcopy(messages), "thinking": thinking}
+    body = {"messages": with_ids(messages), "thinking": thinking}
     if tools:
         body["tools"] = copy.deepcopy(tools)
     if reasoning_effort is not None:
@@ -95,6 +105,7 @@ for inp in sorted(TESTS.glob("test_input_*.json"), key=lambda p: int(p.stem.spli
     n = inp.stem.split("_")[-1]
     case = REF.load_cases(str(inp))[0]
     mode = case.get("thinking_mode") or "chat"
+    case["messages"] = with_ids(case["messages"])
     ref_prompt, _ = REF.encode_case(case, thinking_mode=mode)
     golden = TESTS / f"test_output_{n}.txt"
     if golden.exists():
@@ -120,7 +131,7 @@ def make_tool_call_messages():
 def both(name, messages, tools=None, thinking=False):
     """The reference's prompt for a system message carrying the tools, SGLang's for a body carrying them."""
     sys_msgs = ([{"role": "system", "content": "system", "tools": tools}] if tools else []) + messages
-    r = outcome(lambda: ref_ids(REF.encode_messages(copy.deepcopy(sys_msgs), thinking_mode="thinking" if thinking else "chat")))
+    r = outcome(lambda: ref_ids(REF.encode_messages(with_ids(sys_msgs), thinking_mode="thinking" if thinking else "chat")))
     s = outcome(lambda: sgl_ids(([{"role": "system", "content": "system"}] if tools else []) + messages, tools, thinking))
     record("namespace", name, r, s)
 
@@ -161,10 +172,10 @@ DROP = [
     {"role": "tool", "tool_call_id": "c1", "content": "value"},
 ]
 record("thinking", "tool results keep the current turn's reasoning",
-       outcome(lambda: ref_ids(REF.encode_messages(copy.deepcopy(DROP), thinking_mode="thinking", drop_thinking=True))),
+       outcome(lambda: ref_ids(REF.encode_messages(with_ids(DROP), thinking_mode="thinking", drop_thinking=True))),
        outcome(lambda: sgl_ids(DROP, None, True)))
 record("thinking", "the next user turn drops it",
-       outcome(lambda: ref_ids(REF.encode_messages(copy.deepcopy(DROP) + [{"role": "user", "content": "q3"}], thinking_mode="thinking"))),
+       outcome(lambda: ref_ids(REF.encode_messages(with_ids(DROP) + [{"role": "user", "content": "q3"}], thinking_mode="thinking"))),
        outcome(lambda: sgl_ids(DROP + [{"role": "user", "content": "q3"}], None, True)))
 
 # ---------------------------------------------------------------- verdict
