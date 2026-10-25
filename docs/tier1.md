@@ -77,6 +77,7 @@ after launch pays a one-time warm-up; the second is a new 35,000-token prompt on
 | `kv-vmm`, `kv-lend-plan` | 43.9 | 24.5 | 18.4 | 2.69 |
 | `kv-vmm`, `kv-lend-plan`, `hot-lend` | 44.4 | 24.8 | 19.2 | 2.66 |
 | all sixteen | 41.5 | 21.0 | 46.2 | 4.24 |
+| `cpu-gpu-overlap` (`KT_SHARED_AFTER_SUBMIT`, `KT_HANDOFF_PACK`; both default off) | unchanged | unchanged | TP1 31.5/31.6 off → 32.8 shared / 32.0 pack / 32.7 both ([05yuki, earlier bundle](https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers/pull/5#issuecomment-6378935104)) | not measured |
 
 Numerics: the 2-token NLL check gives the base's value for every patch above but four.
 `fp8-decode` and `gpu-moe-fp32` change the GPU arithmetic (see their Numerics lines), and
