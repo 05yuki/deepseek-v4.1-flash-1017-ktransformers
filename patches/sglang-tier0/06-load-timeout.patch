@@ -1,8 +1,8 @@
-From 985a47236d0c41f8591f676054ca0476be88ef49 Mon Sep 17 00:00:00 2001
+From 9d2578e637d6576bd3e9525fb2ca34e5553aaf59 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:33 +0900
-Subject: [PATCH] [tier 0] model-loader: make the unbalanced load barrier
- timeout configurable
+Subject: [PATCH] model-loader: make the unbalanced load barrier timeout
+ configurable
 
 With KTransformers the ranks load very different amounts (rank 0 also
 loads the CPU experts), and the fixed 480 s barrier fails a TP2 launch

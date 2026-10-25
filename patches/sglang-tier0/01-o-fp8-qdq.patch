@@ -1,8 +1,8 @@
-From 450714b3718668a25e8e72efb2fa2e45e9dd83ea Mon Sep 17 00:00:00 2001
+From c2f0b30a51820f8c82039ad32ae6c490d992842e Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:32 +0900
-Subject: [PATCH] [tier 0] deepseek-v4: FP8 quantize-dequantize of the
- attention output before wo_a (1017)
+Subject: [PATCH] deepseek-v4: FP8 quantize-dequantize of the attention output
+ before wo_a (1017)
 
 DeepSeek-V4.1-Flash-1017's reference code rounds the attention output o
 to FP8 (blocks of 32 along each group's row, power-of-two scales) and
@@ -132,11 +132,11 @@ index 0000000000..3a062ae805
 +    v = (f / s).clamp(-448.0, 448.0)
 +    return (v.to(torch.float8_e4m3fn).float() * s).to(x.dtype).reshape(shape)
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index f880594602..268d2e46b4 100644
+index 76473c12bc..3c346a3bef 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -461,6 +461,17 @@ def _fused_wo_a_arch_supported() -> bool:
-     return _is_cuda and torch.cuda.get_device_capability()[0] == 10
+@@ -474,6 +474,17 @@ def _wo_a_bf16_bmm_token_major(o: torch.Tensor, wo_a: torch.Tensor) -> torch.Ten
+     return result
  
  
 +def _o_fp8_qdq_block() -> int:
@@ -153,7 +153,7 @@ index f880594602..268d2e46b4 100644
  def _apply_wo_a_bf16_matmul(
      o: torch.Tensor,
      wo_a: torch.Tensor,
-@@ -2927,6 +2938,10 @@ class MQALayer(MqaAttentionBase):
+@@ -2987,6 +2998,10 @@ class MQALayer(MqaAttentionBase):
                      recipe=recipe,
                  )
              else:
@@ -165,7 +165,7 @@ index f880594602..268d2e46b4 100644
                  if wo_a_weight is not None:
                      if (
 diff --git a/python/sglang/srt/models/deepseek_v4_dspark.py b/python/sglang/srt/models/deepseek_v4_dspark.py
-index ed763a9566..92069d844e 100644
+index 9703af5897..0b6f2d73ee 100644
 --- a/python/sglang/srt/models/deepseek_v4_dspark.py
 +++ b/python/sglang/srt/models/deepseek_v4_dspark.py
 @@ -368,6 +368,14 @@ class DSparkAttention(MqaAttentionBase):

@@ -1,8 +1,7 @@
-From 49326a3ba55e0ed0ec0be930aa73ff69d7f51982 Mon Sep 17 00:00:00 2001
+From 430e620708a1ce56b1a273c97d666d8b258aab1c Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 23 Oct 2026 00:40:00 +0900
-Subject: [PATCH] [tier 0] deepseek-v4.1: the V4.1 KV cache layouts on SM120 /
- SM121
+Subject: [PATCH] deepseek-v4.1: the V4.1 KV cache layouts on SM120 / SM121
 
 DeepSeek-V4.1 defines its SWA KV as all 512 values (RoPE included) in e4m3
 blocks of 32 with UE8M0 scales, and its ratio-1/2 compressed KV in e2m1 blocks
@@ -145,10 +144,10 @@ index c57194d3c5..1ec816c7a9 100644
      q,
      k_cache,
 diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
-index be871c7251..474f987cc2 100644
+index 9e99baa592..0389b82e52 100644
 --- a/python/sglang/srt/environ.py
 +++ b/python/sglang/srt/environ.py
-@@ -1721,6 +1721,8 @@ class Envs:
+@@ -1735,6 +1735,8 @@ class Envs:
      # Compressed-cache layout under "v41": "auto" (fp4 for the fp4-rounded
      # ratio-1 / ratio-2 latents, fp8 for ratios 4 / 128), "fp8" or "fp4" for all.
      SGLANG_DSV4_COMPRESSED_KV_LAYOUT = EnvStr("auto")

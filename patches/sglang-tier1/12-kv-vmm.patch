@@ -1,7 +1,7 @@
-From f4fbae29efb371f1ebd0abaf35c7393d1a15a6d4 Mon Sep 17 00:00:00 2001
+From 98c21fd7bfe1a8aa4d18bd72d2af5862a17c2793 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
-Subject: [PATCH] [tier 1] kv-vmm: the KV pool on remappable memory (CUDA VMM)
+Subject: [PATCH] kv-vmm: the KV pool on remappable memory (CUDA VMM)
 
 `KT_KV_VMM=1` puts the KV pool on memory whose physical pages can be
 unmapped and mapped again while the addresses, and the CUDA graphs that

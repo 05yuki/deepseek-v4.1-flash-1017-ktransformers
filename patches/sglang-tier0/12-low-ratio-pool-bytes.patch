@@ -1,8 +1,8 @@
-From f58f44ac89c2c761e6616ec5c9bba1a5531136cf Mon Sep 17 00:00:00 2001
+From 4b1a4c672b1320688dc46ed24eb46fded8c8e52f Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 23 Oct 2026 09:15:04 +0900
-Subject: [PATCH] [tier 0] deepseek-v4.1: size the KV pool by the ratio-1/2
- layout's own entry bytes
+Subject: [PATCH] deepseek-v4.1: size the KV pool by the ratio-1/2 layout's own
+ entry bytes
 
 The pool configurator priced a ratio-1/2 compressed KV entry at kv_bytes,
 the 584 bytes of a V4 FlashMLA slot, whatever layout the pool is built

@@ -1,8 +1,8 @@
-From 64d79cefaecd3b2ba9ce2273949a299225bdde50 Mon Sep 17 00:00:00 2001
+From b56c2e2b3f4e3bed07c857ff2aeaae726cc61a74 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
-Subject: [PATCH] [tier 1] placement: a routing dump to build a placement from
- a workload
+Subject: [PATCH] placement: a routing dump to build a placement from a
+ workload
 
 `KT_ROUTING_DUMP=<prefix>` saves a per-layer histogram of the routed
 physical ids every 30 s (a captured `index_add_`, so it counts under
@@ -23,7 +23,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  1 file changed, 45 insertions(+)
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index e48a5cf824..ee135a2f77 100644
+index acfc8aeda4..0c17adfea6 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -151,7 +151,36 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
@@ -63,7 +63,7 @@ index e48a5cf824..ee135a2f77 100644
  
  
  def _kt_swiglu_kwargs(layer: torch.nn.Module) -> dict:
-@@ -380,6 +409,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -383,6 +412,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          # attributes, not unpacking: the packed variant carries a fourth field
          topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
  
@@ -75,7 +75,7 @@ index e48a5cf824..ee135a2f77 100644
          # Submit forward task to CPU (non-blocking)
          self.wrapper.submit_forward(
              x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
-@@ -427,6 +461,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -436,6 +470,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
  
          x = dispatch_output.hidden_states
          topk_output = dispatch_output.topk_output

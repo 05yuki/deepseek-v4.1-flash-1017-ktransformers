@@ -1,8 +1,8 @@
-From 56101ab9b163aefa6c3937b36fe3340bbbdbab27 Mon Sep 17 00:00:00 2001
+From 0c621543d2e5fdbedfe2b87e3c852a5cc18b5a13 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
-Subject: [PATCH] [tier 1] prefill-lend: lend the GPU-resident weights' memory
- to a streamed prefill
+Subject: [PATCH] prefill-lend: lend the GPU-resident weights' memory to a
+ streamed prefill
 
 `KT_PREFILL_LEND=1`: during a streamed prefill the GPU-resident weights
 give their memory to the prefill's scratch and come back layer by layer,
@@ -1692,10 +1692,10 @@ index 0000000000..776077ca55
 +        _bounce["n"] = nbytes
 +    return _bounce["buf"][:nbytes]
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 1831160646..d31cf7da06 100644
+index 86947616f2..48ed4fe0a6 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -6089,6 +6089,11 @@ class Scheduler(
+@@ -6126,6 +6126,11 @@ class Scheduler(
  
  
  def dispatch_event_loop(scheduler: Scheduler):
@@ -1708,10 +1708,10 @@ index 1831160646..d31cf7da06 100644
          return role_switch.run_event_loop_supervisor(
              scheduler,
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 1b318682ba..db5d0bc7d4 100644
+index 8fb7751cb5..212f64bb46 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -1859,6 +1859,11 @@ class ModelRunner:
+@@ -1861,6 +1861,11 @@ class ModelRunner:
                  forward_batch,
              ) as recorder_outputs,
          ):
@@ -1724,10 +1724,10 @@ index 1b318682ba..db5d0bc7d4 100644
                  forward_batch,
                  pp_proxy_tensors,
 diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
-index 711af8a86b..4b7afbd023 100644
+index edda2a7618..1512ca4334 100644
 --- a/python/sglang/srt/model_loader/loader.py
 +++ b/python/sglang/srt/model_loader/loader.py
-@@ -307,6 +307,10 @@ def _initialize_model(
+@@ -309,6 +309,10 @@ def _initialize_model(
          model = model_class(**kwargs)
          check_stage_producers(model)
      model.shared_experts_config = shared_experts
@@ -1738,7 +1738,7 @@ index 711af8a86b..4b7afbd023 100644
      return model
  
  
-@@ -1085,6 +1089,14 @@ class DefaultModelLoader(BaseModelLoader):
+@@ -1087,6 +1091,14 @@ class DefaultModelLoader(BaseModelLoader):
              # parameters onto device for processing and back off after.
              with device_loading_context(module, target_device):
                  quant_method.process_weights_after_loading(module)
@@ -1754,10 +1754,10 @@ index 711af8a86b..4b7afbd023 100644
      @staticmethod
      def restore_weights_before_loading(model, target_device):
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index aeefcd1114..cf7a2549d8 100644
+index afd8a11427..f5d894e4b2 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -1371,7 +1371,11 @@ class MqaAttentionBase(nn.Module):
+@@ -1420,7 +1420,11 @@ class MqaAttentionBase(nn.Module):
              assert not getattr(meta, "q_pad_captured", False), (
                  "the padded query buffer grew after a CUDA graph captured it"
              )
@@ -1770,7 +1770,7 @@ index aeefcd1114..cf7a2549d8 100644
              if meta is not None:
                  try:
                      meta.q_pad_buffer = buf
-@@ -4266,6 +4270,10 @@ class DeepseekV4Model(nn.Module):
+@@ -4326,6 +4330,10 @@ class DeepseekV4Model(nn.Module):
              if tail is not None and i == self.late_layer_start:
                  if self.tail_writes_source_kv:
                      source = self.layers[i]
@@ -1782,7 +1782,7 @@ index aeefcd1114..cf7a2549d8 100644
                          # The previous FFN hc_post has not run yet, so run it here too.
                          source_x = fused_boundary_attn_input(source, state)
 diff --git a/python/sglang/srt/models/deepseek_v4_replay_tail.py b/python/sglang/srt/models/deepseek_v4_replay_tail.py
-index 440f1186e3..990b8a0a13 100644
+index 85ae2cd1ac..c3ecd61c9f 100644
 --- a/python/sglang/srt/models/deepseek_v4_replay_tail.py
 +++ b/python/sglang/srt/models/deepseek_v4_replay_tail.py
 @@ -154,6 +154,8 @@ class DecoderReplayTail:

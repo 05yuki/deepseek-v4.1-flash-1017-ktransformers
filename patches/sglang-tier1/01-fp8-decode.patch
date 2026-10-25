@@ -1,8 +1,8 @@
-From ccf4c5a28dd049c56a9618db9674cb6f9e6fac00 Mon Sep 17 00:00:00 2001
+From d5b5dba3ddec66a955b67454bcffe0a762a839ad Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 22:56:28 +0900
-Subject: [PATCH] [tier 1] fp8-decode: block-FP8 GEMV and split-K for
- decode-sized dense GEMMs
+Subject: [PATCH] fp8-decode: block-FP8 GEMV and split-K for decode-sized dense
+ GEMMs
 
 Faster block-FP8 dense GEMMs for decode-sized inputs. With up to four
 rows, `w8a8_block_fp8_matmul_triton` runs a Triton GEMV

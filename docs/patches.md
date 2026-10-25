@@ -41,7 +41,7 @@ patch goes and the pin moves past it.
 | `04-mask-zero` | not sent (a workaround for the Marlin MoE path) |
 | `05-zero-gpu-experts` | [#45188](https://github.com/sgl-project/sglang/pull/45188) |
 | `06-load-timeout` | [#45184](https://github.com/sgl-project/sglang/pull/45184) |
-| `07-chat-encoding` | not sent |
+| `07-chat-encoding` | dropped 2026-10-25: SGLang main renders DeepSeek-V4.1 prompts through `deepseek-recipe` 0.2.0 ([#45315](https://github.com/sgl-project/sglang/pull/45315)), which carries the tool namespaces |
 | `08-sm12x-indexer` | not sent |
 | `09-indexer-score-in-place` | [#45745](https://github.com/sgl-project/sglang/pull/45745) |
 | `10-routed-scale-once` | [#45810](https://github.com/sgl-project/sglang/pull/45810) |
@@ -94,7 +94,10 @@ at most 1 GiB. Its ReLU and head weights now run on that product in place: out o
 made about 3 GiB of transients, the largest allocation of a prefill on a small card. The
 output is bit-identical.
 
-### Chat encoding
+### Chat encoding (dropped)
+
+SGLang main renders DeepSeek-V4/V4.1 chat prompts through DeepSeek's own `deepseek-recipe` package since #45315 (2026-10-23) and removed `encoding_dsv41.py`; version 0.2.0 has the tool namespaces (`with_namespace_tool_map`), so this patch is gone. `tools/dsv41-encoding-check.py` still imports the removed file and will be reworked against the recipe path.
+
 
 `entrypoints/openai/encoding_dsv41.py`, `entrypoints/openai/protocol.py`,
 `entrypoints/openai/serving_chat.py`, `function_call/deepseekv41_detector.py`,

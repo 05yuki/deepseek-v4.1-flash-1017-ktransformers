@@ -1,7 +1,7 @@
-From e57b2c4aa1074e1aa88a3e505fbf3d442e096723 Mon Sep 17 00:00:00 2001
+From 005d7da7d6b3a7512baa0a89499890ee6e613220 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:33 +0900
-Subject: [PATCH] [tier 0] kt: keep CPU-routed experts out of the Marlin MoE
+Subject: [PATCH] kt: keep CPU-routed experts out of the Marlin MoE
  (KT_GPU_MASK_ZERO)
 
 The wrapper marks the routes the CPU computes with id -1. The Marlin MoE
@@ -18,7 +18,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  1 file changed, 17 insertions(+), 1 deletion(-)
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 962687fa98..4eac475f1e 100644
+index 8032a78324..70e35a4262 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -115,6 +115,9 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
@@ -31,7 +31,7 @@ index 962687fa98..4eac475f1e 100644
  def _kt_swiglu_kwargs(layer: torch.nn.Module) -> dict:
      """{"swiglu_limit": limit} for KTMoEWrapper when the layer clamps its SwiGLU, else {}.
      The value is what the resident GPU runner applies: moe_runner_config.swiglu_limit
-@@ -384,7 +387,20 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -393,7 +396,20 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
  
          # Create modified dispatch output for GPU computation

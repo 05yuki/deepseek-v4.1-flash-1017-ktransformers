@@ -1,8 +1,7 @@
-From 34a7e1d82090f979a21d12a4be264536c884903c Mon Sep 17 00:00:00 2001
+From df1635bfb56519bf8b8b5c3db35024af6ac3629c Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:34 +0900
-Subject: [PATCH] [tier 0] sm120: the V4.1 indexer takes the torch path on
- SM12x
+Subject: [PATCH] sm120: the V4.1 indexer takes the torch path on SM12x
 
 The V4.1 indexer's is_sm100_or_newer() leaves out compute capability 12:
 DeepGEMM has no SM12x build, and the candidate indexer stopped at

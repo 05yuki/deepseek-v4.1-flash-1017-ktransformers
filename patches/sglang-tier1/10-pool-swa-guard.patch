@@ -1,8 +1,8 @@
-From ad5cd3708c14a3fb99282879e7195129b02bb099 Mon Sep 17 00:00:00 2001
+From b20c20befba787241bf04cbdd87739495ee86cc9 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
-Subject: [PATCH] [tier 1] pool-swa-guard: fail at startup when the SWA pool
- cannot hold a prefill chunk
+Subject: [PATCH] pool-swa-guard: fail at startup when the SWA pool cannot hold
+ a prefill chunk
 
 A startup check in the pool configurator for DeepSeek V4: an SWA pool
 smaller than one prefill chunk plus a page raises a ValueError that

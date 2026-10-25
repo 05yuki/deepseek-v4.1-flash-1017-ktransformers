@@ -1,8 +1,8 @@
-From c641707ea11c99b54b9982526410e4cd3467e4c7 Mon Sep 17 00:00:00 2001
+From 5802f3309015ed903559d17534fe6d94c0525206 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
-Subject: [PATCH] [tier 1] hot-lend: more hot experts in the KV pool's free
- pages outside prefill
+Subject: [PATCH] hot-lend: more hot experts in the KV pool's free pages
+ outside prefill
 
 `KT_KV_HOT_LEND=1`: outside prefill the KV pool's free pages hold up to
 `KT_KV_HOT_EXTRA` more experts a layer on the GPU on a shadow layer;
@@ -57,10 +57,10 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  3 files changed, 674 insertions(+), 34 deletions(-)
 
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-index f15e6579f0..772127df51 100644
+index e06adbd486..3b8c82dee9 100644
 --- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 +++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-@@ -1162,6 +1162,13 @@ class FusedMoE(torch.nn.Module):
+@@ -1165,6 +1165,13 @@ class FusedMoE(torch.nn.Module):
          ):
              if self.quant_method.num_gpu_experts != -1:
                  if expert_id >= self.quant_method.num_gpu_experts:
@@ -75,7 +75,7 @@ index f15e6579f0..772127df51 100644
  
          self._weight_loader_impl(
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index c4dd1167e5..bcc8f41425 100644
+index f91552de77..cfe462dd59 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -308,6 +308,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
@@ -114,7 +114,7 @@ index c4dd1167e5..bcc8f41425 100644
          # Last layer loaded on this rank: optionally build the streamer and
          # pin every layer's arenas now (KT_GPU_STREAM_EARLY_INIT).
          num_layers = getattr(self.kt_config, "num_layers", None)
-@@ -492,6 +505,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -501,6 +514,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          # experts are streamed to the GPU in groups instead of computed here
          # (kt_stream_prefill.py). The ids are taken before the mask below
          # mutates them in place.
@@ -125,7 +125,7 @@ index c4dd1167e5..bcc8f41425 100644
          streamer = stream_prefill_for(self, layer, x.shape[0])
          cpu_share = False
          if streamer is not None:
-@@ -505,9 +522,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -514,9 +531,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                  # Everything below the cutoff is streamed or resident: send it
                  # to GPU expert 0 at weight 0, which kt-kernel skips.
                  theirs = physical_ids < cutoff
@@ -138,7 +138,7 @@ index c4dd1167e5..bcc8f41425 100644
                          topk_weights=torch.where(
                              theirs, torch.zeros_like(topk_output.topk_weights), topk_output.topk_weights
                          ),
-@@ -516,15 +535,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -525,15 +544,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                  self.submit(layer, cpu_do)
                  cpu_share = True
  
@@ -163,7 +163,7 @@ index c4dd1167e5..bcc8f41425 100644
  
          # Create modified dispatch output for GPU computation
          if _gpu_mask_zero:
-@@ -560,6 +586,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -569,6 +595,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                  hot_reference_check(self, layer, x, physical_ids, topk_output.topk_weights, output, streamer)
          else:
              output = torch.zeros_like(x)
@@ -172,7 +172,7 @@ index c4dd1167e5..bcc8f41425 100644
  
          # Step 4: Synchronize CPU results and merge with GPU results
          if streamer is not None:
-@@ -570,6 +598,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -579,6 +607,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
              cpu_output = self.sync(x)
              output = output + cpu_output
  

@@ -1,8 +1,8 @@
-From 21eba1bb42d1fdddb932928d00433575d9ee0932 Mon Sep 17 00:00:00 2001
+From 2ab7a7044dc22bc0200083c2ebc2eb2a0347f392 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:37 +0900
-Subject: [PATCH] [tier 2] distributed: all-reduce through pinned host memory
- for GPUs without peer access
+Subject: [PATCH] distributed: all-reduce through pinned host memory for GPUs
+ without peer access
 
 Two GPUs without peer access (consumer cards on a board without P2P):
 small all-reduces (decode) go through pinned host memory in NCCL's LL
@@ -319,10 +319,10 @@ index 0000000000..dc9b9a5bb1
 +        self.ext.ll_ar(t, self.base, self.rank, self.slot_bytes, self.counter)
 +        return t
 diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
-index 4524b21c3d..074b60e7c6 100644
+index 2656bfc2e3..eda74f9d38 100644
 --- a/python/sglang/srt/distributed/parallel_state.py
 +++ b/python/sglang/srt/distributed/parallel_state.py
-@@ -551,6 +551,40 @@ class GroupCoordinator:
+@@ -539,6 +539,40 @@ class GroupCoordinator:
                  device=self.device,
              )
  
@@ -363,7 +363,7 @@ index 4524b21c3d..074b60e7c6 100644
          # Create communicator for other hardware backends
          from sglang.srt.distributed.device_communicators.hpu_communicator import (
              HpuCommunicator,
-@@ -719,6 +753,12 @@ class GroupCoordinator:
+@@ -707,6 +741,12 @@ class GroupCoordinator:
                  torch.distributed.all_reduce(input_, group=self.device_group)
              return input_
  

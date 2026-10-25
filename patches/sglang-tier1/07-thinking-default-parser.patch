@@ -1,8 +1,8 @@
-From c4ed809f0116120ef324d9c5521412f9863ecef5 Mon Sep 17 00:00:00 2001
+From aa2a154227baba07a71a72af171ff22d2e9b4354 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
-Subject: [PATCH] [tier 1] thinking-default-parser: reasoning parser falls back
- to SGLANG_DEFAULT_THINKING
+Subject: [PATCH] thinking-default-parser: reasoning parser falls back to
+ SGLANG_DEFAULT_THINKING
 
 When a request sends no thinking toggle in `chat_template_kwargs`, the
 reasoning parser falls back to `SGLANG_DEFAULT_THINKING`, the same
@@ -22,10 +22,10 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  1 file changed, 6 insertions(+), 4 deletions(-)
 
 diff --git a/python/sglang/srt/entrypoints/openai/serving_chat.py b/python/sglang/srt/entrypoints/openai/serving_chat.py
-index adbe82845a..29df36c43a 100644
+index 4473a0536b..22d64844dd 100644
 --- a/python/sglang/srt/entrypoints/openai/serving_chat.py
 +++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
-@@ -2990,10 +2990,12 @@ class OpenAIServingChat(OpenAIServingBase):
+@@ -3158,10 +3158,12 @@ class OpenAIServingChat(OpenAIServingBase):
                  )
              if mode in ("explicit_thinking", "explicit_enable_thinking"):
                  toggle = mode.replace("explicit_", "")

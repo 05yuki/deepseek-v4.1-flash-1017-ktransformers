@@ -1,3 +1,6 @@
+From 3b4f5eac0c0cdca6cc03b96328686ca32eb452cd Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Sun, 25 Oct 2026 09:28:20 +0900
 Subject: [PATCH] [tier 0] Ada SM89 sparse attention fallback
 
 Select the existing dual-scope BF16 Triton kernels only on compute capability
@@ -8,11 +11,15 @@ SM89 launch settings, graph-owned scratch and bounded prefill row chunks.
 The separate-scope portable Triton path remains the query-shape fallback.
 Numerical differences from that reference are documented in docs/sm89.md.
 This patch reuses SGLang kernels; it does not introduce a new attention formula.
-
 ---
+ .../kernels/ops/attention/sm89_dual_scope.py  | 349 ++++++++++++++++++
+ .../layers/attention/deepseek_v4_backend.py   |  28 +-
+ 2 files changed, 375 insertions(+), 2 deletions(-)
+ create mode 100644 python/sglang/kernels/ops/attention/sm89_dual_scope.py
+
 diff --git a/python/sglang/kernels/ops/attention/sm89_dual_scope.py b/python/sglang/kernels/ops/attention/sm89_dual_scope.py
 new file mode 100644
-index 0000000..623b0e8
+index 0000000000..623b0e87d8
 --- /dev/null
 +++ b/python/sglang/kernels/ops/attention/sm89_dual_scope.py
 @@ -0,0 +1,349 @@
@@ -366,10 +373,10 @@ index 0000000..623b0e8
 +        dim=0,
 +    )
 diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-index 9c71a22..9859707 100644
+index 5c62ddf18f..b44d43a0d7 100644
 --- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 +++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-@@ -203,6 +203,12 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
+@@ -207,8 +207,14 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
      return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
  
  
@@ -383,7 +390,9 @@ index 9c71a22..9859707 100644
 -    if get_platform().is_sm120 or _is_xpu:
 +    if get_platform().is_sm120 or _is_xpu or _use_sm89_sparse_attention():
          return None
-@@ -2779,6 +2785,7 @@ class DeepseekV4AttnBackend(
+     from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
+ 
+@@ -2925,6 +2931,7 @@ class DeepseekV4AttnBackend(
              and forward_batch.forward_mode.is_extend_without_speculative()
              and not is_cp_active(forward_batch)
              and not get_platform().is_sm120
@@ -391,7 +400,7 @@ index 9c71a22..9859707 100644
              and self.forward_metadata.late_layer_tail is None
              and (
                  num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
-@@ -4188,7 +4195,24 @@ class DeepseekV4AttnBackend(
+@@ -4320,7 +4327,24 @@ class DeepseekV4AttnBackend(
                      extra_topk_lengths,
                  )
  

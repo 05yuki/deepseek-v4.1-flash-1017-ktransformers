@@ -1,8 +1,8 @@
-From 8acdeff94dafbbd666aea1180c121614236149a5 Mon Sep 17 00:00:00 2001
+From b6fac98f91bc9b332bcab18b4e31a39cebf3c9e9 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
-Subject: [PATCH] [tier 1] stream-prefill: stream the CPU experts to the GPU
- for long prefills
+Subject: [PATCH] stream-prefill: stream the CPU experts to the GPU for long
+ prefills
 
 `KT_GPU_STREAM_PREFILL=<tokens>`: above that many tokens the CPU experts
 are not computed by kt-kernel; their weights are copied to the GPU in
@@ -43,7 +43,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  create mode 100644 python/sglang/srt/layers/moe/kt_stream_prefill.py
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index ee135a2f77..c4dd1167e5 100644
+index 0c17adfea6..f91552de77 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Optional
@@ -115,7 +115,7 @@ index ee135a2f77..c4dd1167e5 100644
  
      def create_moe_runner(
          self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
-@@ -472,9 +488,37 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -481,9 +497,37 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          if _routing_dump_prefix and self.tp_rank == 0:
              _routing_count(x.device, self.kt_config.layer_idx, topk_output.topk_ids, self.tp_rank)
  
@@ -154,7 +154,7 @@ index ee135a2f77..c4dd1167e5 100644
              self.submit(layer, dispatch_output)
  
          # Step 2: Prepare GPU computation by masking CPU expert IDs
-@@ -486,10 +530,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -495,10 +539,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          if _gpu_mask_zero:
              # KT_GPU_MASK_ZERO=1: the Marlin MoE path cannot take -1 ids (its
              # alignment kernels index weights with them: illegal address at
@@ -170,7 +170,7 @@ index ee135a2f77..c4dd1167e5 100644
              m = masked_topk_ids < 0
              masked_topk_output = topk_output._replace(
                  topk_ids=torch.where(m, torch.zeros_like(masked_topk_ids), masked_topk_ids).to(torch.int64),
-@@ -503,15 +548,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -512,15 +557,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
  
          # Step 3: Execute GPU expert computation (any quantization method)
          # This runs in parallel with CPU computation. With no resident GPU
@@ -2181,10 +2181,10 @@ index 89965886e1..34823777eb 100644
  
      if do_pad:
 diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
-index 892206036f..9771ce2c86 100644
+index fa4a4b7e11..a3688f2a63 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 +++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
-@@ -116,6 +116,9 @@ class Mxfp4FlashinferCutlassMoEMethod:
+@@ -117,6 +117,9 @@ class Mxfp4FlashinferCutlassMoEMethod:
          clamp_limit = (
              gemm1_clamp_limit if gemm1_clamp_limit is not None else swiglu_limit
          )
@@ -2194,7 +2194,7 @@ index 892206036f..9771ce2c86 100644
          if clamp_limit is not None:
              self._swiglu_limit_tensor = torch.full(
                  (E,), float(clamp_limit), dtype=torch.float32, device=device
-@@ -129,6 +132,44 @@ class Mxfp4FlashinferCutlassMoEMethod:
+@@ -130,6 +133,44 @@ class Mxfp4FlashinferCutlassMoEMethod:
  
          self.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, moe_runner_config)
  

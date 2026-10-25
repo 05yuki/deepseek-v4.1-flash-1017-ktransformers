@@ -1,8 +1,8 @@
-From acd1209d5af316de19a369240278595c4654d820 Mon Sep 17 00:00:00 2001
+From 67951838a63d544e68f066bdb60366a67ba7672d Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:34 +0900
-Subject: [PATCH] [tier 1] cutlass-kt-expert-count: CUTLASS MXFP4 MoE takes its
- expert count from the weights under kt
+Subject: [PATCH] cutlass-kt-expert-count: CUTLASS MXFP4 MoE takes its expert
+ count from the weights under kt
 
 A fix in the FlashInfer CUTLASS MXFP4 MoE method: the expert count is
 taken from the weight tensor (`layer.w13_weight.shape[0]`) instead of
@@ -21,10 +21,10 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  1 file changed, 6 insertions(+), 1 deletion(-)
 
 diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
-index 96300858ac..892206036f 100644
+index 7a1c5a9512..fa4a4b7e11 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 +++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
-@@ -91,7 +91,12 @@ class Mxfp4FlashinferCutlassMoEMethod:
+@@ -92,7 +92,12 @@ class Mxfp4FlashinferCutlassMoEMethod:
          if moe_runner_config.layer is None:
              moe_runner_config.layer = layer
  

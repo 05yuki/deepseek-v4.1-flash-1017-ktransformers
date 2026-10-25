@@ -1,8 +1,7 @@
-From fd5e3a4d0c98bb3713cf657500ab63ada5ce862c Mon Sep 17 00:00:00 2001
+From fb06d1177c90b67d6721e5258a8140f687d75de1 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Wed, 21 Oct 2026 22:34:00 +0900
-Subject: [PATCH] [tier 0] deepseek-v4.1: score the torch indexer chunk in
- place
+Subject: [PATCH] deepseek-v4.1: score the torch indexer chunk in place
 
 The torch prefill indexer scores a request in chunks of rows whose bf16
 [rows, heads, lc] product is capped at 1 GiB. relu() and the multiply by the

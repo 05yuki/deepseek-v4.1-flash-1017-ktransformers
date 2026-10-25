@@ -1,8 +1,8 @@
-From 6a6243a2f194497e734050e1ea50301c3329a880 Mon Sep 17 00:00:00 2001
+From 0526803f0bf6ff477e457a59ed1a02c457cdd3d7 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Thu, 22 Oct 2026 23:30:00 +0900
-Subject: [PATCH] [tier 0] kt: scale the routed output once when the top-k
- already folds the factor
+Subject: [PATCH] kt: scale the routed output once when the top-k already folds
+ the factor
 
 Since #44993 the top-k folds routed_scaling_factor into its weights whenever the
 quant method says so, and KTEPWrapperMethod forwards that question to its GPU

@@ -1,8 +1,8 @@
-From 08e6465efd379f1a1365a7a8dd3a2b08623ce1d7 Mon Sep 17 00:00:00 2001
+From a3e39e226155204613485cfc734b76689cc207ae Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
-Subject: [PATCH] [tier 1] kv-lend-plan: lend the KV pool's free pages to
- prefill, plan the chunk per request
+Subject: [PATCH] kv-lend-plan: lend the KV pool's free pages to prefill, plan
+ the chunk per request
 
 The KV pool's free pages during prefill. `KT_PREFILL_KV_LEND=1` lends
 the pool's free pages to the prefill (pages in use are never lent; the
@@ -1770,10 +1770,10 @@ index 0000000000..a2b878d9f2
 +              + f", cap {chunk})", flush=True)
 +    return c
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index 6cab5b8066..f5bbc49dcb 100644
+index fcbb02cf5f..f81900a4eb 100644
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -4110,11 +4110,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -4135,11 +4135,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                          if req.extend_batch_idx < 2:
                              continue
                          else:
@@ -1793,10 +1793,10 @@ index 6cab5b8066..f5bbc49dcb 100644
                      else:
                          self._evict_swa(req, pre_len)
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index d31cf7da06..018756c5a9 100644
+index 48ed4fe0a6..ea83a2ef5f 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -3430,6 +3430,10 @@ class Scheduler(
+@@ -3454,6 +3454,10 @@ class Scheduler(
              req.storage_prefetch_retry_attempts = 0
              req.storage_prefetch_last_match_len = None
              req.staged_prefetch_plan = None
@@ -1807,7 +1807,7 @@ index d31cf7da06..018756c5a9 100644
          if self.disaggregation_mode == DisaggregationMode.NULL:
              if self._abort_on_queued_limit(req):
                  self._release_aborted_request(req)
-@@ -4090,6 +4094,11 @@ class Scheduler(
+@@ -4114,6 +4118,11 @@ class Scheduler(
              dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
              if dynamic_size is not None:
                  chunked_prefill_size = dynamic_size
