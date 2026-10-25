@@ -242,19 +242,19 @@ The compressed KV is 720 bytes a token; at 1M tokens, 0.70 GiB of RAM.
 
 2 × AMD EPYC 7452 (Zen 2, AVX2), 512 GB DDR4, 2 × RTX 5070 Ti 16 GB, the checkpoint on
 NVMe; built from this repository and run with the `serve.sh` defaults (1M-token context,
-one request at a time), measured with `tools/bench.py` at tag `2026-10-23-0135`, every row from one launch.
+one request at a time), measured with `tools/bench.py` at tag `2026-10-25-1035` (SGLang main 65633129), every table from one launch.
 
 Decode, 1,024 tokens a reply (`--other-text` for the rows below the first):
 
 | text | tok/s |
 |---|---|
-| Japanese prose (median of four prompts) | 47.1 |
-| Chinese prose | 40.6 |
-| math | 40.0 |
-| English prose | 38.5 |
-| JSON | 37.2 |
-| English technical prose | 35.4 |
-| Python code | 35.3 |
+| Japanese prose (median of four prompts) | 46.5 |
+| Chinese prose | 41.1 |
+| math | 39.3 |
+| English prose | 38.0 |
+| JSON | 36.9 |
+| English technical prose | 34.8 |
+| Python code | 34.4 |
 
 One expert a layer always stays on the GPU, and as many more as the free GPU memory holds
 sit in the KV pool's free pages and the driver's idle memory (15-16 a layer here). All of
@@ -312,12 +312,12 @@ The served model is scored against the checkpoint's own reference implementation
 DeepSeek's `inference/model.py`, run one layer at a time on one 16 GB GPU
 ([tools/ref-nll.py](tools/ref-nll.py)). Both score the same 24 pieces of 480 tokens, taken
 from two public-domain texts in [tools/nll-text/](tools/nll-text/), one Japanese and one
-English, teacher-forced. Measured at tag `2026-10-23-1702`, `serve.sh` defaults:
+English, teacher-forced. `serve.sh` defaults; two GPUs at tag `2026-10-25-1035`, one GPU at `2026-10-23-1702`:
 
 | run | mean NLL | minus the reference (SE over the 24 pieces) |
 |---|---|---|
 | reference (`inference/model.py`) | 0.7185 | |
-| served, two GPUs | 0.7181 | -0.0004 (0.0040) |
+| served, two GPUs | 0.7192 | +0.0007 (0.0041) |
 | served, one GPU (KV past the GPU in host memory) | 0.7194 | +0.0008 (0.0050) |
 | served, one RTX 4080 SUPER 32 GB (SM89), against its own reference run (0.7141) | 0.7151 | +0.0010 (0.0041) |
 
