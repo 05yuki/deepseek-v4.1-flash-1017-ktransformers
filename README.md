@@ -242,7 +242,7 @@ The compressed KV is 720 bytes a token; at 1M tokens, 0.70 GiB of RAM.
 
 2 × AMD EPYC 7452 (Zen 2, AVX2), 512 GB DDR4, 2 × RTX 5070 Ti 16 GB, the checkpoint on
 NVMe; built from this repository and run with the `serve.sh` defaults (1M-token context,
-one request at a time), measured with `tools/bench.py` at tag `2026-10-25-1035` (SGLang main 65633129), every table from one launch.
+one request at a time), measured with `tools/bench.py` at tag `2026-10-25-1121` (SGLang main 65633129), every table from one launch.
 
 Decode, 1,024 tokens a reply (`--other-text` for the rows below the first):
 
@@ -312,7 +312,7 @@ The served model is scored against the checkpoint's own reference implementation
 DeepSeek's `inference/model.py`, run one layer at a time on one 16 GB GPU
 ([tools/ref-nll.py](tools/ref-nll.py)). Both score the same 24 pieces of 480 tokens, taken
 from two public-domain texts in [tools/nll-text/](tools/nll-text/), one Japanese and one
-English, teacher-forced. `serve.sh` defaults; two GPUs at tag `2026-10-25-1035`, one GPU at `2026-10-23-1702`:
+English, teacher-forced. `serve.sh` defaults; two GPUs at tag `2026-10-25-1121`, one GPU at `2026-10-23-1702`:
 
 | run | mean NLL | minus the reference (SE over the 24 pieces) |
 |---|---|---|
