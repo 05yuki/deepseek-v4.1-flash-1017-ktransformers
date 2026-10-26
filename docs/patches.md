@@ -4,7 +4,7 @@
 
 | tier | file | applies to |
 |---|---|---|
-| 0 | `patches/sglang-tier0/NN-*.patch` | sgl-project/sglang main at `8b9f7241`, one concern each |
+| 0 | `patches/sglang-tier0/NN-*.patch` | sgl-project/sglang main at `65633129`, one concern each |
 | 1 | `patches/sglang-tier1/NN-*.patch` | the same, after tier 0: one patch per feature ([tier1.md](tier1.md)) |
 | 2 | `patches/sglang-tier2-no-p2p.patch` | the same, after tier 1 |
 | 1 | `patches/kt-kernel-tree.patch` | kvcache-ai/ktransformers `95009ea` (below tier 1 it is built as pinned) |
@@ -21,7 +21,7 @@
 - **Tier 2** is what depends on the machine: two GPUs without peer access.
 
 The SGLang patches are the commits of branch `dsv41-1017-main` of
-[05yuki/sglang-upstream](https://github.com/05yuki/sglang-upstream/tree/dsv41-1017-main) on `8b9f7241`, one
+[05yuki/sglang-upstream](https://github.com/05yuki/sglang-upstream/tree/dsv41-1017-main) on `65633129`, one
 concern a commit, in `git format-patch` form: each file carries its commit message (what the change
 is for, its switch, how it was checked). `git log` on the branch reads as the list below.
 
