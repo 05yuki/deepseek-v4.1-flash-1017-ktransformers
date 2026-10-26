@@ -1,4 +1,4 @@
-From 3b4f5eac0c0cdca6cc03b96328686ca32eb452cd Mon Sep 17 00:00:00 2001
+From 45c14d4aee9fe8824e419568559e114c2ff05a1c Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Sun, 25 Oct 2026 09:28:20 +0900
 Subject: [PATCH] [tier 0] Ada SM89 sparse attention fallback
@@ -19,7 +19,7 @@ This patch reuses SGLang kernels; it does not introduce a new attention formula.
 
 diff --git a/python/sglang/kernels/ops/attention/sm89_dual_scope.py b/python/sglang/kernels/ops/attention/sm89_dual_scope.py
 new file mode 100644
-index 0000000000..623b0e87d8
+index 00000000..623b0e87
 --- /dev/null
 +++ b/python/sglang/kernels/ops/attention/sm89_dual_scope.py
 @@ -0,0 +1,349 @@
@@ -373,7 +373,7 @@ index 0000000000..623b0e87d8
 +        dim=0,
 +    )
 diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-index 5c62ddf18f..b44d43a0d7 100644
+index 25ab480e..082d304c 100644
 --- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 +++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 @@ -207,8 +207,14 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
@@ -400,7 +400,7 @@ index 5c62ddf18f..b44d43a0d7 100644
              and self.forward_metadata.late_layer_tail is None
              and (
                  num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
-@@ -4320,7 +4327,24 @@ class DeepseekV4AttnBackend(
+@@ -4332,7 +4339,24 @@ class DeepseekV4AttnBackend(
                      extra_topk_lengths,
                  )
  

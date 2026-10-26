@@ -1,4 +1,4 @@
-From a22f4e4e18dbc4d683a35189224e0f0d729004da Mon Sep 17 00:00:00 2001
+From 8b5d25699444cf3dc4a0f9535b8bf8060ccff60e Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:32 +0900
 Subject: [PATCH] kt: pass the model's SwiGLU clamp to the CPU experts
@@ -16,7 +16,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  1 file changed, 21 insertions(+)
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 53226bb868..8032a78324 100644
+index 53226bb8..8032a783 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -7,6 +7,7 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert

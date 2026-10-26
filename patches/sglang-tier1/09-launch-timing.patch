@@ -1,4 +1,4 @@
-From c23465c089e135629e8535f1aa84597603550044 Mon Sep 17 00:00:00 2001
+From 6af42c81b240f65dea1dc68372384da8a53583b7 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] launch-timing: KT_LAUNCH_TIMING, a timeline of the weight
@@ -25,7 +25,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 
 diff --git a/python/sglang/srt/layers/moe/kt_launch_timing.py b/python/sglang/srt/layers/moe/kt_launch_timing.py
 new file mode 100644
-index 0000000000..39159dac25
+index 00000000..39159dac
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_launch_timing.py
 @@ -0,0 +1,397 @@
@@ -427,10 +427,10 @@ index 0000000000..39159dac25
 +        log(f"loader not wrapped: {e}")
 +    log("installed")
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index c4cf03fb91..8fb7751cb5 100644
+index 0fa08d05..5d448c02 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -1268,6 +1268,11 @@ class ModelRunner:
+@@ -1269,6 +1269,11 @@ class ModelRunner:
  
      def load_model(self):
          tic_total = time.perf_counter()

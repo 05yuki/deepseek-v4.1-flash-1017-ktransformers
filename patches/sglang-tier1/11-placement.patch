@@ -1,4 +1,4 @@
-From b56c2e2b3f4e3bed07c857ff2aeaae726cc61a74 Mon Sep 17 00:00:00 2001
+From c410e7c2cf0f6fa0ba1774c73d70c5254cf08dd0 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] placement: a routing dump to build a placement from a
@@ -23,7 +23,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  1 file changed, 45 insertions(+)
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index acfc8aeda4..0c17adfea6 100644
+index acfc8aed..0c17adfe 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -151,7 +151,36 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T

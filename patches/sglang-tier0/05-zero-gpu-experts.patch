@@ -1,4 +1,4 @@
-From 076fa77e95fd872c92b6abf22776a008e5a26e0f Mon Sep 17 00:00:00 2001
+From e536e91806b3305a87c53fc3ca6fa523a04ec303 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:33 +0900
 Subject: [PATCH] kt: run with zero GPU experts (--kt-num-gpu-experts 0)
@@ -14,7 +14,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  1 file changed, 9 insertions(+), 4 deletions(-)
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 70e35a4262..a832393b41 100644
+index 70e35a42..a832393b 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -330,7 +330,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):

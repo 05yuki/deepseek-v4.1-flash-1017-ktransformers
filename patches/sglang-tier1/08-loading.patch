@@ -1,4 +1,4 @@
-From de7e80f02c9d980e0f18d091c04243ab187b2762 Mon Sep 17 00:00:00 2001
+From 5ca4ed723b68f991f4277b3fbca6b5c87a2eb845 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] loading: skip the CPU-only experts in the GPU loader, read
@@ -30,7 +30,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  3 files changed, 250 insertions(+), 2 deletions(-)
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index a832393b41..acfc8aeda4 100644
+index a832393b..acfc8aed 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -38,6 +38,42 @@ except ImportError:
@@ -115,7 +115,7 @@ index a832393b41..acfc8aeda4 100644
  
      def create_moe_runner(
 diff --git a/python/sglang/srt/model_loader/weight_utils.py b/python/sglang/srt/model_loader/weight_utils.py
-index 1d7fce13b2..74390749aa 100644
+index 1d7fce13..74390749 100644
 --- a/python/sglang/srt/model_loader/weight_utils.py
 +++ b/python/sglang/srt/model_loader/weight_utils.py
 @@ -1143,6 +1143,76 @@ def _drop_file_cache_after_load(path: str) -> None:
@@ -291,7 +291,7 @@ index 1d7fce13b2..74390749aa 100644
  
      # Sliding window: max_workers loading + 1 prefetched.
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 24ad9db2dc..afd8a11427 100644
+index 2cc2d151..9bbe9f93 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
 @@ -21,6 +21,7 @@ from typing import (
@@ -302,7 +302,7 @@ index 24ad9db2dc..afd8a11427 100644
  import torch
  import torch.nn as nn
  import torch.nn.functional as F
-@@ -475,6 +476,46 @@ def _wo_a_bf16_bmm_token_major(o: torch.Tensor, wo_a: torch.Tensor) -> torch.Ten
+@@ -500,6 +501,46 @@ def _wo_a_bf16_bmm_token_major(o: torch.Tensor, wo_a: torch.Tensor) -> torch.Ten
      return result
  
  
@@ -349,7 +349,7 @@ index 24ad9db2dc..afd8a11427 100644
  def _o_fp8_qdq_block() -> int:
      """SGLANG_DSV4_O_FP8_QDQ_BLOCK (sglang-dsv4-o-fp8-qdq.py): FP8 quant-dequant of the
      attention output before a bf16 wo_a, in blocks of this many; 0 = off."""
-@@ -5484,6 +5525,8 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -5525,6 +5566,8 @@ class DeepseekV4ForCausalLM(nn.Module):
  
          cache_compressor_weight = {}
          COMPRESSOR_PART = ".compressor.w"
@@ -358,7 +358,7 @@ index 24ad9db2dc..afd8a11427 100644
  
          fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
          cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
-@@ -5537,6 +5580,13 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -5578,6 +5621,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                          is_nextn=is_nextn,
                          num_hidden_layers=self.config.num_hidden_layers,
                      )

@@ -1,4 +1,4 @@
-From b6fac98f91bc9b332bcab18b4e31a39cebf3c9e9 Mon Sep 17 00:00:00 2001
+From d469171d75bb78f2a917ef159ba70260ecc4ba80 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] stream-prefill: stream the CPU experts to the GPU for long
@@ -43,7 +43,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  create mode 100644 python/sglang/srt/layers/moe/kt_stream_prefill.py
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 0c17adfea6..f91552de77 100644
+index 0c17adfe..f91552de 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Optional
@@ -202,7 +202,7 @@ index 0c17adfea6..f91552de77 100644
  
 diff --git a/python/sglang/srt/layers/moe/kt_stream_prefill.py b/python/sglang/srt/layers/moe/kt_stream_prefill.py
 new file mode 100644
-index 0000000000..77fc0f4252
+index 00000000..77fc0f42
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_stream_prefill.py
 @@ -0,0 +1,1744 @@
@@ -1951,7 +1951,7 @@ index 0000000000..77fc0f4252
 +    kept = max(1, n_groups - CPU_GROUPS)
 +    return min(last, first + kept * streamer.G)
 diff --git a/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py b/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
-index 89965886e1..34823777eb 100644
+index 89965886..34823777 100644
 --- a/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
 +++ b/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
 @@ -11,6 +11,8 @@ from __future__ import annotations
@@ -2181,7 +2181,7 @@ index 89965886e1..34823777eb 100644
  
      if do_pad:
 diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
-index fa4a4b7e11..a3688f2a63 100644
+index fa4a4b7e..a3688f2a 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 +++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 @@ -117,6 +117,9 @@ class Mxfp4FlashinferCutlassMoEMethod:

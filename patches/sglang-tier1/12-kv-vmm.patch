@@ -1,4 +1,4 @@
-From 98c21fd7bfe1a8aa4d18bd72d2af5862a17c2793 Mon Sep 17 00:00:00 2001
+From fa99c14951650ba1526a3d2f09b6e93c015cddb9 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] kv-vmm: the KV pool on remappable memory (CUDA VMM)
@@ -23,7 +23,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 
 diff --git a/python/sglang/srt/layers/moe/kt_kv_vmm.py b/python/sglang/srt/layers/moe/kt_kv_vmm.py
 new file mode 100644
-index 0000000000..cf20823569
+index 00000000..cf208235
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_kv_vmm.py
 @@ -0,0 +1,235 @@
@@ -263,7 +263,7 @@ index 0000000000..cf20823569
 +    """Map zeroed chunks wherever t's bytes [off, off + length) have none. -1: no memory."""
 +    return int(_load().kv_vmm_restore(ctypes.c_void_p(t.data_ptr()), off, length))
 diff --git a/python/sglang/srt/utils/torch_memory_saver_adapter.py b/python/sglang/srt/utils/torch_memory_saver_adapter.py
-index cd5c96eda2..b6d698a383 100644
+index cd5c96ed..b6d698a3 100644
 --- a/python/sglang/srt/utils/torch_memory_saver_adapter.py
 +++ b/python/sglang/srt/utils/torch_memory_saver_adapter.py
 @@ -143,6 +143,14 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):

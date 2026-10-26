@@ -1,4 +1,4 @@
-From 022fcba71983fe0536e1d4cb9d56b099a4aee886 Mon Sep 17 00:00:00 2001
+From d67552d982b41798ea64934b13f97f7b411a2d9c Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:34 +0900
 Subject: [PATCH] gpu-moe-fp32: GPU MXFP4 experts in the checkpoint's layout,
@@ -30,7 +30,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  create mode 100644 python/sglang/srt/layers/moe/mxfp4_fp32_moe.py
 
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py b/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
-index b3e21ebe93..c22f1a98fa 100644
+index b3e21ebe..c22f1a98 100644
 --- a/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
 +++ b/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
 @@ -109,6 +109,59 @@ def get_scalar_type(
@@ -129,7 +129,7 @@ index b3e21ebe93..c22f1a98fa 100644
          # mul_topk_weights, so this is a plain sum over the topk dim. The JIT
 diff --git a/python/sglang/srt/layers/moe/mxfp4_fp32_moe.py b/python/sglang/srt/layers/moe/mxfp4_fp32_moe.py
 new file mode 100644
-index 0000000000..02a118ed34
+index 00000000..02a118ed
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/mxfp4_fp32_moe.py
 @@ -0,0 +1,385 @@
@@ -519,7 +519,7 @@ index 0000000000..02a118ed34
 +        out.index_add_(0, tok, y * topk_weights[tok, slot].double()[:, None])
 +    return out
 diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
-index 7d73ffcbea..d37297fd20 100644
+index d7790919..3001455a 100644
 --- a/python/sglang/srt/layers/quantization/fp8.py
 +++ b/python/sglang/srt/layers/quantization/fp8.py
 @@ -5,6 +5,7 @@
@@ -545,7 +545,7 @@ index 7d73ffcbea..d37297fd20 100644
  
              if self.is_fp4_experts and get_moe_runner_backend().is_humming():
 diff --git a/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py b/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
-index 8ee5a96e23..c2d39636c1 100644
+index 8ee5a96e..c2d39636 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
 +++ b/python/sglang/srt/layers/quantization/mxfp4_marlin_moe.py
 @@ -211,3 +211,35 @@ class Mxfp4MarlinMoEMethod:

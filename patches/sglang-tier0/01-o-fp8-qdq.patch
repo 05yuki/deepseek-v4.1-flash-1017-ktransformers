@@ -1,4 +1,4 @@
-From c2f0b30a51820f8c82039ad32ae6c490d992842e Mon Sep 17 00:00:00 2001
+From 9712e13477df629a31d9ab869eb76697d43d2768 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:32 +0900
 Subject: [PATCH] deepseek-v4: FP8 quantize-dequantize of the attention output
@@ -27,7 +27,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 
 diff --git a/python/sglang/srt/models/deepseek_common/o_fp8_qdq.py b/python/sglang/srt/models/deepseek_common/o_fp8_qdq.py
 new file mode 100644
-index 0000000000..3a062ae805
+index 00000000..3a062ae8
 --- /dev/null
 +++ b/python/sglang/srt/models/deepseek_common/o_fp8_qdq.py
 @@ -0,0 +1,100 @@
@@ -132,10 +132,10 @@ index 0000000000..3a062ae805
 +    v = (f / s).clamp(-448.0, 448.0)
 +    return (v.to(torch.float8_e4m3fn).float() * s).to(x.dtype).reshape(shape)
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 76473c12bc..3c346a3bef 100644
+index a610a4de..8c949e9e 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -474,6 +474,17 @@ def _wo_a_bf16_bmm_token_major(o: torch.Tensor, wo_a: torch.Tensor) -> torch.Ten
+@@ -499,6 +499,17 @@ def _wo_a_bf16_bmm_token_major(o: torch.Tensor, wo_a: torch.Tensor) -> torch.Ten
      return result
  
  
@@ -153,7 +153,7 @@ index 76473c12bc..3c346a3bef 100644
  def _apply_wo_a_bf16_matmul(
      o: torch.Tensor,
      wo_a: torch.Tensor,
-@@ -2987,6 +2998,10 @@ class MQALayer(MqaAttentionBase):
+@@ -3014,6 +3025,10 @@ class MQALayer(MqaAttentionBase):
                      recipe=recipe,
                  )
              else:
@@ -165,10 +165,10 @@ index 76473c12bc..3c346a3bef 100644
                  if wo_a_weight is not None:
                      if (
 diff --git a/python/sglang/srt/models/deepseek_v4_dspark.py b/python/sglang/srt/models/deepseek_v4_dspark.py
-index 9703af5897..0b6f2d73ee 100644
+index 47aa9a25..6c02caf3 100644
 --- a/python/sglang/srt/models/deepseek_v4_dspark.py
 +++ b/python/sglang/srt/models/deepseek_v4_dspark.py
-@@ -368,6 +368,14 @@ class DSparkAttention(MqaAttentionBase):
+@@ -369,6 +369,14 @@ class DSparkAttention(MqaAttentionBase):
              self.n_local_groups,
              o.shape[1] * o.shape[2] // self.n_local_groups,
          )

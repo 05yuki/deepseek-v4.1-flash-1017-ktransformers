@@ -1,4 +1,4 @@
-From 2ab7a7044dc22bc0200083c2ebc2eb2a0347f392 Mon Sep 17 00:00:00 2001
+From d03a3609a2cbd2ab8ee426eb3e013bf5aec37bb3 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:37 +0900
 Subject: [PATCH] distributed: all-reduce through pinned host memory for GPUs
@@ -22,7 +22,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 
 diff --git a/python/sglang/srt/distributed/device_communicators/host_staged_allreduce.py b/python/sglang/srt/distributed/device_communicators/host_staged_allreduce.py
 new file mode 100644
-index 0000000000..e4901c8464
+index 00000000..e4901c84
 --- /dev/null
 +++ b/python/sglang/srt/distributed/device_communicators/host_staged_allreduce.py
 @@ -0,0 +1,151 @@
@@ -179,7 +179,7 @@ index 0000000000..e4901c8464
 +        return t
 diff --git a/python/sglang/srt/distributed/device_communicators/ll_allreduce.py b/python/sglang/srt/distributed/device_communicators/ll_allreduce.py
 new file mode 100644
-index 0000000000..dc9b9a5bb1
+index 00000000..dc9b9a5b
 --- /dev/null
 +++ b/python/sglang/srt/distributed/device_communicators/ll_allreduce.py
 @@ -0,0 +1,135 @@
@@ -319,10 +319,10 @@ index 0000000000..dc9b9a5bb1
 +        self.ext.ll_ar(t, self.base, self.rank, self.slot_bytes, self.counter)
 +        return t
 diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
-index 2656bfc2e3..eda74f9d38 100644
+index 945c1c9d..97c43c9a 100644
 --- a/python/sglang/srt/distributed/parallel_state.py
 +++ b/python/sglang/srt/distributed/parallel_state.py
-@@ -539,6 +539,40 @@ class GroupCoordinator:
+@@ -538,6 +538,40 @@ class GroupCoordinator:
                  device=self.device,
              )
  
@@ -363,7 +363,7 @@ index 2656bfc2e3..eda74f9d38 100644
          # Create communicator for other hardware backends
          from sglang.srt.distributed.device_communicators.hpu_communicator import (
              HpuCommunicator,
-@@ -707,6 +741,12 @@ class GroupCoordinator:
+@@ -699,6 +733,12 @@ class GroupCoordinator:
                  torch.distributed.all_reduce(input_, group=self.device_group)
              return input_
  

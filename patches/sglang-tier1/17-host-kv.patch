@@ -1,4 +1,4 @@
-From 310536656930c0cee10fdf61f1d470f93828bca1 Mon Sep 17 00:00:00 2001
+From 938154c0c047c3a7a22400cd5592a39c8319ca86 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 23 Oct 2026 12:16:53 +0900
 Subject: [PATCH] host-kv: DeepSeek-V4.1's KV pool covers the whole context,
@@ -68,7 +68,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  create mode 100644 python/sglang/srt/mem_cache/dsv41_host_kv.py
 
 diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-index b44d43a0d7..a7d008be42 100644
+index 082d304c..fc3fde94 100644
 --- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 +++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 @@ -1280,6 +1280,10 @@ class DeepseekV4AttnBackend(
@@ -82,7 +82,7 @@ index b44d43a0d7..a7d008be42 100644
          # Nothing is built for a compress ratio outside the pool's set.
          self.present_ratios: Tuple[int, ...] = self.token_to_kv_pool.present_ratios
          self.low_ratios: Tuple[int, ...] = tuple(
-@@ -3503,6 +3507,31 @@ class DeepseekV4AttnBackend(
+@@ -3515,6 +3519,31 @@ class DeepseekV4AttnBackend(
              self._low_ratio_compress(layer, x, req, pos, forward_batch)
          if run_indexer and layer.indexer is not None:
              self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
@@ -114,7 +114,7 @@ index b44d43a0d7..a7d008be42 100644
  
      def _forward_low_ratio_sources_cp(
          self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
-@@ -4175,6 +4204,27 @@ class DeepseekV4AttnBackend(
+@@ -4187,6 +4216,27 @@ class DeepseekV4AttnBackend(
                  extra_topk_lengths = core_attn_metadata.sparse_topk_lengths(
                      compress_ratio
                  )
@@ -143,7 +143,7 @@ index b44d43a0d7..a7d008be42 100644
              swa_kv_page_size = token_to_kv_pool.get_swa_key_page_size()
              assert swa_k_cache.ndim == 2
 diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
-index ea5ba22626..610ed859ab 100644
+index ea5ba226..610ed859 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 @@ -152,7 +152,7 @@ def _whole_chunks(tensors, mark, n: int, dev):
@@ -221,7 +221,7 @@ index ea5ba22626..610ed859ab 100644
      cand, _, ranges, total = got
      STATE.update(lent=cand, ranges=ranges, bytes=total, owner="hot")
 diff --git a/python/sglang/srt/layers/moe/kt_kv_vmm.py b/python/sglang/srt/layers/moe/kt_kv_vmm.py
-index cf20823569..4b62f98233 100644
+index cf208235..4b62f982 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_vmm.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_vmm.py
 @@ -77,6 +77,11 @@ def _load():
@@ -282,7 +282,7 @@ index cf20823569..4b62f98233 100644
      return int(_load().kv_vmm_chunk_bytes(device))
  
 diff --git a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
-index f7a5d41dcc..28f1d27eee 100644
+index f7a5d41d..28f1d27e 100644
 --- a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
 +++ b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
 @@ -1,6 +1,7 @@
@@ -386,7 +386,7 @@ index f7a5d41dcc..28f1d27eee 100644
  
 diff --git a/python/sglang/srt/mem_cache/dsv41_host_kv.py b/python/sglang/srt/mem_cache/dsv41_host_kv.py
 new file mode 100644
-index 0000000000..942f7a5efb
+index 00000000..942f7a5e
 --- /dev/null
 +++ b/python/sglang/srt/mem_cache/dsv41_host_kv.py
 @@ -0,0 +1,278 @@
@@ -669,7 +669,7 @@ index 0000000000..942f7a5efb
 +            num_warps=4,
 +        )
 diff --git a/python/sglang/srt/model_executor/pool_configurator.py b/python/sglang/srt/model_executor/pool_configurator.py
-index a943f439c2..b916dae611 100644
+index 7a4e1e95..92479ec4 100644
 --- a/python/sglang/srt/model_executor/pool_configurator.py
 +++ b/python/sglang/srt/model_executor/pool_configurator.py
 @@ -9,6 +9,7 @@ from available GPU memory using a unified coeff+bias model:
@@ -680,7 +680,7 @@ index a943f439c2..b916dae611 100644
  from bisect import bisect_right
  from dataclasses import dataclass
  from typing import TYPE_CHECKING, Optional
-@@ -1639,6 +1640,35 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
+@@ -1660,6 +1661,35 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                  f"or SGLANG_SWA_EVICTION_INTERVAL, or increase --mem-fraction-static."
              )
  

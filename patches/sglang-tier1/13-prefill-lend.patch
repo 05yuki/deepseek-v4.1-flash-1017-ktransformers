@@ -1,4 +1,4 @@
-From 0c621543d2e5fdbedfe2b87e3c852a5cc18b5a13 Mon Sep 17 00:00:00 2001
+From a5ea6bed1d6b89239d01974a4d58f28b436eecb2 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] prefill-lend: lend the GPU-resident weights' memory to a
@@ -47,7 +47,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 
 diff --git a/python/sglang/srt/layers/moe/kt_lend.py b/python/sglang/srt/layers/moe/kt_lend.py
 new file mode 100644
-index 0000000000..5079b6a17f
+index 00000000..5079b6a1
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_lend.py
 @@ -0,0 +1,1339 @@
@@ -1392,7 +1392,7 @@ index 0000000000..5079b6a17f
 +        _point_back(i)
 diff --git a/python/sglang/srt/layers/moe/kt_lend_probe.py b/python/sglang/srt/layers/moe/kt_lend_probe.py
 new file mode 100644
-index 0000000000..ed9fdea18a
+index 00000000..ed9fdea1
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_lend_probe.py
 @@ -0,0 +1,157 @@
@@ -1555,7 +1555,7 @@ index 0000000000..ed9fdea18a
 +    logger.info("kt-lend probe: done in %.1f s", time.perf_counter() - t_all)
 diff --git a/python/sglang/srt/layers/moe/kt_pinned.py b/python/sglang/srt/layers/moe/kt_pinned.py
 new file mode 100644
-index 0000000000..776077ca55
+index 00000000..776077ca
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_pinned.py
 @@ -0,0 +1,132 @@
@@ -1692,10 +1692,10 @@ index 0000000000..776077ca55
 +        _bounce["n"] = nbytes
 +    return _bounce["buf"][:nbytes]
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 86947616f2..48ed4fe0a6 100644
+index d223d2e4..80a8f2a3 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -6126,6 +6126,11 @@ class Scheduler(
+@@ -6204,6 +6204,11 @@ class Scheduler(
  
  
  def dispatch_event_loop(scheduler: Scheduler):
@@ -1708,10 +1708,10 @@ index 86947616f2..48ed4fe0a6 100644
          return role_switch.run_event_loop_supervisor(
              scheduler,
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 8fb7751cb5..212f64bb46 100644
+index 5d448c02..6f05c8ff 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -1861,6 +1861,11 @@ class ModelRunner:
+@@ -1862,6 +1862,11 @@ class ModelRunner:
                  forward_batch,
              ) as recorder_outputs,
          ):
@@ -1724,7 +1724,7 @@ index 8fb7751cb5..212f64bb46 100644
                  forward_batch,
                  pp_proxy_tensors,
 diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
-index edda2a7618..1512ca4334 100644
+index edda2a76..1512ca43 100644
 --- a/python/sglang/srt/model_loader/loader.py
 +++ b/python/sglang/srt/model_loader/loader.py
 @@ -309,6 +309,10 @@ def _initialize_model(
@@ -1754,10 +1754,10 @@ index edda2a7618..1512ca4334 100644
      @staticmethod
      def restore_weights_before_loading(model, target_device):
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index afd8a11427..f5d894e4b2 100644
+index 9bbe9f93..7d813350 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -1420,7 +1420,11 @@ class MqaAttentionBase(nn.Module):
+@@ -1447,7 +1447,11 @@ class MqaAttentionBase(nn.Module):
              assert not getattr(meta, "q_pad_captured", False), (
                  "the padded query buffer grew after a CUDA graph captured it"
              )
@@ -1770,7 +1770,7 @@ index afd8a11427..f5d894e4b2 100644
              if meta is not None:
                  try:
                      meta.q_pad_buffer = buf
-@@ -4326,6 +4330,10 @@ class DeepseekV4Model(nn.Module):
+@@ -4352,6 +4356,10 @@ class DeepseekV4Model(nn.Module):
              if tail is not None and i == self.late_layer_start:
                  if self.tail_writes_source_kv:
                      source = self.layers[i]
@@ -1782,7 +1782,7 @@ index afd8a11427..f5d894e4b2 100644
                          # The previous FFN hc_post has not run yet, so run it here too.
                          source_x = fused_boundary_attn_input(source, state)
 diff --git a/python/sglang/srt/models/deepseek_v4_replay_tail.py b/python/sglang/srt/models/deepseek_v4_replay_tail.py
-index 85ae2cd1ac..c3ecd61c9f 100644
+index 1131e9d8..ccb297cf 100644
 --- a/python/sglang/srt/models/deepseek_v4_replay_tail.py
 +++ b/python/sglang/srt/models/deepseek_v4_replay_tail.py
 @@ -154,6 +154,8 @@ class DecoderReplayTail:

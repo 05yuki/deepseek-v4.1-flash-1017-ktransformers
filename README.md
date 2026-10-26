@@ -10,7 +10,7 @@ to 1M tokens.
 
 This repository is everything needed: patches against two public upstream commits, a
 setup script that builds them, a launcher that reads the machine it runs on, and tests.
-It is a snapshot against those commits as of October 2026 (SGLang main at `65633129`,
+It is a snapshot against those commits as of October 2026 (SGLang main at `66f79f1a`,
 KTransformers `95009ea`, torch 2.14.1 with CUDA 13 wheels, FlashInfer 0.7.2, CUDA toolkit
 13.1); later upstream versions are not tracked.
 
@@ -86,12 +86,12 @@ pages on the GPU. If the server runs out of memory at launch, a shorter context
 
 ## What setup.sh does
 
-1. Clones sgl-project/sglang at `65633129` on its main branch and applies the SGLang patches
+1. Clones sgl-project/sglang at `66f79f1a` on its main branch and applies the SGLang patches
    up to `TIER` (default 2), each tier on top of the ones below it:
 
    | `TIER` | patch | what it adds |
    |---|---|---|
-   | 0 | `sglang-tier0/` (thirteen patches, one concern each) | what 1017 needs to run correctly on the KTransformers hybrid MoE: the FP8 step below, the SwiGLU clamp passed to the CPU experts, the expert mask kt-kernel takes, `-1` ids kept out of the Marlin MoE, zero GPU experts, a configurable load barrier, the tool namespaces of the current reference's chat encoding, the V4.1 indexer on its torch path on SM12x (RTX 50, RTX PRO Blackwell, DGX Spark), which has no DeepGEMM build, its torch scoring done in place, the routed experts scaled by `routed_scaling_factor` once, V4.1's own KV cache formats on SM120 (below), the KV pool sized by those formats' own entry bytes, and an automatic [SM89 attention fallback](docs/sm89.md) |
+   | 0 | `sglang-tier0/` (twelve patches, one concern each) | what 1017 needs to run correctly on the KTransformers hybrid MoE: the FP8 step below, the SwiGLU clamp passed to the CPU experts, the expert mask kt-kernel takes, `-1` ids kept out of the Marlin MoE, zero GPU experts, a configurable load barrier, the V4.1 indexer on its torch path on SM12x (RTX 50, RTX PRO Blackwell, DGX Spark), which has no DeepGEMM build, its torch scoring done in place, the routed experts scaled by `routed_scaling_factor` once, V4.1's own KV cache formats on SM120 (below), the KV pool sized by those formats' own entry bytes, and an automatic [SM89 attention fallback](docs/sm89.md) |
    | 1 | `sglang-tier1/` (one patch per feature, [docs/tier1.md](docs/tier1.md); `SGLANG_FEATURES` picks some) | streamed prefill, the lends, hot experts and placement, the KV pool on remappable memory, the GPU MoE and FP8 kernels (the streamed prefill needs SM89 or newer) |
    | 2 | `sglang-tier2-no-p2p.patch` | all-reduce through pinned host memory, for two GPUs without peer access |
 
@@ -153,10 +153,12 @@ or not. `SGLANG_TOOL_CALL_PARSER=` or `SGLANG_REASONING_PARSER=` (empty) leaves 
 
 - Thinking is off unless a request turns it on:
   `"chat_template_kwargs": {"thinking": true}`.
-- A tool may carry a `namespace` (tier 0): the prompt shows `namespace::name`, and the call
-  comes back with the bare name in `function.name` and the namespace in `namespace`.
+- The prompt is rendered by SGLang main's `deepseek-recipe` package, which differs from the
+  checkpoint's `encoding/encoding.py` in three places, tool namespaces among them
+  ([docs/patches.md](docs/patches.md#chat-encoding-dropped)).
 - `tools/tool-call-check.py [URL]` checks a running server: a call, the same call streamed,
-  the answer after the tool's result, a namespaced tool, and a call with thinking on.
+  the answer after the tool's result, and a call with thinking on (4 of 4 pass); a namespaced
+  tool is reported as the known gap above.
 
 ## The 1017 change: o in FP8 before `wo_a`
 
@@ -178,7 +180,7 @@ The earlier release did not have this step; 1017's weights were made with it.
   checkpoint's own `inference/model.py`. The step therefore turns on for 1017 (block
   32) and stays off for the earlier release.
 - `patches/sglang-dsv4-o-fp8-qdq.py` installs the same step in another SGLang tree on
-  its own. It applies to SGLang main at `65633129` unmodified.
+  its own. It applies to SGLang main at `66f79f1a` unmodified.
 
 It works the same at any tensor-parallel size. Its 32-value blocks lie inside a head
 (512 values), so splitting heads across GPUs never cuts a block.

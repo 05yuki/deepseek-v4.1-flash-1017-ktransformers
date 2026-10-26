@@ -1,4 +1,4 @@
-From 67951838a63d544e68f066bdb60366a67ba7672d Mon Sep 17 00:00:00 2001
+From 4f4339a15b5be97d0fa184a1c5e975d8bc68cf5b Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:34 +0900
 Subject: [PATCH] cutlass-kt-expert-count: CUTLASS MXFP4 MoE takes its expert
@@ -21,7 +21,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  1 file changed, 6 insertions(+), 1 deletion(-)
 
 diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
-index 7a1c5a9512..fa4a4b7e11 100644
+index 7a1c5a95..fa4a4b7e 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 +++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 @@ -92,7 +92,12 @@ class Mxfp4FlashinferCutlassMoEMethod:

@@ -1,4 +1,4 @@
-From 4b1a4c672b1320688dc46ed24eb46fded8c8e52f Mon Sep 17 00:00:00 2001
+From fb5cd0ba928c3812eaade2d01627ec98f817c473 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 23 Oct 2026 09:15:04 +0900
 Subject: [PATCH] deepseek-v4.1: size the KV pool by the ratio-1/2 layout's own
@@ -25,10 +25,10 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  1 file changed, 5 insertions(+), 1 deletion(-)
 
 diff --git a/python/sglang/srt/model_executor/pool_configurator.py b/python/sglang/srt/model_executor/pool_configurator.py
-index f3021ed026..aeb119e042 100644
+index 9972776f..e9783cc6 100644
 --- a/python/sglang/srt/model_executor/pool_configurator.py
 +++ b/python/sglang/srt/model_executor/pool_configurator.py
-@@ -1367,7 +1367,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
+@@ -1388,7 +1388,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
          """Compressed KV (+ indexer) bytes one full token adds per layer of `ratio`;
          compress state is priced per SWA slot (c4) or as fixed bytes (c128, ratio 2)."""
          if ratio in (1, 2):

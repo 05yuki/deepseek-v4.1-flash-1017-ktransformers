@@ -1,4 +1,4 @@
-From 430e620708a1ce56b1a273c97d666d8b258aab1c Mon Sep 17 00:00:00 2001
+From 86b8db94422b3961b6243e6fc5346f323df410f4 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 23 Oct 2026 00:40:00 +0900
 Subject: [PATCH] deepseek-v4.1: the V4.1 KV cache layouts on SM120 / SM121
@@ -36,7 +36,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  3 files changed, 109 insertions(+), 2 deletions(-)
 
 diff --git a/python/sglang/kernels/ops/attention/flash_mla_sm120.py b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
-index c57194d3c5..1ec816c7a9 100644
+index c57194d3..1ec816c7 100644
 --- a/python/sglang/kernels/ops/attention/flash_mla_sm120.py
 +++ b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
 @@ -313,6 +313,22 @@ def flash_mla_with_kvcache_sm120(**kwargs):
@@ -144,10 +144,10 @@ index c57194d3c5..1ec816c7a9 100644
      q,
      k_cache,
 diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
-index 9e99baa592..0389b82e52 100644
+index bc768e27..b57c0bcf 100644
 --- a/python/sglang/srt/environ.py
 +++ b/python/sglang/srt/environ.py
-@@ -1735,6 +1735,8 @@ class Envs:
+@@ -1748,6 +1748,8 @@ class Envs:
      # Compressed-cache layout under "v41": "auto" (fp4 for the fp4-rounded
      # ratio-1 / ratio-2 latents, fp8 for ratios 4 / 128), "fp8" or "fp4" for all.
      SGLANG_DSV4_COMPRESSED_KV_LAYOUT = EnvStr("auto")
@@ -157,7 +157,7 @@ index 9e99baa592..0389b82e52 100644
      # bf16 rope pool, 640 B/token instead of 1024. The unified pool takes no
      # dtype, so --kv-cache-dtype has no effect there and this switch is the
 diff --git a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
-index bc8f19fa2f..f7a5d41dcc 100644
+index bc8f19fa..f7a5d41d 100644
 --- a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
 +++ b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
 @@ -228,10 +228,25 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:

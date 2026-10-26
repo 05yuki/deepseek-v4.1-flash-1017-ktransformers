@@ -1,4 +1,4 @@
-From fb06d1177c90b67d6721e5258a8140f687d75de1 Mon Sep 17 00:00:00 2001
+From fcc5678c9aa0c66d3ad119be915f91be783332e4 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Wed, 21 Oct 2026 22:34:00 +0900
 Subject: [PATCH] deepseek-v4.1: score the torch indexer chunk in place
@@ -18,7 +18,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  2 files changed, 4 insertions(+), 3 deletions(-)
 
 diff --git a/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py b/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py
-index 6b08bd9dbd..a98d98c974 100644
+index 6b08bd9d..a98d98c9 100644
 --- a/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py
 +++ b/python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py
 @@ -287,5 +287,6 @@ class DeepseekV41Indexer(nn.Module):
@@ -31,7 +31,7 @@ index 6b08bd9dbd..a98d98c974 100644
 +        s.relu_().mul_(weights.unsqueeze(-1))
 +        return s.sum(dim=1).float()
 diff --git a/python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py b/python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py
-index 7d7983d8c2..9c7281e28a 100644
+index b0683d5b..21b0f046 100644
 --- a/python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py
 +++ b/python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py
 @@ -325,7 +325,7 @@ def dense_prefill_topk(

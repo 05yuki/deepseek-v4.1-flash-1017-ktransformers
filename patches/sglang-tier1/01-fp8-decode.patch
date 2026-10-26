@@ -1,4 +1,4 @@
-From d5b5dba3ddec66a955b67454bcffe0a762a839ad Mon Sep 17 00:00:00 2001
+From 30532c31714f4a9455bb8936c2dc15b1898ccd93 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 22:56:28 +0900
 Subject: [PATCH] fp8-decode: block-FP8 GEMV and split-K for decode-sized dense
@@ -24,7 +24,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  create mode 100644 python/sglang/kernels/ops/quantization/fp8_block_gemv.py
 
 diff --git a/python/sglang/kernels/ops/gemm/fp8_kernel.py b/python/sglang/kernels/ops/gemm/fp8_kernel.py
-index 2e7bdd7aaa..1061338ebc 100644
+index 2e7bdd7a..1061338e 100644
 --- a/python/sglang/kernels/ops/gemm/fp8_kernel.py
 +++ b/python/sglang/kernels/ops/gemm/fp8_kernel.py
 @@ -23,6 +23,7 @@ from sglang.srt.utils.custom_op import register_custom_op
@@ -110,7 +110,7 @@ index 2e7bdd7aaa..1061338ebc 100644
      if hopper_tuned:
 diff --git a/python/sglang/kernels/ops/quantization/fp8_block_gemv.py b/python/sglang/kernels/ops/quantization/fp8_block_gemv.py
 new file mode 100644
-index 0000000000..c5559254c4
+index 00000000..c5559254
 --- /dev/null
 +++ b/python/sglang/kernels/ops/quantization/fp8_block_gemv.py
 @@ -0,0 +1,172 @@

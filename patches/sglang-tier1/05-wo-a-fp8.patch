@@ -1,4 +1,4 @@
-From 0705bf0f224dd15f56705176e81d62519f30c402 Mon Sep 17 00:00:00 2001
+From 89465a89c631e81a352fa5f11c49e994675c4811 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 22:58:32 +0900
 Subject: [PATCH] wo-a-fp8: keep wo_a in the checkpoint's FP8, read by a GEMV
@@ -28,7 +28,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 
 diff --git a/python/sglang/srt/models/deepseek_common/wo_a_fp8_gemv.py b/python/sglang/srt/models/deepseek_common/wo_a_fp8_gemv.py
 new file mode 100644
-index 0000000000..8ff875faee
+index 00000000..8ff875fa
 --- /dev/null
 +++ b/python/sglang/srt/models/deepseek_common/wo_a_fp8_gemv.py
 @@ -0,0 +1,73 @@
@@ -106,10 +106,10 @@ index 0000000000..8ff875faee
 +                                                     BLOCK_R=32, BLOCK_D=128, num_warps=4)
 +    return out
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index d903035837..3ea1f9e74a 100644
+index dbd85b7c..ae1496d2 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -486,6 +486,68 @@ def _o_fp8_qdq_block() -> int:
+@@ -511,6 +511,68 @@ def _o_fp8_qdq_block() -> int:
  _O_FP8_QDQ_BLOCK = _o_fp8_qdq_block()
  
  
@@ -178,7 +178,7 @@ index d903035837..3ea1f9e74a 100644
  def _apply_wo_a_bf16_matmul(
      o: torch.Tensor,
      wo_a: torch.Tensor,
-@@ -1062,6 +1124,16 @@ class MqaAttentionBase(nn.Module):
+@@ -1089,6 +1151,16 @@ class MqaAttentionBase(nn.Module):
          else:
              wo_a_quant_config = None
  
@@ -195,7 +195,7 @@ index d903035837..3ea1f9e74a 100644
          self.fuse_wqa_wkv = fuse
          self.wo_a_fp8 = fp8
  
-@@ -1107,8 +1179,17 @@ class MqaAttentionBase(nn.Module):
+@@ -1134,8 +1206,17 @@ class MqaAttentionBase(nn.Module):
              quant_config=wo_a_quant_config,
              prefix=add_prefix("wo_a", prefix),
              parallel_group="attn_tp",
@@ -214,7 +214,7 @@ index d903035837..3ea1f9e74a 100644
          if quantize_wo_a:
              assert hasattr(self.wo_a, "weight_scale_inv"), (
                  "FP8 quant_config must create weight_scale_inv"
-@@ -3004,7 +3085,20 @@ class MQALayer(MqaAttentionBase):
+@@ -3031,7 +3112,20 @@ class MQALayer(MqaAttentionBase):
  
                      o = o_fp8_qdq_(o, _O_FP8_QDQ_BLOCK)
                  wo_a_weight = getattr(self.wo_a, "weight", None)
@@ -236,7 +236,7 @@ index d903035837..3ea1f9e74a 100644
                      if (
                          _NPU_BF16_WO_A_GEMM
                          and forward_batch.forward_mode.is_decode()
-@@ -5083,6 +5177,8 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -5124,6 +5218,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                  attn.wo_a.weight_scale_inv.format_ue8m0 = False
  
      def post_load_weights(self, is_nextn=False, weight_names=None):
@@ -245,7 +245,7 @@ index d903035837..3ea1f9e74a 100644
          if self.wo_a_fp8:
              self._setup_fp8_wo_a_scales(is_nextn)
  
-@@ -5799,6 +5895,9 @@ def _prepare_deepseek_v4_weights(
+@@ -5840,6 +5936,9 @@ def _prepare_deepseek_v4_weights(
          return weights
      if quant_config is not None and quant_config.get_name() == "quark":
          weights = _rename_quark_fp8_block_scales(weights)

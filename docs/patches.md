@@ -4,7 +4,7 @@
 
 | tier | file | applies to |
 |---|---|---|
-| 0 | `patches/sglang-tier0/NN-*.patch` | sgl-project/sglang main at `65633129`, one concern each |
+| 0 | `patches/sglang-tier0/NN-*.patch` | sgl-project/sglang main at `66f79f1a`, one concern each |
 | 1 | `patches/sglang-tier1/NN-*.patch` | the same, after tier 0: one patch per feature ([tier1.md](tier1.md)) |
 | 2 | `patches/sglang-tier2-no-p2p.patch` | the same, after tier 1 |
 | 1 | `patches/kt-kernel-tree.patch` | kvcache-ai/ktransformers `95009ea` (below tier 1 it is built as pinned) |
@@ -21,7 +21,7 @@
 - **Tier 2** is what depends on the machine: two GPUs without peer access.
 
 The SGLang patches are the commits of branch `dsv41-1017-main` of
-[05yuki/sglang-upstream](https://github.com/05yuki/sglang-upstream/tree/dsv41-1017-main) on `65633129`, one
+[05yuki/sglang-upstream](https://github.com/05yuki/sglang-upstream/tree/dsv41-1017-main) on `66f79f1a`, one
 concern a commit, in `git format-patch` form: each file carries its commit message (what the change
 is for, its switch, how it was checked). `git log` on the branch reads as the list below.
 
@@ -41,7 +41,7 @@ patch goes and the pin moves past it.
 | `04-mask-zero` | not sent (a workaround for the Marlin MoE path) |
 | `05-zero-gpu-experts` | [#45188](https://github.com/sgl-project/sglang/pull/45188) |
 | `06-load-timeout` | [#45184](https://github.com/sgl-project/sglang/pull/45184) |
-| `07-chat-encoding` | dropped 2026-10-25: SGLang main renders DeepSeek-V4.1 prompts through `deepseek-recipe` 0.2.0 ([#45315](https://github.com/sgl-project/sglang/pull/45315)), which carries the tool namespaces |
+| `07-chat-encoding` | dropped 2026-10-25: SGLang main renders DeepSeek-V4.1 prompts through `deepseek-recipe` 0.2.0 ([#45315](https://github.com/sgl-project/sglang/pull/45315)); where that differs from the checkpoint's encoding is under [Chat encoding (dropped)](#chat-encoding-dropped) |
 | `08-sm12x-indexer` | not sent |
 | `09-indexer-score-in-place` | [#45745](https://github.com/sgl-project/sglang/pull/45745) |
 | `10-routed-scale-once` | [#45810](https://github.com/sgl-project/sglang/pull/45810) |
