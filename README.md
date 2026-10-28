@@ -20,6 +20,16 @@ MODEL=/models/dsv41-1017 ./setup.sh
 MODEL=/models/dsv41-1017 ./serve.sh
 ```
 
+Or all of it in one command:
+
+```
+./run.sh
+```
+
+`run.sh` runs `setup.sh`, downloads the checkpoint into `./models/` when it is not there, and starts `serve.sh`.
+`MODEL=<dir>` uses a checkpoint already downloaded.
+It remembers the directory in `state/run.env`, so the next `./run.sh` only starts the server.
+
 `MODEL=/models/dsv41-1017 tools/check.sh` starts the server once, sends one short request,
 checks that an answer comes back, and stops the server: the one command that says a setup works.
 
