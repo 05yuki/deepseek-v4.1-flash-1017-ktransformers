@@ -34,7 +34,16 @@ It remembers the directory in `state/run.env`, so the next `./run.sh` only start
 checks that an answer comes back, and stops the server: the one command that says a setup works.
 
 The server speaks SGLang's OpenAI-compatible API on `127.0.0.1:8080`, one request at a
-time. To serve other machines, set `SGLANG_HOST=0.0.0.0` and `SGLANG_API_KEY=<key>`
+time by default. `SGLANG_MAX_RUNNING_REQUESTS=4` runs up to four at once.
+
+- Four streams of Japanese prose decode at 74 tok/s together (18.5 each), against 42.7 for one.
+  Their routes gather on the same experts.
+- Four streams of different kinds of text (Japanese, Chinese, JSON, Python) stay at 47 tok/s together.
+  The CPU reads every expert any of them routes to.
+- A long prompt holds the others while it prefills: the prefill lends the GPU's weights and free KV
+  pages to itself. Three running answers waited 62 s for a 131K-token prompt.
+
+To serve other machines, set `SGLANG_HOST=0.0.0.0` and `SGLANG_API_KEY=<key>`
 (clients then send `Authorization: Bearer <key>`). The same setup also serves the earlier
 DeepSeek-V4.1-Flash release: point `MODEL` at it.
 

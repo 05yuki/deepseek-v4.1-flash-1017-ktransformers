@@ -326,7 +326,7 @@ command=(
   --max-total-tokens "$max_total_tokens"
   --kv-cache-dtype "$kv_cache_dtype"
   --mem-fraction-static "$mem_fraction"
-  --max-running-requests 1
+  --max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS:-1}"
   --chunked-prefill-size "$chunked_prefill"
   --max-prefill-tokens "$chunked_prefill"
   --sampling-backend pytorch
