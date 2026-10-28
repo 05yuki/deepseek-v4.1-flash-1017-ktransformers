@@ -1,4 +1,4 @@
-From 3a1a41ffdb1021e25cdd5bac628119a024970ede Mon Sep 17 00:00:00 2001
+From 776f644a3f523da4332b893f9b2d4bfc05976fb8 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:37 +0900
 Subject: [PATCH] distributed: all-reduce through pinned host memory for GPUs
@@ -319,7 +319,7 @@ index 00000000..dc9b9a5b
 +        self.ext.ll_ar(t, self.base, self.rank, self.slot_bytes, self.counter)
 +        return t
 diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
-index 945c1c9d..97c43c9a 100644
+index c2f78053..d1f27882 100644
 --- a/python/sglang/srt/distributed/parallel_state.py
 +++ b/python/sglang/srt/distributed/parallel_state.py
 @@ -538,6 +538,40 @@ class GroupCoordinator:
@@ -363,7 +363,7 @@ index 945c1c9d..97c43c9a 100644
          # Create communicator for other hardware backends
          from sglang.srt.distributed.device_communicators.hpu_communicator import (
              HpuCommunicator,
-@@ -699,6 +733,12 @@ class GroupCoordinator:
+@@ -715,6 +749,12 @@ class GroupCoordinator:
                  torch.distributed.all_reduce(input_, group=self.device_group)
              return input_
  

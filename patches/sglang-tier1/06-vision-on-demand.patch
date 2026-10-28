@@ -1,4 +1,4 @@
-From a28cc37c9d3b23b8b1b7820d7fa57da9e11f206a Mon Sep 17 00:00:00 2001
+From ee88f5f30a32f76f5884a705962c9cd53132743a Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 22:59:06 +0900
 Subject: [PATCH] vision-on-demand: keep the vision tower in host memory

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build everything serve.sh needs, inside this directory:
-#   third_party/sglang         sgl-project/sglang main @ 65505981 + patches/sglang-tier*
+#   third_party/sglang         sgl-project/sglang main @ 5d8e90a0 + patches/sglang-tier*
 #   third_party/ktransformers  kvcache-ai/ktransformers @ 95009ea (+ patches/kt-kernel-tree.patch
 #                              and patches/kt-kernel-llama-cpp.patch from tier 1)
 #   .venv                      Python 3.12, requirements.txt, kt-kernel built for this CPU and GPU
@@ -28,7 +28,7 @@
 set -Eeuo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$here"
-SGLANG_COMMIT=655059819cda56f4c0feb5e3f09056caa6907bc7
+SGLANG_COMMIT=5d8e90a0f96e6ba35603f9b27f2f1039268c810e
 KT_COMMIT=95009ea6856c0799e517e93cb12be5e8494bc7ce
 TIER="${TIER:-2}"
 [[ "$TIER" =~ ^[012]$ ]] || { echo "TIER must be 0, 1 or 2 (tiers 2 and 3 of before 10-21 are 1 and 2)" >&2; exit 2; }

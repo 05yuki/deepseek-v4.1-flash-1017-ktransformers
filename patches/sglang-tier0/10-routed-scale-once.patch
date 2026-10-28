@@ -1,4 +1,4 @@
-From 0aaefae4cd01cc8574c37afb6ac2d366a3b1c148 Mon Sep 17 00:00:00 2001
+From b9cdedc94e393471793cde4e9b5d8ae3a9add5c7 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Thu, 22 Oct 2026 23:30:00 +0900
 Subject: [PATCH] kt: scale the routed output once when the top-k already folds
@@ -15,10 +15,10 @@ checkpoint's own inference code: 2.878 before, 2.596 after (reference 2.594).
  1 file changed, 12 insertions(+), 2 deletions(-)
 
 diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
-index 15a2c542..b4a4af03 100644
+index 017e4e85..4756256a 100644
 --- a/python/sglang/srt/models/deepseek_v2.py
 +++ b/python/sglang/srt/models/deepseek_v2.py
-@@ -1234,7 +1234,12 @@ class DeepseekV2MoE(nn.Module):
+@@ -1238,7 +1238,12 @@ class DeepseekV2MoE(nn.Module):
              not _is_cuda
              and not _is_musa
              and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
@@ -32,7 +32,7 @@ index 15a2c542..b4a4af03 100644
          ):
              final_hidden_states *= self.routed_scaling_factor
  
-@@ -1417,7 +1422,12 @@ class DeepseekV2MoE(nn.Module):
+@@ -1421,7 +1426,12 @@ class DeepseekV2MoE(nn.Module):
              and not _is_musa
              and not _is_xpu
              and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)

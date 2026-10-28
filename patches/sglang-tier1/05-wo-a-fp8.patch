@@ -1,4 +1,4 @@
-From 5e7f1b929fcecc684735a5803ed0a8202da39d00 Mon Sep 17 00:00:00 2001
+From 7eb2ef80912bf045ad53f078cc96e5460c217927 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 22:58:32 +0900
 Subject: [PATCH] wo-a-fp8: keep wo_a in the checkpoint's FP8, read by a GEMV

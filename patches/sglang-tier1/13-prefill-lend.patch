@@ -1,4 +1,4 @@
-From 300fa57f27060efb2770d2ff25aa1673806174f6 Mon Sep 17 00:00:00 2001
+From 268c591fd20d3a96b604b76c1eedbccf38e612cf Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] prefill-lend: lend the GPU-resident weights' memory to a
@@ -1692,10 +1692,10 @@ index 00000000..776077ca
 +        _bounce["n"] = nbytes
 +    return _bounce["buf"][:nbytes]
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 7cc8dcec..4929f574 100644
+index e2124e4c..daaa7b39 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -6287,6 +6287,11 @@ class Scheduler(
+@@ -6305,6 +6305,11 @@ class Scheduler(
  
  
  def dispatch_event_loop(scheduler: Scheduler):
@@ -1708,10 +1708,10 @@ index 7cc8dcec..4929f574 100644
          return role_switch.run_event_loop_supervisor(
              scheduler,
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 52ec40d4..2ad98858 100644
+index baddf006..5a8cae14 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -1891,6 +1891,11 @@ class ModelRunner:
+@@ -1890,6 +1890,11 @@ class ModelRunner:
                  forward_batch,
              ) as recorder_outputs,
          ):
