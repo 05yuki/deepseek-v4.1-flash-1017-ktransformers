@@ -11,6 +11,7 @@
 | 1 | `patches/kt-kernel-llama-cpp.patch` | ktransformers' `third_party/llama.cpp` submodule |
 | 1 | `patches/kt-kernel-load-prefetch.py` | the installed kt-kernel (parallel expert loading) |
 | - | `patches/sglang-dsv4-o-fp8-qdq.py`, `patches/dsv4_o_fp8_qdq.py` | another SGLang tree, on their own (tier 0 already has them) |
+| - | `patches/sglang-optional/NN-*.patch` | the full stack, by hand; `setup.sh` never applies them (below) |
 
 - **Tier 0** is what DeepSeek-V4.1-Flash-1017 needs to run correctly on the KTransformers
   hybrid MoE, on any GPU, and nothing else. KTransformers `95009ea` needs no change for it: its AVX2
@@ -204,6 +205,21 @@ them unchanged, which may not be their best:
 - `KT_GPU_STREAM_PREFILL` (512 tokens) and `KT_GPU_STREAM_GROUP` (4 experts a group);
 - the hot lend's `KT_KV_HOT_EXTRA` (16 a layer) and `KT_KV_HOT_SPARE_FLOOR_MB` (1024);
 - `SGLANG_MEM_FRACTION` (0.81) and the prefill chunk, which the first launch calibrates.
+
+## Optional patches
+
+`patches/sglang-optional/` holds patches that fit on the full stack but carry no measured
+number here. `setup.sh` does not apply them; after it has run, one goes on by hand:
+`git -C third_party/sglang apply --whitespace=nowarn patches/sglang-optional/NN-name.patch`.
+CI checks that each still applies.
+
+- `01-sm89-indexer-merge.patch`: two default-off switches scoped to SM89, `KT_IDX_LIVE_TOPK=1`
+  (the decode indexer's selection bounded by the device-side sequence lengths) and
+  `KT_SM89_FUSED_MERGE=1` (the portable attention fallback's merge and sink in one kernel).
+  Contributed in #7 by howl9003, with its parity fixtures `tools/test_live_topk.py`,
+  `tools/test_merge_sink.py` and `tools/test_fused_merge_wiring.py`
+  ([sm89-indexer-merge.md](sm89-indexer-merge.md)). It moves to tier 0 once each switch has
+  an A/B on an SM89 GPU (decode tok/s and the `tools/nll.py` check, with and without it).
 
 ## Tests
 

@@ -40,6 +40,10 @@ jobs:
           for f in ../patches/sglang-tier1/[0-9][0-9]-*.patch ../patches/sglang-tier2-no-p2p.patch; do
             git apply --whitespace=nowarn "$f"
           done
+          # the optional patches each fit on the full stack
+          for f in ../patches/sglang-optional/[0-9][0-9]-*.patch; do
+            git apply --check --whitespace=nowarn "$f"
+          done
 
       - name: SM89 dispatch contracts (CPU only)
         run: python3 tools/test_sm89_dispatch.py sglang

@@ -1,6 +1,7 @@
 # Optional SM89 indexer and merge kernels
 
-Tier-0 patch 14 adds two independent default-off switches, scoped to compute
+`patches/sglang-optional/01-sm89-indexer-merge.patch` (applied by hand on the full stack, see
+[patches.md](patches.md#optional-patches)) adds two independent default-off switches, scoped to compute
 capability 8.9: `KT_IDX_LIVE_TOPK=1` and `KT_SM89_FUSED_MERGE=1`.
 Live top-k bounds work by device-side sequence lengths and keeps the existing
 torch path above `KT_IDX_LIVE_TOPK_MAX_L` (65536). The fused merge preserves
