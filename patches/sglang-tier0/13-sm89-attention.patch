@@ -1,4 +1,4 @@
-From 45c14d4aee9fe8824e419568559e114c2ff05a1c Mon Sep 17 00:00:00 2001
+From 0bb47b39cd7529f159ccc54522cb4bf7a50a69e5 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Sun, 25 Oct 2026 09:28:20 +0900
 Subject: [PATCH] [tier 0] Ada SM89 sparse attention fallback
@@ -373,7 +373,7 @@ index 00000000..623b0e87
 +        dim=0,
 +    )
 diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-index 25ab480e..082d304c 100644
+index 9a29aa8e..bb6af1f0 100644
 --- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 +++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 @@ -207,8 +207,14 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:

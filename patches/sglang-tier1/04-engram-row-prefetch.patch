@@ -1,4 +1,4 @@
-From 9bb0e94fb0b3165178c9f2b05a21d8276b27b281 Mon Sep 17 00:00:00 2001
+From 49c840a15fec139d6da8e90c3f39ea5766c0f79f Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] engram-row-prefetch: start the engram row lookups with the
@@ -31,10 +31,10 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  2 files changed, 74 insertions(+), 7 deletions(-)
 
 diff --git a/python/sglang/srt/layers/engram.py b/python/sglang/srt/layers/engram.py
-index 78fe4839..3740ef51 100644
+index 1fee97e3..71f08f2f 100644
 --- a/python/sglang/srt/layers/engram.py
 +++ b/python/sglang/srt/layers/engram.py
-@@ -1357,6 +1357,12 @@ class Engram(nn.Module):
+@@ -1354,6 +1354,12 @@ class Engram(nn.Module):
              # Nothing to gate, and the MXFP8 quantize behind wkv rejects an
              # empty M.
              return x
@@ -48,7 +48,7 @@ index 78fe4839..3740ef51 100644
          image_ids = input_ids if self.image_token_id is not None else None
          return engram_gate(
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 8c949e9e..dbd85b7c 100644
+index d85dd86c..991b3e51 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
 @@ -3,6 +3,7 @@ from __future__ import annotations
@@ -124,7 +124,7 @@ index 8c949e9e..dbd85b7c 100644
          tail = None
          if (
              self.late_layer_start is not None
-@@ -4196,13 +4248,22 @@ class DeepseekV4Model(nn.Module):
+@@ -4195,13 +4247,22 @@ class DeepseekV4Model(nn.Module):
              if engram is not None:
                  # No local name holds the pre-Engram residual: it would stay alive
                  # until the next Engram layer.

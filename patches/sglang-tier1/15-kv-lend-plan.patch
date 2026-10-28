@@ -1,4 +1,4 @@
-From 9ad9b13ebec090fca3bc64dde2374e9f77e92dfb Mon Sep 17 00:00:00 2001
+From ad7a614f4e0765ea2e2c0d5da3477579922b058b Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] kv-lend-plan: lend the KV pool's free pages to prefill, plan
@@ -1770,10 +1770,10 @@ index 00000000..a2b878d9
 +              + f", cap {chunk})", flush=True)
 +    return c
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index c0556ff3..df67cc7a 100644
+index 0c7e55c0..21d3ffd0 100644
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -4137,11 +4137,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -4119,11 +4119,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                          if req.extend_batch_idx < 2:
                              continue
                          else:
@@ -1793,10 +1793,10 @@ index c0556ff3..df67cc7a 100644
                      else:
                          self._evict_swa(req, pre_len)
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 80a8f2a3..5e49e7da 100644
+index 4929f574..6bd9e2c9 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -3485,6 +3485,10 @@ class Scheduler(
+@@ -3545,6 +3545,10 @@ class Scheduler(
              req.storage_prefetch_retry_attempts = 0
              req.storage_prefetch_last_match_len = None
              req.staged_prefetch_plan = None
@@ -1807,7 +1807,7 @@ index 80a8f2a3..5e49e7da 100644
          if self.disaggregation_mode == DisaggregationMode.NULL:
              if self._abort_on_queued_limit(req):
                  self._release_aborted_request(req)
-@@ -4145,6 +4149,11 @@ class Scheduler(
+@@ -4205,6 +4209,11 @@ class Scheduler(
              dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
              if dynamic_size is not None:
                  chunked_prefill_size = dynamic_size
@@ -1820,10 +1820,10 @@ index 80a8f2a3..5e49e7da 100644
          # Prefill policy
          # Get BLOCK_M from the backend for tile-budget admission logic
 diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
-index 1d7a6c51..aa682413 100644
+index 84f52dbb..8f81c9bd 100644
 --- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
 +++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
-@@ -472,7 +472,11 @@ class KVCacheConfigurator:
+@@ -473,7 +473,11 @@ class KVCacheConfigurator:
              )
              config = self.memory_pool_config
          else:
@@ -1836,7 +1836,7 @@ index 1d7a6c51..aa682413 100644
  
          sizes = self._derive_pool_sizes(config=config)
  
-@@ -481,6 +485,10 @@ class KVCacheConfigurator:
+@@ -482,6 +486,10 @@ class KVCacheConfigurator:
              req_to_token_pool=self.req_to_token_pool,
              token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
          )
@@ -1847,7 +1847,7 @@ index 1d7a6c51..aa682413 100644
  
          swa_max_total_num_tokens = sizes.swa_max_total_num_tokens
          alloc = pools.token_to_kv_pool_allocator
-@@ -563,6 +571,15 @@ class KVCacheConfigurator:
+@@ -564,6 +572,15 @@ class KVCacheConfigurator:
          if is_deepseek_v4(self.model_config.hf_config):
              c4_state_dtype, c128_state_dtype = _get_dsv4_compress_state_dtypes()
  

@@ -4,7 +4,7 @@
 
 | tier | file | applies to |
 |---|---|---|
-| 0 | `patches/sglang-tier0/NN-*.patch` | sgl-project/sglang main at `66f79f1a`, one concern each |
+| 0 | `patches/sglang-tier0/NN-*.patch` | sgl-project/sglang main at `65505981`, one concern each |
 | 1 | `patches/sglang-tier1/NN-*.patch` | the same, after tier 0: one patch per feature ([tier1.md](tier1.md)) |
 | 2 | `patches/sglang-tier2-no-p2p.patch` | the same, after tier 1 |
 | 1 | `patches/kt-kernel-tree.patch` | kvcache-ai/ktransformers `95009ea` (below tier 1 it is built as pinned) |
@@ -21,7 +21,7 @@
 - **Tier 2** is what depends on the machine: two GPUs without peer access.
 
 The SGLang patches are the commits of branch `dsv41-1017-main` of
-[05yuki/sglang-upstream](https://github.com/05yuki/sglang-upstream/tree/dsv41-1017-main) on `66f79f1a`, one
+[05yuki/sglang-upstream](https://github.com/05yuki/sglang-upstream/tree/dsv41-1017-main) on `65505981`, one
 concern a commit, in `git format-patch` form: each file carries its commit message (what the change
 is for, its switch, how it was checked). `git log` on the branch reads as the list below.
 
@@ -30,7 +30,7 @@ A switch marked "on" is on in `serve.sh`.
 ## SGLang tier 0
 
 What 1017 needs to run correctly. Each patch is one concern; its commit message says how
-it was checked. Eight are pull requests to SGLang, one concern each; when one is merged, its
+it was checked. Seven are pull requests to SGLang, one concern each; when one is merged, its
 patch goes and the pin moves past it.
 
 | patch | upstream |
@@ -46,7 +46,7 @@ patch goes and the pin moves past it.
 | `09-indexer-score-in-place` | [#45745](https://github.com/sgl-project/sglang/pull/45745) |
 | `10-routed-scale-once` | [#45810](https://github.com/sgl-project/sglang/pull/45810) |
 | `11-v41-kv-layout` | [#45851](https://github.com/sgl-project/sglang/pull/45851) |
-| `12-low-ratio-pool-bytes` | [#45931](https://github.com/sgl-project/sglang/pull/45931) |
+| `12-low-ratio-pool-bytes` | dropped 2026-10-28: SGLang main prices the ratio-1/2 entry by its own layout ([#41275](https://github.com/sgl-project/sglang/pull/41275)), the change #45931 made, and counts the pages the pool reserves on top |
 | `13-sm89-attention` | [SM89 fallback and validation](sm89.md) |
 
 ### KTransformers wrapper

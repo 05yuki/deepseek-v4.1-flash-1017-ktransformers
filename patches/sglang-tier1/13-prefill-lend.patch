@@ -1,4 +1,4 @@
-From a5ea6bed1d6b89239d01974a4d58f28b436eecb2 Mon Sep 17 00:00:00 2001
+From 300fa57f27060efb2770d2ff25aa1673806174f6 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] prefill-lend: lend the GPU-resident weights' memory to a
@@ -1692,10 +1692,10 @@ index 00000000..776077ca
 +        _bounce["n"] = nbytes
 +    return _bounce["buf"][:nbytes]
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index d223d2e4..80a8f2a3 100644
+index 7cc8dcec..4929f574 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -6204,6 +6204,11 @@ class Scheduler(
+@@ -6287,6 +6287,11 @@ class Scheduler(
  
  
  def dispatch_event_loop(scheduler: Scheduler):
@@ -1708,10 +1708,10 @@ index d223d2e4..80a8f2a3 100644
          return role_switch.run_event_loop_supervisor(
              scheduler,
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 5d448c02..6f05c8ff 100644
+index 52ec40d4..2ad98858 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -1862,6 +1862,11 @@ class ModelRunner:
+@@ -1891,6 +1891,11 @@ class ModelRunner:
                  forward_batch,
              ) as recorder_outputs,
          ):
@@ -1754,7 +1754,7 @@ index edda2a76..1512ca43 100644
      @staticmethod
      def restore_weights_before_loading(model, target_device):
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 9bbe9f93..7d813350 100644
+index 95aee9b7..38ba4da6 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
 @@ -1447,7 +1447,11 @@ class MqaAttentionBase(nn.Module):
@@ -1770,7 +1770,7 @@ index 9bbe9f93..7d813350 100644
              if meta is not None:
                  try:
                      meta.q_pad_buffer = buf
-@@ -4352,6 +4356,10 @@ class DeepseekV4Model(nn.Module):
+@@ -4351,6 +4355,10 @@ class DeepseekV4Model(nn.Module):
              if tail is not None and i == self.late_layer_start:
                  if self.tail_writes_source_kv:
                      source = self.layers[i]
@@ -1782,7 +1782,7 @@ index 9bbe9f93..7d813350 100644
                          # The previous FFN hc_post has not run yet, so run it here too.
                          source_x = fused_boundary_attn_input(source, state)
 diff --git a/python/sglang/srt/models/deepseek_v4_replay_tail.py b/python/sglang/srt/models/deepseek_v4_replay_tail.py
-index 1131e9d8..ccb297cf 100644
+index 55ad59dc..88dea8d5 100644
 --- a/python/sglang/srt/models/deepseek_v4_replay_tail.py
 +++ b/python/sglang/srt/models/deepseek_v4_replay_tail.py
 @@ -154,6 +154,8 @@ class DecoderReplayTail:

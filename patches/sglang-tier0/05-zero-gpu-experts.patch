@@ -1,4 +1,4 @@
-From e536e91806b3305a87c53fc3ca6fa523a04ec303 Mon Sep 17 00:00:00 2001
+From c4065d1387fa7a4bcb970f2c06ef909369285508 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:33 +0900
 Subject: [PATCH] kt: run with zero GPU experts (--kt-num-gpu-experts 0)

@@ -1,4 +1,4 @@
-From 938154c0c047c3a7a22400cd5592a39c8319ca86 Mon Sep 17 00:00:00 2001
+From a7d6c246f7f97f693e13b4603d6bcd79965bd1d3 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 23 Oct 2026 12:16:53 +0900
 Subject: [PATCH] host-kv: DeepSeek-V4.1's KV pool covers the whole context,
@@ -68,7 +68,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  create mode 100644 python/sglang/srt/mem_cache/dsv41_host_kv.py
 
 diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-index 082d304c..fc3fde94 100644
+index bb6af1f0..1a7d9fae 100644
 --- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 +++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 @@ -1280,6 +1280,10 @@ class DeepseekV4AttnBackend(
@@ -669,7 +669,7 @@ index 00000000..942f7a5e
 +            num_warps=4,
 +        )
 diff --git a/python/sglang/srt/model_executor/pool_configurator.py b/python/sglang/srt/model_executor/pool_configurator.py
-index 7a4e1e95..92479ec4 100644
+index 75fcc617..47ac71dc 100644
 --- a/python/sglang/srt/model_executor/pool_configurator.py
 +++ b/python/sglang/srt/model_executor/pool_configurator.py
 @@ -9,6 +9,7 @@ from available GPU memory using a unified coeff+bias model:
@@ -680,7 +680,7 @@ index 7a4e1e95..92479ec4 100644
  from bisect import bisect_right
  from dataclasses import dataclass
  from typing import TYPE_CHECKING, Optional
-@@ -1660,6 +1661,35 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
+@@ -1701,6 +1702,35 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                  f"or SGLANG_SWA_EVICTION_INTERVAL, or increase --mem-fraction-static."
              )
  

@@ -1,4 +1,4 @@
-From 862b1bc6a1e5fd48bb7e17b1023b0f8c8b2561e3 Mon Sep 17 00:00:00 2001
+From 0792f1ec8e049441ac853c0b75d91938e75bc47d Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:34 +0900
 Subject: [PATCH] sm120: the V4.1 indexer takes the torch path on SM12x

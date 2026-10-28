@@ -1,4 +1,4 @@
-From d469171d75bb78f2a917ef159ba70260ecc4ba80 Mon Sep 17 00:00:00 2001
+From de36ecb4495c06b769d60134d97b085bbbba8993 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] stream-prefill: stream the CPU experts to the GPU for long

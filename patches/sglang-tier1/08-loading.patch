@@ -1,4 +1,4 @@
-From 5ca4ed723b68f991f4277b3fbca6b5c87a2eb845 Mon Sep 17 00:00:00 2001
+From 016046f0b7eb23e3d26b30068da50c8d373bf79d Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] loading: skip the CPU-only experts in the GPU loader, read
@@ -115,7 +115,7 @@ index a832393b..acfc8aed 100644
  
      def create_moe_runner(
 diff --git a/python/sglang/srt/model_loader/weight_utils.py b/python/sglang/srt/model_loader/weight_utils.py
-index 1d7fce13..74390749 100644
+index 64d781ea..573b4707 100644
 --- a/python/sglang/srt/model_loader/weight_utils.py
 +++ b/python/sglang/srt/model_loader/weight_utils.py
 @@ -1143,6 +1143,76 @@ def _drop_file_cache_after_load(path: str) -> None:
@@ -291,7 +291,7 @@ index 1d7fce13..74390749 100644
  
      # Sliding window: max_workers loading + 1 prefetched.
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 2cc2d151..9bbe9f93 100644
+index 10d71b82..95aee9b7 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
 @@ -21,6 +21,7 @@ from typing import (
@@ -349,7 +349,7 @@ index 2cc2d151..9bbe9f93 100644
  def _o_fp8_qdq_block() -> int:
      """SGLANG_DSV4_O_FP8_QDQ_BLOCK (sglang-dsv4-o-fp8-qdq.py): FP8 quant-dequant of the
      attention output before a bf16 wo_a, in blocks of this many; 0 = off."""
-@@ -5525,6 +5566,8 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -5524,6 +5565,8 @@ class DeepseekV4ForCausalLM(nn.Module):
  
          cache_compressor_weight = {}
          COMPRESSOR_PART = ".compressor.w"
@@ -358,7 +358,7 @@ index 2cc2d151..9bbe9f93 100644
  
          fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
          cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
-@@ -5578,6 +5621,13 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -5577,6 +5620,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                          is_nextn=is_nextn,
                          num_hidden_layers=self.config.num_hidden_layers,
                      )

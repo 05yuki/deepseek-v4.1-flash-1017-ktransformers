@@ -1,4 +1,4 @@
-From 7fb15ec1a36fb4d06f4961e8a421750bf7abf6d2 Mon Sep 17 00:00:00 2001
+From 0aaefae4cd01cc8574c37afb6ac2d366a3b1c148 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Thu, 22 Oct 2026 23:30:00 +0900
 Subject: [PATCH] kt: scale the routed output once when the top-k already folds
@@ -15,7 +15,7 @@ checkpoint's own inference code: 2.878 before, 2.596 after (reference 2.594).
  1 file changed, 12 insertions(+), 2 deletions(-)
 
 diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
-index 2a101cd3..c28706d7 100644
+index 15a2c542..b4a4af03 100644
 --- a/python/sglang/srt/models/deepseek_v2.py
 +++ b/python/sglang/srt/models/deepseek_v2.py
 @@ -1234,7 +1234,12 @@ class DeepseekV2MoE(nn.Module):

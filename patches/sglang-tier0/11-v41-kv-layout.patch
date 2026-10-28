@@ -1,4 +1,4 @@
-From 86b8db94422b3961b6243e6fc5346f323df410f4 Mon Sep 17 00:00:00 2001
+From f0b74afb55ce60d423e648ba2c61b79b8c3beac9 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 23 Oct 2026 00:40:00 +0900
 Subject: [PATCH] deepseek-v4.1: the V4.1 KV cache layouts on SM120 / SM121
@@ -144,10 +144,10 @@ index c57194d3..1ec816c7 100644
      q,
      k_cache,
 diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
-index bc768e27..b57c0bcf 100644
+index 14d84098..d74cbad3 100644
 --- a/python/sglang/srt/environ.py
 +++ b/python/sglang/srt/environ.py
-@@ -1748,6 +1748,8 @@ class Envs:
+@@ -1797,6 +1797,8 @@ class Envs:
      # Compressed-cache layout under "v41": "auto" (fp4 for the fp4-rounded
      # ratio-1 / ratio-2 latents, fp8 for ratios 4 / 128), "fp8" or "fp4" for all.
      SGLANG_DSV4_COMPRESSED_KV_LAYOUT = EnvStr("auto")

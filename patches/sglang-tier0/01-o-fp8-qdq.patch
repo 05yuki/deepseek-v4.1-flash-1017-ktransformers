@@ -1,4 +1,4 @@
-From 9712e13477df629a31d9ab869eb76697d43d2768 Mon Sep 17 00:00:00 2001
+From 687eb45e5b93b897624219361ebaaf6155c27197 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:32 +0900
 Subject: [PATCH] deepseek-v4: FP8 quantize-dequantize of the attention output
@@ -132,7 +132,7 @@ index 00000000..3a062ae8
 +    v = (f / s).clamp(-448.0, 448.0)
 +    return (v.to(torch.float8_e4m3fn).float() * s).to(x.dtype).reshape(shape)
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index a610a4de..8c949e9e 100644
+index 63e5ba14..d85dd86c 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
 @@ -499,6 +499,17 @@ def _wo_a_bf16_bmm_token_major(o: torch.Tensor, wo_a: torch.Tensor) -> torch.Ten

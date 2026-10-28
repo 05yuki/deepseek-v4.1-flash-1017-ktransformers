@@ -1,7 +1,7 @@
 # Tier 1, one patch per feature
 
 Tier 1 is one patch per feature in `patches/sglang-tier1/`, applied in the order of their numbers on
-SGLang main at `66f79f1a` after tier 0; tier 2 applies on top. `setup.sh` applies all of them by
+SGLang main at `65505981` after tier 0; tier 2 applies on top. `setup.sh` applies all of them by
 default; `SGLANG_FEATURES=a,b,...` picks some (the names below), and `serve.sh` turns on only what
 was applied.
 
