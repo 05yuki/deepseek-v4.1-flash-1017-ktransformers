@@ -78,7 +78,7 @@ after launch pays a one-time warm-up; the second is a new 35,000-token prompt on
 | `kv-vmm`, `kv-lend-plan` | 43.9 | 24.5 | 18.4 | 2.69 |
 | `kv-vmm`, `kv-lend-plan`, `hot-lend` | 44.4 | 24.8 | 19.2 | 2.66 |
 | all sixteen | 41.5 | 21.0 | 46.2 | 4.24 |
-| `cpu-gpu-overlap` (`KT_SHARED_AFTER_SUBMIT`, `KT_HANDOFF_PACK`; both default off) | unchanged | unchanged | TP1 31.5/31.6 off → 32.8 shared / 32.0 pack / 32.7 both ([05yuki, earlier bundle](https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers/pull/5#issuecomment-6378935104)) | not measured |
+| `cpu-gpu-overlap` on the sixteen plus `stream-mmq` | unchanged | unchanged | 45.5-46.1 → 47.5-48.3 | 4.24 |
 
 Numerics: the 2-token NLL check gives the base's value for every patch above but four.
 `fp8-decode` and `gpu-moe-fp32` change the GPU arithmetic (see their Numerics lines), and
@@ -548,3 +548,35 @@ Files (under `python/sglang/`):
 - `srt/layers/moe/kt_stream_prefill.py`
 - `srt/layers/moe/kt_gguf_moe_mmq.py` (new)
 - `srt/layers/moe/kt_gguf_moe_mmq/` (new: the binding and the vendored llama.cpp 23b0202 MMQ kernels, MIT)
+
+## 19 cpu-gpu-overlap
+
+On in `serve.sh` (`KT_SHARED_AFTER_SUBMIT=1 KT_HANDOFF_PACK=1`; off in the code). Two
+changes to the decode step's hand-off to the CPU experts, contributed in #5 by howl9003.
+
+- `KT_SHARED_AFTER_SUBMIT`: the shared expert's GEMMs fork from an event recorded right
+  after the CPU request is submitted, instead of before the router, so they stop contending
+  with the router → top-k → hand-off chain that feeds the CPU. Scheduling only.
+- `KT_HANDOFF_PACK`: one Triton kernel writes the hidden rows (bf16), the routing weights
+  (fp32) and the expert ids (widened to int64) straight into kt-kernel's pinned host buffers
+  through their device-mapped addresses, in place of the ids cast and three DtoH copies the
+  graph serialised before the request flag. Decode and verify batches only (256 rows at most);
+  a buffer that is not device-mapped turns the pack off for the process, with a warning.
+  `patches/kt-kernel-cpu-handoff.patch` gives `submit_forward` the `packer` argument.
+
+**Effect** (two RTX 5070 Ti, TP 2, the `serve.sh` defaults, two launches each way):
+
+- Japanese prose decode 46.1 / 45.5 → 48.3 / 47.5 tok/s (+4.6%).
+- The six other texts rise 2-7% in both rounds: Chinese prose 39.7-40.7 → 42.2-43.5,
+  English prose 38.1-38.2 → 39.6-40.2, math 38.8-39.3 → 40.8-41.4, JSON 36.4-36.8 →
+  37.8-38.2, Python code 34.9-35.1 → 36.2-36.3, English technical prose 34.7-34.8 →
+  35.8-36.3.
+- The 35K prefill is unchanged (1,474-1,484 tok/s first, 1,834-1,853 second).
+- One GPU (SM89, howl9003): 31.5 → 32.7 tok/s.
+
+Numerics: bit-identical. The 24-piece NLL with the hot slots held fixed is 0.7139 with both switches off and on, 11,496 of 11,496 tokens identical (two RTX 5070 Ti, TP 2). howl9003's check on one SM89 GPU: all four switch combinations bit-identical on selected-token and top-8 logprobs, 112 cases.
+
+Switches (code / serve.sh):
+
+- `KT_SHARED_AFTER_SUBMIT`: 0 / 1
+- `KT_HANDOFF_PACK`: 0 / 1
