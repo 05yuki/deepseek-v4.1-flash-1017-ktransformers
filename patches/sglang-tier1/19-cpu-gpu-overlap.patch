@@ -1,0 +1,247 @@
+diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+--- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
++++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+@@ -7,6 +7,7 @@
+ (using any quantization method) and CPU experts (using AMX/AVX instructions).
+ """
+ 
++import inspect
+ import os
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Optional
+@@ -14,6 +15,11 @@
+ import torch
+ 
+ from sglang.srt.arg_groups.overrides import model_config_of
++from sglang.srt.layers.moe.kt_handoff_pack import (
++    PACK as _KT_HANDOFF_PACK,
++    SHARED_AFTER_SUBMIT as _KT_SHARED_AFTER_SUBMIT,
++    pack_to_host,
++)
+ from sglang.srt.layers.moe.kt_stream_prefill import stream_prefill_for
+ from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+ from sglang.srt.runtime_context import (
+@@ -444,9 +450,25 @@
+         # <prefix>-rank<r>.pt every 30 s. SGLang's expert distribution recorder
+         # never sees the V4 router's ids (09-13); this does.
+         # Submit forward task to CPU (non-blocking)
++        stream = torch.cuda.current_stream(x.device)
++        kwargs = {}
++        if _KT_HANDOFF_PACK:
++            takes_packer = getattr(self, "_kt_takes_packer", None)
++            if takes_packer is None:
++                # a kt_kernel without the packer hook keeps its copies
++                takes_packer = (
++                    "packer" in inspect.signature(self.wrapper.submit_forward).parameters
++                )
++                self._kt_takes_packer = takes_packer
++            if takes_packer:
++                # KT_HANDOFF_PACK: one kernel stages the request in the pinned buffers
++                kwargs["packer"] = pack_to_host
+         self.wrapper.submit_forward(
+-            x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
++            x, topk_ids, topk_weights, stream.cuda_stream, **kwargs
+         )
++        if _KT_SHARED_AFTER_SUBMIT:
++            # KT_SHARED_AFTER_SUBMIT: DeepseekV2MoE forks its shared expert here
++            self._kt_post_submit_event = stream.record_event()
+ 
+     def sync(self, x: torch.Tensor) -> torch.Tensor:
+         """Synchronize and retrieve CPU expert computation results.
+diff --git a/python/sglang/srt/layers/moe/kt_handoff_pack.py b/python/sglang/srt/layers/moe/kt_handoff_pack.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/kt_handoff_pack.py
+@@ -0,0 +1,145 @@
++"""Packed GPU->CPU request handoff for the KT expert path, and the shared-expert switch.
++
++Developed for this SGLang/KT recipe in the local GPU-glue investigation
++(2026-10-22). The stream-memop handoff it shortens is the KT_STREAM_MEMOPS
++recipe in kt-kernel's cpuinfer.h; no Strata implementation is included.
++
++KT_HANDOFF_PACK=1: submit_forward stages the MoE input for the CPU with one kernel
++that writes the hidden rows (bf16), the routing weights (fp32) and the expert ids
++(widened to int64) straight into kt-kernel's pinned host buffers through their
++device-mapped addresses. It replaces the ids cast kernel and the three DtoH copy
++nodes (10240 + 24 + 48 bytes at bs=1) that the graph serialises before the
++``req`` stream write. Ordering: kt-kernel issues that cuStreamWriteValue32 with
++flags 0, which places a memory barrier (like __threadfence_system, scoped to the
++stream) before the write, so the host sees the stores before the flag.
++Bytes only (the int32->int64 widening of the ids is exact): bit-identical.
++
++Pinned memory from torch's host allocator is page-locked and, with unified
++addressing, mapped into the device address space. The pinned tensors are passed to
++the kernel as ordinary pointer arguments; Triton's launcher resolves each with
++cuPointerGetAttribute(DEVICE_POINTER). Each buffer is checked once (pinned,
++contiguous, cuMemHostGetDevicePointer succeeds) and the verdict is cached by
++address, which is stable because kt-kernel never frees these buffers; the first
++failing buffer turns the pack off for the process (copies, as without the switch).
++
++KT_SHARED_AFTER_SUBMIT=1: DeepseekV2MoE.forward_normal_dual_stream forks the shared
++expert from an event KTEPWrapperMethod.submit records right after the CPU request,
++instead of before the router. Scheduling only: bit-identical.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import logging
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++logger = logging.getLogger(__name__)
++
++PACK = os.environ.get("KT_HANDOFF_PACK", "0") == "1"
++SHARED_AFTER_SUBMIT = os.environ.get("KT_SHARED_AFTER_SUBMIT", "0") == "1"
++
++# Decode and verify graphs only: one CTA writes all ids, and large prefill chunks
++# move their rows faster with the copy engine than with SM stores over PCIe.
++_PACK_MAX_ROWS = 256
++
++_usable_cache: dict = {}
++_libcuda = None
++_disabled = False
++
++
++def _host_dev_ptr(t: torch.Tensor) -> int:
++    """Device address of pinned host tensor ``t`` (0 if it is not mapped)."""
++    global _libcuda
++    hp = t.data_ptr()
++    if os.environ.get("TRITON_INTERPRET", "0") == "1":
++        return hp  # CPU interpreter: loads and stores go through host addresses
++    if _libcuda is None:
++        _libcuda = ctypes.CDLL("libcuda.so.1")
++    out = ctypes.c_uint64(0)
++    rc = _libcuda.cuMemHostGetDevicePointer_v2(ctypes.byref(out), ctypes.c_void_p(hp), 0)
++    return int(out.value) if rc == 0 else 0
++
++
++def _usable(*host: torch.Tensor) -> bool:
++    global _disabled
++    if _disabled:
++        return False
++    for t in host:
++        key = (t.data_ptr(), t.numel(), t.dtype)
++        ok = _usable_cache.get(key)
++        if ok is None:
++            ok = t.is_pinned() and t.is_contiguous() and _host_dev_ptr(t) != 0
++            _usable_cache[key] = ok
++        if not ok:
++            _disabled = True
++            logger.warning("kt_handoff_pack: pinned buffer not device-mapped; using copies")
++            return False
++    return True
++
++
++@triton.jit
++def _pack_kernel(
++    x_ptr,
++    w_ptr,
++    ids_ptr,
++    hx_ptr,  # pinned host buffers (device-mapped)
++    hw_ptr,
++    hid_ptr,
++    NX,
++    NK,
++    BLOCK: tl.constexpr,
++    KBLOCK: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    offs = pid * BLOCK + tl.arange(0, BLOCK)
++    m = offs < NX
++    tl.store(hx_ptr + offs, tl.load(x_ptr + offs, mask=m), mask=m)
++    if pid == 0:
++        k = tl.arange(0, KBLOCK)
++        mk = k < NK
++        tl.store(hw_ptr + k, tl.load(w_ptr + k, mask=mk), mask=mk)
++        tl.store(hid_ptr + k, tl.load(ids_ptr + k, mask=mk).to(tl.int64), mask=mk)
++
++
++def pack_to_host(x, topk_weights, topk_ids, host_x, host_w, host_ids) -> bool:
++    """One kernel instead of ``host_x.copy_(x); host_w.copy_(w); host_ids.copy_(ids.long())``.
++    False (and nothing issued) when the inputs do not fit the fast path."""
++    if not (
++        x.is_cuda
++        and x.dim() == 2
++        and x.shape[0] <= _PACK_MAX_ROWS
++        and x.dtype == torch.bfloat16
++        and host_x.dtype == torch.bfloat16
++        and topk_weights.dtype == torch.float32
++        and host_w.dtype == torch.float32
++        and topk_ids.dtype in (torch.int32, torch.int64)
++        and host_ids.dtype == torch.int64
++        and x.is_contiguous()
++        and topk_weights.is_contiguous()
++        and topk_ids.is_contiguous()
++        and host_x.numel() == x.numel()
++        and host_w.numel() == topk_weights.numel()
++        and host_ids.numel() == topk_ids.numel()
++        and _usable(host_x, host_w, host_ids)
++    ):
++        return False
++    nx, nk = x.numel(), topk_ids.numel()
++    BLOCK = 2048
++    _pack_kernel[(triton.cdiv(nx, BLOCK),)](
++        x,
++        topk_weights,
++        topk_ids,
++        host_x,
++        host_w,
++        host_ids,
++        nx,
++        nk,
++        BLOCK=BLOCK,
++        KBLOCK=max(16, triton.next_power_of_2(nk)),
++        num_warps=4,
++    )
++    return True
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -113,6 +113,9 @@
+ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+ from sglang.srt.layers.moe.hash_topk import HashTopK
+ from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
++from sglang.srt.layers.moe.kt_handoff_pack import (
++    SHARED_AFTER_SUBMIT as _KT_SHARED_AFTER_SUBMIT,
++)
+ from sglang.srt.layers.moe.token_dispatcher.base import (
+     BaseDispatcher,
+     CombineInput,
+@@ -1148,7 +1151,18 @@
+             if use_flashinfer_trtllm_bypass
+             else self._maybe_quant_moe_input_once(hidden_states)
+         )
+-        self.alt_stream.wait_stream(current_stream)
++        # KT_SHARED_AFTER_SUBMIT: with KT experts the shared expert forks after the CPU
++        # request (event recorded by KTEPWrapperMethod.submit), so its GEMMs stop
++        # contending with the router -> top-k -> handoff chain that feeds the CPU.
++        kt_late_fork = _KT_SHARED_AFTER_SUBMIT and isinstance(
++            self.experts.quant_method, KTEPWrapperMethod
++        )
++        if kt_late_fork:
++            # today's fork point, used when this call issues no CPU request
++            kt_fork_event = current_stream.record_event()
++            self.experts.quant_method._kt_post_submit_event = None
++        else:
++            self.alt_stream.wait_stream(current_stream)
+         should_quant_routed_input_mxfp8 = (
+             not use_flashinfer_trtllm_bypass
+             and pre_quant_input is None
+@@ -1244,6 +1258,13 @@
+ 
+         # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
+         # Only the quant-once fp8 pair is shared with it; the routed MXFP8 pre-quant is not.
++        if kt_late_fork:
++            kt_method = self.experts.quant_method
++            submitted = kt_method._kt_post_submit_event
++            kt_method._kt_post_submit_event = None
++            self.alt_stream.wait_event(
++                submitted if submitted is not None else kt_fork_event
++            )
+         with torch.cuda.stream(self.alt_stream):
+             shared_output = self._forward_shared_experts(
+                 hidden_states,
