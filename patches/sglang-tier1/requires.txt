@@ -4,3 +4,4 @@ stream-prefill: loading placement prefill-lend
 kv-lend-plan: kv-vmm prefill-lend
 hot-lend: kv-vmm prefill-lend stream-prefill kv-lend-plan
 host-kv: kv-vmm prefill-lend stream-prefill kv-lend-plan hot-lend
+stream-mmq: stream-prefill

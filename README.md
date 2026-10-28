@@ -91,8 +91,8 @@ pages on the GPU. If the server runs out of memory at launch, a shorter context
 
    | `TIER` | patch | what it adds |
    |---|---|---|
-   | 0 | `sglang-tier0/` (twelve patches, one concern each) | what 1017 needs to run correctly on the KTransformers hybrid MoE: the FP8 step below, the SwiGLU clamp passed to the CPU experts, the expert mask kt-kernel takes, `-1` ids kept out of the Marlin MoE, zero GPU experts, a configurable load barrier, the V4.1 indexer on its torch path on SM12x (RTX 50, RTX PRO Blackwell, DGX Spark), which has no DeepGEMM build, its torch scoring done in place, the routed experts scaled by `routed_scaling_factor` once, V4.1's own KV cache formats on SM120 (below), the KV pool sized by those formats' own entry bytes, and an automatic [SM89 attention fallback](docs/sm89.md) |
-   | 1 | `sglang-tier1/` (one patch per feature, [docs/tier1.md](docs/tier1.md); `SGLANG_FEATURES` picks some) | streamed prefill, the lends, hot experts and placement, the KV pool on remappable memory, the GPU MoE and FP8 kernels (the streamed prefill needs SM89 or newer) |
+   | 0 | `sglang-tier0/` (eleven patches, one concern each) | what 1017 needs to run correctly on the KTransformers hybrid MoE: the FP8 step below, the SwiGLU clamp passed to the CPU experts, the expert mask kt-kernel takes, `-1` ids kept out of the Marlin MoE, zero GPU experts, a configurable load barrier, the V4.1 indexer on its torch path on SM12x (RTX 50, RTX PRO Blackwell, DGX Spark), which has no DeepGEMM build, its torch scoring done in place, the routed experts scaled by `routed_scaling_factor` once, V4.1's own KV cache formats on SM120 (below), and an automatic [SM89 attention fallback](docs/sm89.md) |
+   | 1 | `sglang-tier1/` (one patch per feature, [docs/tier1.md](docs/tier1.md); `SGLANG_FEATURES` picks some) | streamed prefill (its experts through llama.cpp's MMQ), the lends, hot experts and placement, the KV pool on remappable memory, the GPU MoE and FP8 kernels (the streamed prefill needs SM89 or newer) |
    | 2 | `sglang-tier2-no-p2p.patch` | all-reduce through pinned host memory, for two GPUs without peer access |
 
    Below tier 1 a long prompt's experts run on the CPU (about 40 tok/s of prefill here, decode
@@ -244,19 +244,19 @@ The compressed KV is 720 bytes a token; at 1M tokens, 0.70 GiB of RAM.
 
 2 × AMD EPYC 7452 (Zen 2, AVX2), 512 GB DDR4, 2 × RTX 5070 Ti 16 GB, the checkpoint on
 NVMe; built from this repository and run with the `serve.sh` defaults (1M-token context,
-one request at a time), measured with `tools/bench.py` at tag `2026-10-25-1121` (SGLang main 65633129), every table from one launch.
+one request at a time), measured with `tools/bench.py` at tag `2026-10-28-1714` (SGLang main 65505981), every table from one launch.
 
 Decode, 1,024 tokens a reply (`--other-text` for the rows below the first):
 
 | text | tok/s |
 |---|---|
-| Japanese prose (median of four prompts) | 46.5 |
-| Chinese prose | 41.1 |
-| math | 39.3 |
-| English prose | 38.0 |
-| JSON | 36.9 |
-| English technical prose | 34.8 |
-| Python code | 34.4 |
+| Japanese prose (median of four prompts) | 46.4 |
+| Chinese prose | 41.3 |
+| math | 39.2 |
+| English prose | 38.2 |
+| JSON | 36.6 |
+| Python code | 35.3 |
+| English technical prose | 35.1 |
 
 One expert a layer always stays on the GPU, and as many more as the free GPU memory holds
 sit in the KV pool's free pages and the driver's idle memory (15-16 a layer here). All of
@@ -271,10 +271,10 @@ Prefill, one prompt of random token ids:
 
 | prompt (tokens) | tok/s | time |
 |---|---|---|
-| 35,000 | 1,254 | 28 s |
-| 131,072 | 1,447 | 1.5 min |
-| 524,288 | 1,137 | 7.7 min |
-| 1,000,000 | 871 | 19 min |
+| 35,000 | 1,758 | 20 s |
+| 131,072 | 1,873 | 1.2 min |
+| 524,288 | 1,421 | 6.1 min |
+| 1,000,000 | 1,067 | 16 min |
 
 Longer prompts run in smaller chunks: the prompt's own KV and the attention's working
 memory grow with its length, leaving less GPU memory for a chunk, and every chunk streams
@@ -284,7 +284,7 @@ experts than real text, so these figures are lower than with text.
 ### One GPU
 
 The same machine with `CUDA_VISIBLE_DEVICES=0`: one RTX 5070 Ti 16 GB (tensor parallel 1),
-the CPU experts on both sockets, `serve.sh` defaults, measured at tag `2026-10-23-1513`,
+the CPU experts on both sockets, `serve.sh` defaults, measured at tag `2026-10-28-1714`,
 every row from one launch.
 
 The KV pool covers the whole 1M-token context. Its compressed KV, 0.70 GiB, sits in host
@@ -295,18 +295,18 @@ most of its routes on the CPU.
 | text | tok/s |
 |---|---|
 | Japanese prose (median of four prompts) | 31.6 |
-| English prose | 29.0 |
-| math | 28.8 |
-| Chinese prose | 28.4 |
+| math | 28.7 |
+| English prose | 28.6 |
+| Chinese prose | 28.3 |
 | English technical prose | 28.2 |
-| JSON | 28.0 |
+| JSON | 28.1 |
 | Python code | 27.7 |
 
 | prompt (tokens) | tok/s | time |
 |---|---|---|
-| 35,000 | 776 | 45 s |
-| 65,536 | 863 | 76 s |
-| 1,000,000 | 670 | 25 min |
+| 35,000 | 1,050 | 33 s |
+| 65,536 | 1,282 | 51 s |
+| 1,000,000 | 806 | 21 min |
 
 ## Accuracy
 
@@ -314,13 +314,13 @@ The served model is scored against the checkpoint's own reference implementation
 DeepSeek's `inference/model.py`, run one layer at a time on one 16 GB GPU
 ([tools/ref-nll.py](tools/ref-nll.py)). Both score the same 24 pieces of 480 tokens, taken
 from two public-domain texts in [tools/nll-text/](tools/nll-text/), one Japanese and one
-English, teacher-forced. `serve.sh` defaults; two GPUs at tag `2026-10-25-1121`, one GPU at `2026-10-23-1702`:
+English, teacher-forced. `serve.sh` defaults, both at tag `2026-10-28-1714`:
 
 | run | mean NLL | minus the reference (SE over the 24 pieces) |
 |---|---|---|
 | reference (`inference/model.py`) | 0.7185 | |
 | served, two GPUs | 0.7192 | +0.0007 (0.0041) |
-| served, one GPU (KV past the GPU in host memory) | 0.7194 | +0.0008 (0.0050) |
+| served, one GPU (KV past the GPU in host memory) | 0.7224 | +0.0039 (0.0040) |
 | served, one RTX 4080 SUPER 32 GB (SM89), against its own reference run (0.7141) | 0.7151 | +0.0010 (0.0041) |
 
 The texts are well known, so the model predicts them closely and the NLL is low. They

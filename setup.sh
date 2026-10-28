@@ -173,6 +173,15 @@ if (( TIER >= 1 )) && [[ " ${features[*]} " == *" stream-prefill "* ]] && comman
     "$py" -c "from flashinfer.fused_moe.core import get_cutlass_fused_moe_module as g; g('$fi_backend'); print('built (or cached)')"
 fi
 
+# The streamed prefill's MMQ (tier-1 stream-mmq): llama.cpp's kernels as a torch extension, built here once for
+# the GPU's arch into the cache serve.sh uses, not inside the server on the first long prompt
+if (( TIER >= 1 )) && [[ " ${features[*]} " == *" stream-mmq "* ]] && command -v nvidia-smi >/dev/null; then
+  step "MMQ kernels for the streamed prefill (kt_gguf_moe_mmq)"
+  TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$here/.cache/torch_extensions}" MAX_JOBS="${MAX_JOBS:-16}" \
+  PATH="$CUDA_HOME/bin:$here/.venv/bin:$PATH" PYTHONPATH="$here/third_party/sglang/python" \
+    "$py" -c "from sglang.srt.layers.moe import kt_gguf_moe_mmq as m; m._load(); print('built (or cached)')"
+fi
+
 step "engram row store (engram-adapter/librow_store.so)"
 if [[ ! -f engram-adapter/librow_store.so || engram-adapter/row_store.cpp -nt engram-adapter/librow_store.so ]]; then
   g++ -O2 -std=c++17 -shared -fPIC -pthread engram-adapter/row_store.cpp -o engram-adapter/librow_store.so

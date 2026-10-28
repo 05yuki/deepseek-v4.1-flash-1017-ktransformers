@@ -185,6 +185,9 @@ export KT_EXPERT_SHM="${KT_EXPERT_SHM:-1}"
 export KT_GPU_STREAM_ZEROCOPY="${KT_GPU_STREAM_ZEROCOPY:-1}"
 export KT_GPU_STREAM_GRAPH="${KT_GPU_STREAM_GRAPH:-1}"
 export KT_GPU_STREAM_W16="${KT_GPU_STREAM_W16:-1}"
+# tier-1 stream-mmq: the streamed groups' MXFP4 bytes go to llama.cpp's MMQ (int8 mma, the weights exact)
+# instead of a bf16 copy and the bf16 CUTLASS MoE
+has stream-mmq && export KT_GPU_STREAM_MMQ="${KT_GPU_STREAM_MMQ:-1}"
 export KT_GPU_STREAM_PREFILL="${KT_GPU_STREAM_PREFILL:-512}"
 export KT_GPU_STREAM_GROUP="${KT_GPU_STREAM_GROUP:-4}"
 export KT_GPU_STREAM_EARLY_INIT="${KT_GPU_STREAM_EARLY_INIT:-1}"
@@ -238,12 +241,16 @@ KT_PREFILL_LEND="${KT_PREFILL_LEND:-1}"
 export KT_PREFILL_LEND
 log_name="$(basename "$model")"
 if [[ "$KT_PREFILL_LEND" == 1 ]]; then
-  lend_max_chunk="${DSV41_LEND_MAX_CHUNK:-6144}"
+  # with stream-mmq a prefill window costs less a row (no bf16 MoE output, no CUTLASS workspace): the plan's
+  # windows go to 36,864 rows at 300 KiB a row (measured on two 16 GB cards and on one, no OOM up to 1M)
+  plan_row=471040 max_chunk=6144
+  if has stream-mmq && [[ "${KT_GPU_STREAM_MMQ:-0}" == 1 ]]; then plan_row=307200 max_chunk=36864; fi
+  lend_max_chunk="${DSV41_LEND_MAX_CHUNK:-$max_chunk}"
   export KT_PREFILL_LEND_MAX_CHUNK="$lend_max_chunk"
   export KT_PREFILL_LEND_PROBE_CONTEXT="${KT_PREFILL_LEND_PROBE_CONTEXT:-$max_total_tokens}"
   # the prefill plan's cost before this setup's own fit (FIXED MiB, a row B, a sequence token
   # B, CARRY MiB): V4.1-1017's measured on two 16 GB cards, rounded up
-  export KT_PREFILL_PLAN_COST_PRIOR="${KT_PREFILL_PLAN_COST_PRIOR:-2600,471040,280,820}"
+  export KT_PREFILL_PLAN_COST_PRIOR="${KT_PREFILL_PLAN_COST_PRIOR:-2600,$plan_row,280,820}"
   source "$here/lib/kt-lend-auto.sh"
   export KT_PREFILL_LEND_KV_CAP="${KT_PREFILL_LEND_KV_CAP:-$max_total_tokens}"
   # the first launch of a setup calibrates the chunk once (one more server start)

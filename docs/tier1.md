@@ -34,6 +34,7 @@ the code" are on as soon as the patch is applied.
 | 15 | [`15-kv-lend-plan.patch`](#15-kv-lend-plan) | +1751 / -5 | `kv-vmm`, `prefill-lend` |
 | 16 | [`16-hot-lend.patch`](#16-hot-lend) | +674 / -34 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan` |
 | 17 | [`17-host-kv.patch`](#17-host-kv) | +477 / -7 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan`, `hot-lend` |
+| 18 | [`18-stream-mmq.patch`](#18-stream-mmq) | +20478 / -3 (of it +20,300 the vendored llama.cpp kernels) | `stream-prefill` |
 
 ## Effect of each patch
 
@@ -497,3 +498,52 @@ Files (under `python/sglang/`):
 - `srt/mem_cache/deepseek_v4_memory_pool.py`
 - `srt/mem_cache/dsv41_host_kv.py` (new)
 - `srt/model_executor/pool_configurator.py`
+
+## 18 stream-mmq
+
+On in `serve.sh` (`KT_GPU_STREAM_MMQ=1`; off in the code). The streamed prefill multiplies its MXFP4 experts with llama.cpp's MMQ instead of a bf16 copy and the bf16 CUTLASS MoE.
+
+**Why.** At the windows the prefill plan picks, the bf16 path was GEMM-bound.
+
+- A layer took 38 ms plus 12 ms a thousand rows on each of two RTX 5070 Ti.
+- The PCIe link needs 159 ms for the layer's 3.6 GB, so the math was the longer part from 10,000 rows on.
+- Wider windows therefore saved little: one window for a 35K prompt instead of three was 2 s faster.
+
+**What it does.**
+
+- Each group's MXFP4 bytes are regrouped on the GPU into ggml `block_mxfp4`, by one Triton kernel.
+- The E8M0 byte comes from kt-kernel's fp32 power-of-two scale. Values j and j + 16 share a byte.
+- The regrouped group goes through `kt_gguf_moe_mmq` (the GGUF recipe's extension, which gains the MXFP4 type).
+- MMQ is int8 mma. The activations and the clamped SwiGLU intermediate are quantized per 32 values with an fp16 scale. The weights stay exact.
+- The routes are sorted by expert once a layer, with one host sync for their bounds.
+- A group's slot goes back to the DMA as soon as it is regrouped.
+- Neither the bf16 MoE output nor the CUTLASS workspace is allocated, so `serve.sh` lets the plan's windows grow: 300 KiB a row and 36,864 rows at most (460 KiB and 6,144 without it).
+- A rank whose rows come from several kt-kernel parts (one GPU over two NUMA nodes) regroups part by part.
+- `setup.sh` builds the extension for the GPU's arch.
+
+**Effect** (two RTX 5070 Ti and two EPYC 7452 unless noted):
+
+- A layer at 12,288 rows takes 154-168 ms, against 182-192 ms. That is the PCIe time now.
+- At 35,000 rows the MoE math alone takes 107 ms, against 462 ms.
+- With the wider windows: 35K prompt 1,806 tok/s (1,290 before), 131K 1,881 (1,452), 1M 1,087 (941).
+- One GPU: 35K 1,056 tok/s (862 before), 65K 1,154 (811).
+- No OOM and no allocator retries in any of these runs. Decode does not use the streamer.
+
+Numerics: the 24-piece NLL with every piece through the streamer (stream threshold 256, the hot slots held fixed):
+
+- Two GPUs: reference + 0.0005 with the bf16 path, - 0.0004 with MMQ; MMQ minus bf16 -0.0009 (SE 0.0033).
+- One GPU: + 0.0034 and - 0.0013; MMQ minus bf16 -0.0047 (SE 0.0044).
+- Greedy answers are the same as the bf16 path's.
+
+Switches (code / serve.sh):
+
+- `KT_GPU_STREAM_MMQ`: 0 / 1 (needs `KT_GPU_STREAM_ZEROCOPY=1` and `KT_GPU_STREAM_W16=1`, the defaults)
+- `KT_GPU_STREAM_MMQ_ROUTES`: 8192 (a group's routes through the kernels at a time)
+
+Prerequisites: `stream-prefill`.
+
+Files (under `python/sglang/`):
+
+- `srt/layers/moe/kt_stream_prefill.py`
+- `srt/layers/moe/kt_gguf_moe_mmq.py` (new)
+- `srt/layers/moe/kt_gguf_moe_mmq/` (new: the binding and the vendored llama.cpp 23b0202 MMQ kernels, MIT)

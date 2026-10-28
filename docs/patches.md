@@ -144,7 +144,7 @@ are for:
 | for | patches |
 |---|---|
 | decode | [`fp8-decode`](tier1.md#01-fp8-decode), [`engram-row-prefetch`](tier1.md#04-engram-row-prefetch), [`wo-a-fp8`](tier1.md#05-wo-a-fp8), [`placement`](tier1.md#11-placement), [`hot-lend`](tier1.md#16-hot-lend) |
-| long prompts | [`stream-prefill`](tier1.md#14-stream-prefill), [`prefill-lend`](tier1.md#13-prefill-lend), [`kv-vmm`](tier1.md#12-kv-vmm), [`kv-lend-plan`](tier1.md#15-kv-lend-plan) |
+| long prompts | [`stream-prefill`](tier1.md#14-stream-prefill), [`stream-mmq`](tier1.md#18-stream-mmq), [`prefill-lend`](tier1.md#13-prefill-lend), [`kv-vmm`](tier1.md#12-kv-vmm), [`kv-lend-plan`](tier1.md#15-kv-lend-plan) |
 | GPU memory | [`wo-a-fp8`](tier1.md#05-wo-a-fp8), [`vision-on-demand`](tier1.md#06-vision-on-demand) |
 | numerics | [`gpu-moe-fp32`](tier1.md#02-gpu-moe-fp32) |
 | startup | [`loading`](tier1.md#08-loading), [`launch-timing`](tier1.md#09-launch-timing), [`pool-swa-guard`](tier1.md#10-pool-swa-guard) |
