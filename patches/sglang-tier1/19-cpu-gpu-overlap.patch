@@ -1,7 +1,52 @@
+From 59424f18163741463ac2e04600c7d3622b07ce5f Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Thu, 29 Oct 2026 21:20:02 +0900
+Subject: [PATCH] cpu-gpu-overlap: the shared expert forks after the CPU
+ request, one kernel stages the hand-off
+
+Contributed by howl9003 in 05yuki/deepseek-v4.1-flash-1017-ktransformers#5.
+
+KT_SHARED_AFTER_SUBMIT=1: DeepseekV2MoE.forward_normal_dual_stream forks
+the shared expert's GEMMs from an event KTEPWrapperMethod.submit records
+right after the CPU request, instead of before the router, so they stop
+contending with the router -> top-k -> hand-off chain that feeds the CPU.
+Scheduling only.
+
+KT_HANDOFF_PACK=1: submit_forward stages the MoE input for the CPU with one
+Triton kernel that writes the hidden rows (bf16), the routing weights
+(fp32) and the expert ids (widened to int64) straight into kt-kernel's
+pinned host buffers through their device-mapped addresses, in place of the
+ids cast and the three DtoH copies the graph serialised before the request
+flag. Decode and verify batches only (256 rows at most); a buffer that is
+not device-mapped turns the pack off for the process, with a warning.
+patches/kt-kernel-cpu-handoff.patch gives submit_forward the packer
+argument; a kt-kernel without it keeps the copies.
+
+Numerics: bit-identical. The 24-piece NLL with the hot slots held fixed is
+0.7139 with both switches off and on, 11,496 of 11,496 tokens identical
+(two RTX 5070 Ti, TP 2); on one SM89 GPU all four switch combinations gave
+bit-identical selected-token and top-8 logprobs over 112 cases.
+
+Effect (two RTX 5070 Ti, TP 2, two launches each way): Japanese prose
+decode 46.1 / 45.5 -> 48.3 / 47.5 tok/s, the six other texts +2-7%, the
+35K prefill unchanged.
+
+Prerequisites: `loading`, `placement`, `prefill-lend`, `stream-prefill`.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
+---
+ python/sglang/srt/layers/moe/kt_ep_wrapper.py |  24 ++-
+ .../sglang/srt/layers/moe/kt_handoff_pack.py  | 145 ++++++++++++++++++
+ python/sglang/srt/models/deepseek_v2.py       |  23 ++-
+ 3 files changed, 190 insertions(+), 2 deletions(-)
+ create mode 100644 python/sglang/srt/layers/moe/kt_handoff_pack.py
+
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+index cfe462dd..c7cf9573 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-@@ -7,6 +7,7 @@
+@@ -7,6 +7,7 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
  (using any quantization method) and CPU experts (using AMX/AVX instructions).
  """
  
@@ -9,7 +54,7 @@ diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/l
  import os
  from dataclasses import dataclass
  from typing import TYPE_CHECKING, Optional
-@@ -14,6 +15,11 @@
+@@ -14,6 +15,11 @@ from typing import TYPE_CHECKING, Optional
  import torch
  
  from sglang.srt.arg_groups.overrides import model_config_of
@@ -21,7 +66,7 @@ diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/l
  from sglang.srt.layers.moe.kt_stream_prefill import stream_prefill_for
  from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
  from sglang.srt.runtime_context import (
-@@ -444,9 +450,25 @@
+@@ -447,9 +453,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          # <prefix>-rank<r>.pt every 30 s. SGLang's expert distribution recorder
          # never sees the V4 router's ids (09-13); this does.
          # Submit forward task to CPU (non-blocking)
@@ -50,6 +95,7 @@ diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/l
          """Synchronize and retrieve CPU expert computation results.
 diff --git a/python/sglang/srt/layers/moe/kt_handoff_pack.py b/python/sglang/srt/layers/moe/kt_handoff_pack.py
 new file mode 100644
+index 00000000..f49aaac5
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_handoff_pack.py
 @@ -0,0 +1,145 @@
@@ -199,9 +245,10 @@ new file mode 100644
 +    )
 +    return True
 diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 4756256a..0dff94ab 100644
 --- a/python/sglang/srt/models/deepseek_v2.py
 +++ b/python/sglang/srt/models/deepseek_v2.py
-@@ -113,6 +113,9 @@
+@@ -114,6 +114,9 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
  from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
  from sglang.srt.layers.moe.hash_topk import HashTopK
  from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
@@ -211,7 +258,7 @@ diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/
  from sglang.srt.layers.moe.token_dispatcher.base import (
      BaseDispatcher,
      CombineInput,
-@@ -1148,7 +1151,18 @@
+@@ -1153,7 +1156,18 @@ class DeepseekV2MoE(nn.Module):
              if use_flashinfer_trtllm_bypass
              else self._maybe_quant_moe_input_once(hidden_states)
          )
@@ -231,7 +278,7 @@ diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/
          should_quant_routed_input_mxfp8 = (
              not use_flashinfer_trtllm_bypass
              and pre_quant_input is None
-@@ -1244,6 +1258,13 @@
+@@ -1249,6 +1263,13 @@ class DeepseekV2MoE(nn.Module):
  
          # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
          # Only the quant-once fp8 pair is shared with it; the routed MXFP8 pre-quant is not.

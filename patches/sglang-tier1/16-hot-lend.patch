@@ -1,4 +1,4 @@
-From 4c0cd0e4071d66003b75dc29339bfa970f3e32a8 Mon Sep 17 00:00:00 2001
+From 2e5d0c62183424dddd82c80c7fcc723d249888ef Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] hot-lend: more hot experts in the KV pool's free pages
@@ -37,6 +37,16 @@ prefill lend reads every layer from its pinned mirror), and the next
 lend fills them again. The route runs as one Triton kernel a layer: as
 separate torch ops the resident rows' table cost 4% of decode.
 
+A round does not wait for the stream (10-29): its table updates go up from
+pinned memory without blocking and split by table on the host, and the
+swapped-out experts leave their table by index_fill_. A pageable .to(dev),
+a boolean index of a device tensor and an index put of the Python -1 each
+waited for the decode forward in flight (on Qwen3.5-35B: a round 11-13 ms
+of host time -> 4.2 ms, decode +7% on Japanese prose). When the arena check
+turns the dynamic slots off, the slots shrink to the banks' experts and the
+lend's plan is cut to them; that fallback had been the else of the resident
+rows' check (the GGUF tree had both fixes since 10-25).
+
 Numerics: Not bit-identical: the lent experts run in the GPU MoE kernel
 instead of kt-kernel, and which and how many are lent depends on the free
 KV pages and the routing so far, so decode output depends on load and
@@ -53,8 +63,8 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
  .../srt/layers/moe/fused_moe_triton/layer.py  |   7 +
  python/sglang/srt/layers/moe/kt_ep_wrapper.py |  37 +-
- .../sglang/srt/layers/moe/kt_kv_hot_lend.py   | 664 +++++++++++++++++-
- 3 files changed, 674 insertions(+), 34 deletions(-)
+ .../sglang/srt/layers/moe/kt_kv_hot_lend.py   | 685 +++++++++++++++++-
+ 3 files changed, 695 insertions(+), 34 deletions(-)
 
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 index e7b5e7ce..7a207ba0 100644
@@ -181,7 +191,7 @@ index f91552de..cfe462dd 100644
  
      def __getattr__(self, name: str):
 diff --git a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
-index 8a7aa149..f335b8d6 100644
+index 8a7aa149..117b8282 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
 @@ -31,19 +31,45 @@ ones most worth adding. This module:
@@ -601,7 +611,7 @@ index 8a7aa149..f335b8d6 100644
          _log(f"slot diag rank {wrapper.tp_rank} layer {L.idx} (k {k}, slots vs CPU {rel_slots:.3e}): "
               f"{len(bad)} of {k * len(L.names)} slot tensors differ from their bank: {bad[:16]}")
      if n_lent and rel_slots > 0.5 and STATE.get("diag", 0) < 3:
-@@ -456,6 +680,354 @@ def _plan(budget: int) -> List[int]:
+@@ -456,6 +680,373 @@ def _plan(budget: int) -> List[int]:
      return ks
  
  
@@ -635,6 +645,22 @@ index 8a7aa149..f335b8d6 100644
 +            return None
 +        r[key] = nm
 +    return r if len(r) == 4 else None
++
++
++def _to_dev(rows, dev) -> torch.Tensor:
++    """A small int64 table update through pinned memory: no wait for the stream (a pageable copy waits)."""
++    return torch.tensor(rows, dtype=torch.int64).pin_memory().to(dev, non_blocking=True)
++
++
++def _pending(swaps, dev):
++    """The table entries a round's swaps make, split by table on the host: applying them needs no boolean
++    mask of a device tensor, whose element count waits for the stream."""
++    out = []
++    for which in (0, 1):
++        rows = [(L.idx, e, i) for L, w, i, _, e in swaps if w == which]
++        if rows:
++            out.append((which, _to_dev(rows, dev)))
++    return out
 +
 +
 +def _arena_load(L: _Layer, e: int, dst, order: int) -> None:
@@ -767,7 +793,9 @@ index 8a7aa149..f335b8d6 100644
 +        DYN["res"] = bool(_over_ranks([ok], torch.distributed.ReduceOp.MIN)[0])
 +        _log("dynamic resident rows " + ("on: experts 0, 1 from the arenas match their rows" if DYN["res"]
 +                                          else f"off: {why or 'another rank could not'}; they hold 0..N-1"))
-+    else:
++    # the slots shrink when the dynamic slots are off (this `else` was
++    # the resident rows', which cut the slots under KT_KV_HOT_DYNAMIC_RESIDENT=0, 10-25)
++    if not DYN["on"]:
 +        for M in LAYERS:
 +            # the placement's experts, as many as there are banks
 +            M.x = M.b
@@ -855,11 +883,10 @@ index 8a7aa149..f335b8d6 100644
 +    rtbl = STATE.get("rtbl")
 +    if DYN["pending"] is not None:
 +        cur.wait_event(DYN["ev_copy"])
-+        t = DYN["pending"]
-+        for which, table in ((0, tbl), (1, rtbl)):
-+            m = t[:, 3] == which
++        for which, t in DYN["pending"]:  # split on the host
++            table = tbl if which == 0 else rtbl
 +            if table is not None:  # (no resident rows' table without KT_KV_HOT_DYNAMIC_RESIDENT)
-+                table[t[m, 0], t[m, 1]] = t[m, 2]
++                table[t[:, 0], t[:, 1]] = t[:, 2]
 +        DYN["pending"] = None
 +    if DYN["ev_cnt"] is not None:
 +        DYN["ev_cnt"].synchronize()
@@ -926,8 +953,10 @@ index 8a7aa149..f335b8d6 100644
 +        for which, table in ((0, tbl), (1, rtbl)):
 +            out = [(L.idx, old) for L, w, _, old, _ in swaps if w == which and old >= 0]
 +            if out and table is not None:
-+                t = torch.tensor(out, dtype=torch.int64).to(dev)
-+                table[t[:, 0], t[:, 1]] = -1
++                # flat indices and index_fill_: -1 as a kernel argument (an index put of the
++                # Python -1 waits for the stream)
++                t = _to_dev([i * table.shape[1] + e for i, e in out], dev)
++                table.view(-1).index_fill_(0, t, -1)
 +        DYN["ev_unmap"].record(cur)
 +        side = DYN["stream"]
 +        with torch.cuda.stream(side):
@@ -940,7 +969,7 @@ index 8a7aa149..f335b8d6 100644
 +                    L.res_now[i] = e
 +                _arena_load(L, e, dst, DYN["order"])
 +            DYN["ev_copy"].record(side)
-+        DYN["pending"] = torch.tensor([(L.idx, e, i, w) for L, w, i, _, e in swaps], dtype=torch.int64).to(dev)
++        DYN["pending"] = _pending(swaps, dev)
 +        DYN["swaps"] += len(swaps)
 +    if DYN["rounds"] % DYN_LOG == 0 and DYN["seen"] is not None:
 +        res = bool(DYN.get("res"))
@@ -956,7 +985,7 @@ index 8a7aa149..f335b8d6 100644
  def _hook() -> None:
      if STATE["hooked"]:
          return
-@@ -473,6 +1045,8 @@ def tick(runner) -> None:
+@@ -473,6 +1064,8 @@ def tick(runner) -> None:
      from sglang.srt.layers.moe import kt_kv_prefill_lend as m
  
      if m.STATE["lent"] is not None:
@@ -965,7 +994,7 @@ index 8a7aa149..f335b8d6 100644
          return
      if not STATE["want"]:
          STATE["since"] += 1
-@@ -481,10 +1055,18 @@ def tick(runner) -> None:
+@@ -481,10 +1074,18 @@ def tick(runner) -> None:
      STATE["want"], STATE["since"] = False, 0
      _hook()
      t0 = time.perf_counter()
@@ -986,7 +1015,7 @@ index 8a7aa149..f335b8d6 100644
      budget = got - (MARGIN_MB << 20)
      spare = 0
      if SPARE_FLOOR_MB >= 0:
-@@ -494,6 +1076,12 @@ def tick(runner) -> None:
+@@ -494,6 +1095,14 @@ def tick(runner) -> None:
          if free > budget:
              spare, budget = free - budget, free
      ks = _plan(budget)
@@ -996,10 +1025,12 @@ index 8a7aa149..f335b8d6 100644
 +    ks = _over_ranks(ks)
 +    if DYNAMIC and DYN["on"] is None:
 +        _dyn_setup(dev)
++        # the setup may have cut the slots to the banks
++        ks = [min(k, L.x) for L, k in zip(LAYERS, ks)]
      for i, (L, k) in enumerate(zip(LAYERS, ks)):
          if k and any(kt_kv_vmm.restore(L.slots[nm], 0, _span(L, nm, k)) < 0 for _, nm in L.names):
              # no memory after all: this layer and the rest get nothing
-@@ -504,11 +1092,22 @@ def tick(runner) -> None:
+@@ -504,11 +1113,22 @@ def tick(runner) -> None:
                      kt_kv_vmm.release(M.slots[nm], 0, _span(M, nm, M.x))
              ks = ks[:i] + [0] * (len(LAYERS) - i)
              break
@@ -1023,7 +1054,7 @@ index 8a7aa149..f335b8d6 100644
      kd = _k_dev(dev)
      kd.copy_(torch.tensor(ks, dtype=torch.int64), non_blocking=True)
      torch.cuda.synchronize(dev)
-@@ -534,6 +1133,11 @@ def release(why: str) -> None:
+@@ -534,6 +1154,11 @@ def release(why: str) -> None:
      dev = LAYERS[0].slots[LAYERS[0].names[0][1]].device
      kd = _k_dev(dev)
      kd.zero_()
