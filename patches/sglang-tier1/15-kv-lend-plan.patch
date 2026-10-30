@@ -1,4 +1,4 @@
-From 1dad27fcd938d0a6e3ae8ca1adce0766c37b3f53 Mon Sep 17 00:00:00 2001
+From 2bbc8a8480cb33fbfb991d9e0a260edefc4d2e91 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] kv-lend-plan: lend the KV pool's free pages to prefill, plan
@@ -6,7 +6,9 @@ Subject: [PATCH] kv-lend-plan: lend the KV pool's free pages to prefill, plan
 
 The KV pool's free pages during prefill. `KT_PREFILL_KV_LEND=1` lends
 the pool's free pages to the prefill (pages in use are never lent; the
-pool never shrinks). `KT_PREFILL_PLAN=1` plans each request's chunk size
+pool never shrinks), in every pool tensor laid out by the allocator's
+pages, the compress ratios' and the indexers' smaller pages included.
+`KT_PREFILL_PLAN=1` plans each request's chunk size
 from the memory free at that moment, so a long prompt takes fewer,
 larger chunks (scheduler and schedule_batch hooks).
 `KT_PREFILL_SWA_LEND=1` sizes the sliding-window pool for the largest
@@ -22,14 +24,15 @@ Prerequisites: `kv-vmm`, `prefill-lend`.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
 ---
  .../sglang/srt/layers/moe/kt_kv_hot_lend.py   | 550 +++++++++++
- .../srt/layers/moe/kt_kv_prefill_lend.py      | 914 ++++++++++++++++++
+ .../srt/layers/moe/kt_kv_prefill_lend.py      | 918 ++++++++++++++++++
  .../sglang/srt/layers/moe/kt_prefill_plan.py  | 253 +++++
  python/sglang/srt/managers/schedule_batch.py  |  11 +-
  python/sglang/srt/managers/scheduler.py       |   9 +
  .../srt/mem_cache/kv_cache_configurator.py    |  19 +-
- 6 files changed, 1751 insertions(+), 5 deletions(-)
+ 6 files changed, 1755 insertions(+), 5 deletions(-)
  create mode 100644 python/sglang/srt/layers/moe/kt_kv_hot_lend.py
  create mode 100644 python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
  create mode 100644 python/sglang/srt/layers/moe/kt_prefill_plan.py
@@ -592,10 +595,10 @@ index 00000000..8a7aa149
 +    STATE["spare_held"] = 0
 diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 new file mode 100644
-index 00000000..ea5ba226
+index 00000000..823b55ed
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
-@@ -0,0 +1,914 @@
+@@ -0,0 +1,918 @@
 +"""The KV pool's free pages lend their physical memory to a streamed prefill
 +(KT_PREFILL_KV_LEND=1, with KT_KV_VMM=1 and the prefill lend KT_PREFILL_LEND=1).
 +
@@ -690,14 +693,18 @@ index 00000000..ea5ba226
 +
 +def _kv_tensors(kvp, n: int, ps: int = 1, what: str = "K/V", extra=()):
 +    """[(flat uint8 view, bytes a page, chunk, first chunk boundary)] of a pool's
-+    buffers laid out by the allocator's pages: n + 1 rows of a page each, or
-+    (n + 1) * page_size rows of a token, on kv_vmm memory; [] when there are none.
-+    A buffer of any other length (another page space) is left alone. extra:
-+    (tensor, bytes a page) pairs known to follow the same pages from byte 0."""
++    buffers laid out by the allocator's pages: k rows a page from row 0 for the n + 1
++    pages (1 for a row a page, page_size for a row a token, or as many as a compress
++    ratio's or an indexer's smaller pages make one), and up to k + 1 rows of padding
++    after them, on kv_vmm memory; [] when there are none. A buffer of any other
++    length (another page space) is left alone. extra: (tensor, bytes a page) pairs
++    known to follow the same pages from byte 0."""
 +    tensors, other = [(t.view(-1).view(torch.uint8), pb) for t, pb in extra], 0
 +    for t in _pool_tensors(kvp):
-+        if t.is_cuda and t.is_contiguous() and t.dim() >= 1 and t.shape[0] in (n + 1, (n + 1) * ps):
-+            tensors.append((t.view(-1).view(torch.uint8), t.nbytes // (n + 1)))
++        rows = t.shape[0] if t.dim() >= 1 else 0
++        k = rows // (n + 1)
++        if t.is_cuda and t.is_contiguous() and k >= 1 and rows - k * (n + 1) <= k + 1:
++            tensors.append((t.view(-1).view(torch.uint8), t.nbytes // rows * k))
 +        else:
 +            other += 1
 +    if other:

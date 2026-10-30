@@ -1,4 +1,4 @@
-From d87377a190df1744d87c5028e3c5c718aea6f09b Mon Sep 17 00:00:00 2001
+From 0c9db687fa94a480a44003b05f2b2efe80ddf55b Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 23 Oct 2026 12:16:53 +0900
 Subject: [PATCH] host-kv: DeepSeek-V4.1's KV pool covers the whole context,
@@ -30,8 +30,9 @@ of the GPU's NUMA node. When the whole context fits the GPU nothing changes.
   every writer (the bounded-replay tail rewrites the kv_source's entries),
   one layer's copy at a time (288 MB at 1M tokens), through an SM kernel (a
   range with host-NUMA chunks is not a valid cudaMemcpy source).
-- The hot lend lends device pages only, and runs on the driver's spare alone
-  when there is no device page to lend.
+- The hot lend and the prefill windows lend device pages only, and the
+  prefill plan counts only those in a window's loan; the hot lend runs on the
+  driver's spare alone when there is no device page to lend.
 
 SGLANG_DSV41_HOST_KV=0 sizes the pool by the budget as before.
 
@@ -57,14 +58,15 @@ kv-vmm/kv_vmm.c with kv_vmm_malloc_split.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
 ---
  .../layers/attention/deepseek_v4_backend.py   |  50 ++++
- .../srt/layers/moe/kt_kv_prefill_lend.py      |  34 ++-
+ .../srt/layers/moe/kt_kv_prefill_lend.py      |  48 ++-
  python/sglang/srt/layers/moe/kt_kv_vmm.py     |  35 ++-
  .../srt/mem_cache/deepseek_v4_memory_pool.py  |  57 +++-
  python/sglang/srt/mem_cache/dsv41_host_kv.py  | 278 ++++++++++++++++++
  .../srt/model_executor/pool_configurator.py   |  30 ++
- 6 files changed, 477 insertions(+), 7 deletions(-)
+ 6 files changed, 488 insertions(+), 10 deletions(-)
  create mode 100644 python/sglang/srt/mem_cache/dsv41_host_kv.py
 
 diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
@@ -143,10 +145,10 @@ index fbda6822..6beaf884 100644
              swa_kv_page_size = token_to_kv_pool.get_swa_key_page_size()
              assert swa_k_cache.ndim == 2
 diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
-index ea5ba226..610ed859 100644
+index 823b55ed..478a9615 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
-@@ -152,7 +152,7 @@ def _whole_chunks(tensors, mark, n: int, dev):
+@@ -156,7 +156,7 @@ def _whole_chunks(tensors, mark, n: int, dev):
  
  def _setup(runner) -> bool:
      if STATE["alloc"] is not None:
@@ -155,7 +157,7 @@ index ea5ba226..610ed859 100644
      if STATE.get("off"):
          return False
      STATE["off"] = True  # until set up
-@@ -173,9 +173,17 @@ def _setup(runner) -> bool:
+@@ -177,9 +177,17 @@ def _setup(runner) -> bool:
      n = int(getattr(a, "num_pages", 0) or a.size // a.page_size)
      tensors = _kv_tensors(kvp, n, a.page_size)
      if not tensors:
@@ -174,7 +176,28 @@ index ea5ba226..610ed859 100644
      _wrap_allocator(a)
      _log(f"{len(tensors)} K/V tensors of {kvp.__class__.__name__}, {n} pages of {a.page_size} tokens "
           f"({min(t[1] for t in tensors)}-{max(t[1] for t in tensors)} B a page per tensor), "
-@@ -267,6 +275,11 @@ def _release_free(keep_pages: int):
+@@ -250,9 +258,17 @@ def loan_estimate(scheduler, rem: int) -> int:
+         if runner is None or not _setup(runner):
+             return 0
+     a, ps = STATE["alloc"], STATE["ps"]
+-    free = _free_count(a)
+-    if STATE["lent"] is not None:
+-        free += int(STATE["lent"].numel())
++    dp = STATE.get("dev_pages")
++    if dp is None:
++        free = _free_count(a)
++        if STATE["lent"] is not None:
++            free += int(STATE["lent"].numel())
++    else:
++        # a pool whose tail is host memory (dsv41_host_kv): the window lends the free
++        # pages below dev_pages only, so only those count
++        free = int((_free_pages(a) < dp).sum())
++        if STATE["lent"] is not None:
++            free += int((STATE["lent"] < dp).sum())
+     keep = -(-(rem + RESERVE) // ps) + 1
+     pages = max(0, free - keep)
+     # only whole chunks are unmapped: a tensor loses up to one chunk at the
+@@ -271,6 +287,11 @@ def _release_free(keep_pages: int):
      if free.numel() <= keep_pages:
          return None
      cand = free[keep_pages:]
@@ -186,7 +209,7 @@ index ea5ba226..610ed859 100644
      mark = torch.zeros(n + 2, dtype=torch.int32, device=dev)
      mark[cand] = 1
      torch.cuda.synchronize(dev)
-@@ -288,18 +301,31 @@ def decode_lend(runner, reserve_tokens: int, min_bytes: int) -> int:
+@@ -292,18 +313,31 @@ def decode_lend(runner, reserve_tokens: int, min_bytes: int) -> int:
      """The hot lend, outside prefill: every free page beyond reserve_tokens (and a
      page a running request) leaves the free list and its whole chunks are unmapped,
      when that is at least min_bytes. Returns the bytes unmapped (0: nothing lent)."""

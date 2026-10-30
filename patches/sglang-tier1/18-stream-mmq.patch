@@ -1,4 +1,4 @@
-From 7edf472fe9c579886c57c767a97120b276bec034 Mon Sep 17 00:00:00 2001
+From 6f7559e5c255d873cbb5a37b511b17fb638ab75e Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Wed, 28 Oct 2026 16:00:40 +0900
 Subject: [PATCH] stream-mmq: the streamed experts through llama.cpp's MMQ, the
@@ -67,7 +67,7 @@ Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
 
 diff --git a/python/sglang/srt/layers/moe/kt_gguf_moe_mmq.py b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq.py
 new file mode 100644
-index 0000000000..0e93edf7b0
+index 00000000..0e93edf7
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq.py
 @@ -0,0 +1,105 @@
@@ -178,7 +178,7 @@ index 0000000000..0e93edf7b0
 +          "K=320:", m.ggml_moe_mmq_tail_bytes(42, 320), "K=2560:", m.ggml_moe_mmq_tail_bytes(42, 2560))
 diff --git a/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/SOURCES b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/SOURCES
 new file mode 100644
-index 0000000000..ce6f088bb5
+index 00000000..ce6f088b
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/SOURCES
 @@ -0,0 +1,50 @@
@@ -234,7 +234,7 @@ index 0000000000..ce6f088bb5
 +2ff515f884cc74faccef7f697bd1335c3fc2e3fbd433d081f4094a48e35fbdae  generated  kt_gguf_moe_mmq_bind.cpp
 diff --git a/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/kt_gguf_moe_mmq.cu b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/kt_gguf_moe_mmq.cu
 new file mode 100644
-index 0000000000..239ecfc221
+index 00000000..239ecfc2
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/kt_gguf_moe_mmq.cu
 @@ -0,0 +1,284 @@
@@ -524,7 +524,7 @@ index 0000000000..239ecfc221
 +}
 diff --git a/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/kt_gguf_moe_mmq_bind.cpp b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/kt_gguf_moe_mmq_bind.cpp
 new file mode 100644
-index 0000000000..b509c0b38e
+index 00000000..b509c0b3
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/kt_gguf_moe_mmq_bind.cpp
 @@ -0,0 +1,16 @@
@@ -546,7 +546,7 @@ index 0000000000..b509c0b38e
 +}
 diff --git a/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/ggml_shim.cu b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/ggml_shim.cu
 new file mode 100644
-index 0000000000..d37e019381
+index 00000000..d37e0193
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/ggml_shim.cu
 @@ -0,0 +1,139 @@
@@ -691,7 +691,7 @@ index 0000000000..d37e019381
 +}
 diff --git a/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/mmq_internal.cuh b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/mmq_internal.cuh
 new file mode 100644
-index 0000000000..c6c4f4b1fb
+index 00000000..c6c4f4b1
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/mmq_internal.cuh
 @@ -0,0 +1,53 @@
@@ -750,7 +750,7 @@ index 0000000000..c6c4f4b1fb
 +}  // namespace sgl_llama_mmq
 diff --git a/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/mmq_moe.cu b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/mmq_moe.cu
 new file mode 100644
-index 0000000000..e74bba66a7
+index 00000000..e74bba66
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/mmq_moe.cu
 @@ -0,0 +1,191 @@
@@ -947,7 +947,7 @@ index 0000000000..e74bba66a7
 +}  // namespace sgl_llama_mmq
 diff --git a/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/mmq_types.cu b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/mmq_types.cu
 new file mode 100644
-index 0000000000..ecc8902220
+index 00000000..ecc89022
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/mmq_types.cu
 @@ -0,0 +1,198 @@
@@ -1151,7 +1151,7 @@ index 0000000000..ecc8902220
 +}  // namespace sgl_llama_mmq
 diff --git a/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/quantize_mmq_q8_1.cu b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/quantize_mmq_q8_1.cu
 new file mode 100644
-index 0000000000..24ed12b6ed
+index 00000000..24ed12b6
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/quantize_mmq_q8_1.cu
 @@ -0,0 +1,311 @@
@@ -1468,7 +1468,7 @@ index 0000000000..24ed12b6ed
 +}  // namespace sgl_llama_mmq
 diff --git a/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/sgl_llama_mmq.h b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/sgl_llama_mmq.h
 new file mode 100644
-index 0000000000..989d09bc61
+index 00000000..989d09bc
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/llama_mmq/sgl_llama_mmq.h
 @@ -0,0 +1,112 @@
@@ -1585,7 +1585,7 @@ index 0000000000..989d09bc61
 +
 +}  // namespace sgl_llama_mmq
 diff --git a/python/sglang/srt/layers/moe/kt_stream_prefill.py b/python/sglang/srt/layers/moe/kt_stream_prefill.py
-index 77fc0f4252..aa45f083fe 100644
+index 77fc0f42..aa45f083 100644
 --- a/python/sglang/srt/layers/moe/kt_stream_prefill.py
 +++ b/python/sglang/srt/layers/moe/kt_stream_prefill.py
 @@ -72,6 +72,14 @@ USE_GRAPH = os.environ.get("KT_GPU_STREAM_GRAPH", "1") == "1"

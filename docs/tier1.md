@@ -379,7 +379,7 @@ Files (under `python/sglang/`):
 
 ## 15 kv-lend-plan
 
-The KV pool's free pages during prefill. `KT_PREFILL_KV_LEND=1` lends the pool's free pages to the prefill (pages in use are never lent; the pool never shrinks). `KT_PREFILL_PLAN=1` plans each request's chunk size from the memory free at that moment, so a long prompt takes fewer, larger chunks (scheduler and schedule_batch hooks). `KT_PREFILL_SWA_LEND=1` sizes the sliding-window pool for the largest planned chunk and releases its free pages outside prefill. The file `kt_kv_hot_lend.py` ships here because the plan imports it; it does nothing until `hot-lend` wires it in.
+The KV pool's free pages during prefill. `KT_PREFILL_KV_LEND=1` lends the pool's free pages to the prefill (pages in use are never lent; the pool never shrinks), in every pool tensor laid out by the allocator's pages: the compressed KV of each compress ratio and the indexer keys, whose rows are a page's share, lend whole pages too. `KT_PREFILL_PLAN=1` plans each request's chunk size from the memory free at that moment, so a long prompt takes fewer, larger chunks (scheduler and schedule_batch hooks). `KT_PREFILL_SWA_LEND=1` sizes the sliding-window pool for the largest planned chunk and releases its free pages outside prefill. The file `kt_kv_hot_lend.py` ships here because the plan imports it; it does nothing until `hot-lend` wires it in.
 
 Switches (code / serve.sh):
 
@@ -456,7 +456,7 @@ The compressed KV is `KVLayout.V41_FP4`, 288 bytes an entry, in the kv_source la
 **Who uses which pages.**
 
 - The allocator hands out the lowest free pages first, so requests fill the GPU's part before host memory.
-- The hot lend lends only device pages. When none are free, it runs on the driver's idle memory alone.
+- The hot lend and the prefill windows lend only device pages, and the prefill plan counts only those in a window's loan. When none are free, the hot lend runs on the driver's idle memory alone.
 
 **Decode.**
 
