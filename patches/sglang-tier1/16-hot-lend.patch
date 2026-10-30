@@ -1,4 +1,4 @@
-From 2e5d0c62183424dddd82c80c7fcc723d249888ef Mon Sep 17 00:00:00 2001
+From 19c874a1dd7c412b3eaf6bb8c574dd5b555b3527 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] hot-lend: more hot experts in the KV pool's free pages
@@ -67,10 +67,10 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  3 files changed, 695 insertions(+), 34 deletions(-)
 
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-index e7b5e7ce..7a207ba0 100644
+index 40d89d80..d131eaec 100644
 --- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 +++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-@@ -1302,6 +1302,13 @@ class FusedMoE(torch.nn.Module):
+@@ -1306,6 +1306,13 @@ class FusedMoE(torch.nn.Module):
          ):
              if self.quant_method.num_gpu_experts != -1:
                  if expert_id >= self.quant_method.num_gpu_experts:

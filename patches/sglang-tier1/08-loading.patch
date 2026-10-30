@@ -1,4 +1,4 @@
-From 129e4f4cd71d9de33511f66b8c7f09073549d731 Mon Sep 17 00:00:00 2001
+From ba83e99a49d2e1e03a8ab20fe551a1354caafbc5 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] loading: skip the CPU-only experts in the GPU loader, read

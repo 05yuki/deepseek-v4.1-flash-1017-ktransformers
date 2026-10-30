@@ -1,4 +1,4 @@
-From 59424f18163741463ac2e04600c7d3622b07ce5f Mon Sep 17 00:00:00 2001
+From 0cd1ec00610bae5aca878099359e11ef2d4e8e5d Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Thu, 29 Oct 2026 21:20:02 +0900
 Subject: [PATCH] cpu-gpu-overlap: the shared expert forks after the CPU
@@ -245,7 +245,7 @@ index 00000000..f49aaac5
 +    )
 +    return True
 diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
-index 4756256a..0dff94ab 100644
+index 031deeb5..32801525 100644
 --- a/python/sglang/srt/models/deepseek_v2.py
 +++ b/python/sglang/srt/models/deepseek_v2.py
 @@ -114,6 +114,9 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class

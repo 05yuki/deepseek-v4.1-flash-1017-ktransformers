@@ -1,4 +1,4 @@
-From 745a618344ec761a4f7e69dd4b9ea1ec46c3c9e8 Mon Sep 17 00:00:00 2001
+From d87377a190df1744d87c5028e3c5c718aea6f09b Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 23 Oct 2026 12:16:53 +0900
 Subject: [PATCH] host-kv: DeepSeek-V4.1's KV pool covers the whole context,
@@ -68,10 +68,10 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  create mode 100644 python/sglang/srt/mem_cache/dsv41_host_kv.py
 
 diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-index 9bbdb7c5..44c7a32e 100644
+index fbda6822..6beaf884 100644
 --- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 +++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-@@ -1282,6 +1282,10 @@ class DeepseekV4AttnBackend(
+@@ -1281,6 +1281,10 @@ class DeepseekV4AttnBackend(
          assert self.token_to_kv_pool.swa_page_size % SWA_WINDOW == 0
          self.hisparse_coordinator = model_runner.hisparse_coordinator
          self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -82,7 +82,7 @@ index 9bbdb7c5..44c7a32e 100644
          # Nothing is built for a compress ratio outside the pool's set.
          self.present_ratios: Tuple[int, ...] = self.token_to_kv_pool.present_ratios
          self.low_ratios: Tuple[int, ...] = tuple(
-@@ -3516,6 +3520,31 @@ class DeepseekV4AttnBackend(
+@@ -3515,6 +3519,31 @@ class DeepseekV4AttnBackend(
              self._low_ratio_compress(layer, x, req, pos, forward_batch)
          if run_indexer and layer.indexer is not None:
              self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
@@ -114,7 +114,7 @@ index 9bbdb7c5..44c7a32e 100644
  
      def _forward_low_ratio_sources_cp(
          self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
-@@ -4188,6 +4217,27 @@ class DeepseekV4AttnBackend(
+@@ -4187,6 +4216,27 @@ class DeepseekV4AttnBackend(
                  extra_topk_lengths = core_attn_metadata.sparse_topk_lengths(
                      compress_ratio
                  )

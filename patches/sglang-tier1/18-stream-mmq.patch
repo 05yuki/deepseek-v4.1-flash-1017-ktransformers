@@ -1,4 +1,4 @@
-From af52390eae17c0e42a1b332d8749ea6a55d14c4c Mon Sep 17 00:00:00 2001
+From 21b47b50b2e29d406f937e96dc6bc255d5c85151 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Wed, 28 Oct 2026 16:00:40 +0900
 Subject: [PATCH] stream-mmq: the streamed experts through llama.cpp's MMQ, the

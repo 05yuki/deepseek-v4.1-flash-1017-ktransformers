@@ -1,4 +1,4 @@
-From dc8a0f62921c03532acd0eb5b2853cf4ae87f8c3 Mon Sep 17 00:00:00 2001
+From 1dad27fcd938d0a6e3ae8ca1adce0766c37b3f53 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] kv-lend-plan: lend the KV pool's free pages to prefill, plan
@@ -1770,10 +1770,10 @@ index 00000000..a2b878d9
 +              + f", cap {chunk})", flush=True)
 +    return c
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index f8497a00..92758443 100644
+index 5317ae77..fb5f34ce 100644
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -4120,11 +4120,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -4203,11 +4203,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                          if req.extend_batch_idx < 2:
                              continue
                          else:
@@ -1793,10 +1793,10 @@ index f8497a00..92758443 100644
                      else:
                          self._evict_swa(req, pre_len)
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index daaa7b39..3884e89a 100644
+index 60a5d024..5e9d1c65 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -3561,6 +3561,10 @@ class Scheduler(
+@@ -3582,6 +3582,10 @@ class Scheduler(
              req.storage_prefetch_retry_attempts = 0
              req.storage_prefetch_last_match_len = None
              req.staged_prefetch_plan = None
@@ -1807,7 +1807,7 @@ index daaa7b39..3884e89a 100644
          if self.disaggregation_mode == DisaggregationMode.NULL:
              if self._abort_on_queued_limit(req):
                  self._release_aborted_request(req)
-@@ -4226,6 +4230,11 @@ class Scheduler(
+@@ -4247,6 +4251,11 @@ class Scheduler(
              dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
              if dynamic_size is not None:
                  chunked_prefill_size = dynamic_size

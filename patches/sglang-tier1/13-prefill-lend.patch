@@ -1,4 +1,4 @@
-From 268c591fd20d3a96b604b76c1eedbccf38e612cf Mon Sep 17 00:00:00 2001
+From 65638f035fbc0ee93d4afcc10dc309c47bb37725 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] prefill-lend: lend the GPU-resident weights' memory to a
@@ -1392,7 +1392,7 @@ index 00000000..5079b6a1
 +        _point_back(i)
 diff --git a/python/sglang/srt/layers/moe/kt_lend_probe.py b/python/sglang/srt/layers/moe/kt_lend_probe.py
 new file mode 100644
-index 00000000..ed9fdea1
+index 00000000..19ee7e1a
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_lend_probe.py
 @@ -0,0 +1,157 @@
@@ -1511,7 +1511,7 @@ index 00000000..ed9fdea1
 +                    req.kv.req_pool_idx = None
 +                    continue
 +                rtp.write((idx, slice(0, P)), loc)
-+                req.kv.kv_allocated_len = req.kv.kv_committed_len = P
++                req.kv.set_row_len(P)
 +                req.kv.set_evicted_seqlen(ComponentType.SWA, P - tail)
 +            while True:
 +                n = min(C, P_end + C - P)
@@ -1692,10 +1692,10 @@ index 00000000..776077ca
 +        _bounce["n"] = nbytes
 +    return _bounce["buf"][:nbytes]
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index e2124e4c..daaa7b39 100644
+index 46c40113..60a5d024 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -6305,6 +6305,11 @@ class Scheduler(
+@@ -6351,6 +6351,11 @@ class Scheduler(
  
  
  def dispatch_event_loop(scheduler: Scheduler):
@@ -1708,10 +1708,10 @@ index e2124e4c..daaa7b39 100644
          return role_switch.run_event_loop_supervisor(
              scheduler,
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index baddf006..5a8cae14 100644
+index c89dafff..8c400808 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -1890,6 +1890,11 @@ class ModelRunner:
+@@ -1895,6 +1895,11 @@ class ModelRunner:
                  forward_batch,
              ) as recorder_outputs,
          ):

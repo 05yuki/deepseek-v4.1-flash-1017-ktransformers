@@ -1,4 +1,4 @@
-From bbc020b6332145cde3149c8367f6d06163ff0479 Mon Sep 17 00:00:00 2001
+From 3d49a50a336e97f59d94fa1ee12d6f5257836d2e Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Sun, 25 Oct 2026 09:28:20 +0900
 Subject: [PATCH] [tier 0] Ada SM89 sparse attention fallback
@@ -373,10 +373,10 @@ index 00000000..623b0e87
 +        dim=0,
 +    )
 diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-index 59c65a20..9bbdb7c5 100644
+index 7a9601ae..fbda6822 100644
 --- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 +++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-@@ -209,8 +209,14 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
+@@ -208,8 +208,14 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
      return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
  
  
@@ -392,7 +392,7 @@ index 59c65a20..9bbdb7c5 100644
          return None
      from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
  
-@@ -2926,6 +2932,7 @@ class DeepseekV4AttnBackend(
+@@ -2925,6 +2931,7 @@ class DeepseekV4AttnBackend(
              and forward_batch.forward_mode.is_extend_without_speculative()
              and not is_cp_active(forward_batch)
              and not get_platform().is_sm120
@@ -400,7 +400,7 @@ index 59c65a20..9bbdb7c5 100644
              and self.forward_metadata.late_layer_tail is None
              and (
                  num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
-@@ -4333,7 +4340,24 @@ class DeepseekV4AttnBackend(
+@@ -4332,7 +4339,24 @@ class DeepseekV4AttnBackend(
                      extra_topk_lengths,
                  )
  

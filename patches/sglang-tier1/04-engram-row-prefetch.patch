@@ -1,4 +1,4 @@
-From c579677c305b9cc968bff1ec1b27e552b92597b5 Mon Sep 17 00:00:00 2001
+From cc598875f046812465c71e8d258b2c69be3416db Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] engram-row-prefetch: start the engram row lookups with the
@@ -31,10 +31,10 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  2 files changed, 74 insertions(+), 7 deletions(-)
 
 diff --git a/python/sglang/srt/layers/engram.py b/python/sglang/srt/layers/engram.py
-index 8e2e091b..ec0e6ab3 100644
+index 7d8e7c4b..6b1331dd 100644
 --- a/python/sglang/srt/layers/engram.py
 +++ b/python/sglang/srt/layers/engram.py
-@@ -1427,6 +1427,12 @@ class Engram(nn.Module):
+@@ -1503,6 +1503,12 @@ class Engram(nn.Module):
              # Nothing to gate, and the MXFP8 quantize behind wkv rejects an
              # empty M.
              return x

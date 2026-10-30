@@ -1,4 +1,4 @@
-From dd0bc89d762bfb4e0a704c5abc53892eb4e279d6 Mon Sep 17 00:00:00 2001
+From b9c4e85051148a79ce3a8b67561c3f40f7cf739a Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:32 +0900
 Subject: [PATCH] deepseek-v4: FP8 quantize-dequantize of the attention output
@@ -165,7 +165,7 @@ index 63e5ba14..d85dd86c 100644
                  if wo_a_weight is not None:
                      if (
 diff --git a/python/sglang/srt/models/deepseek_v4_dspark.py b/python/sglang/srt/models/deepseek_v4_dspark.py
-index 47aa9a25..6c02caf3 100644
+index 9385ab8c..caa3925f 100644
 --- a/python/sglang/srt/models/deepseek_v4_dspark.py
 +++ b/python/sglang/srt/models/deepseek_v4_dspark.py
 @@ -369,6 +369,14 @@ class DSparkAttention(MqaAttentionBase):
