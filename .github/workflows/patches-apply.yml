@@ -40,6 +40,8 @@ jobs:
           for f in ../patches/sglang-tier1/[0-9][0-9]-*.patch ../patches/sglang-tier2-no-p2p.patch; do
             git apply --whitespace=nowarn "$f"
           done
+          # stream-mmq's llama.cpp sources: fetched, patched and checked byte for byte
+          bash ../lib/llama-mmq.sh . ../llama-mmq-clone
           # the optional patches each fit on the full stack
           for f in ../patches/sglang-optional/[0-9][0-9]-*.patch; do
             git apply --check --whitespace=nowarn "$f"

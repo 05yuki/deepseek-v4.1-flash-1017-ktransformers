@@ -9,5 +9,11 @@ https://github.com/0xSero/deepseek-v4.1-flash-4x-rtx-pro-6000
 (Copyright (c) 2026 0xSero, MIT License); the MIT terms apply to those files, as
 their headers say.
 
-The patches under patches/ modify sgl-project/sglang (commit 8b9f7241) and
+patches/llama-mmq.patch changes files of llama.cpp (https://github.com/ggml-org/llama.cpp,
+commit 23b0202, Copyright (c) 2023-2026 The ggml authors, MIT License) that lib/llama-mmq.sh
+fetches into kt_gguf_moe_mmq/llama_mmq/ggml/ with llama.cpp's LICENSE, and
+patches/sglang-tier1/18-stream-mmq.patch adds code derived from it
+(kt_gguf_moe_mmq/llama_mmq/). The MIT terms apply to those files.
+
+The patches under patches/ modify sgl-project/sglang (commit 20036b7a) and
 kvcache-ai/ktransformers (kt-kernel, commit 95009ea), both Apache-2.0.

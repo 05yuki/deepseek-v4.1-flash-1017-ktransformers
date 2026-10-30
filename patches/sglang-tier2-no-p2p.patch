@@ -1,4 +1,4 @@
-From acd0430dc9109d992e0fe7fda5308fd3b90c173d Mon Sep 17 00:00:00 2001
+From 44afa512c8aa4f87ea093852433ac02f62992155 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:37 +0900
 Subject: [PATCH] distributed: all-reduce through pinned host memory for GPUs
@@ -22,7 +22,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 
 diff --git a/python/sglang/srt/distributed/device_communicators/host_staged_allreduce.py b/python/sglang/srt/distributed/device_communicators/host_staged_allreduce.py
 new file mode 100644
-index 00000000..e4901c84
+index 0000000000..e4901c8464
 --- /dev/null
 +++ b/python/sglang/srt/distributed/device_communicators/host_staged_allreduce.py
 @@ -0,0 +1,151 @@
@@ -179,7 +179,7 @@ index 00000000..e4901c84
 +        return t
 diff --git a/python/sglang/srt/distributed/device_communicators/ll_allreduce.py b/python/sglang/srt/distributed/device_communicators/ll_allreduce.py
 new file mode 100644
-index 00000000..dc9b9a5b
+index 0000000000..dc9b9a5bb1
 --- /dev/null
 +++ b/python/sglang/srt/distributed/device_communicators/ll_allreduce.py
 @@ -0,0 +1,135 @@
@@ -319,7 +319,7 @@ index 00000000..dc9b9a5b
 +        self.ext.ll_ar(t, self.base, self.rank, self.slot_bytes, self.counter)
 +        return t
 diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
-index c2f78053..d1f27882 100644
+index c2f7805334..d1f27882f6 100644
 --- a/python/sglang/srt/distributed/parallel_state.py
 +++ b/python/sglang/srt/distributed/parallel_state.py
 @@ -538,6 +538,40 @@ class GroupCoordinator:

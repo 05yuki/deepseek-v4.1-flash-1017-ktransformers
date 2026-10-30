@@ -34,7 +34,7 @@ the code" are on as soon as the patch is applied.
 | 15 | [`15-kv-lend-plan.patch`](#15-kv-lend-plan) | +1751 / -5 | `kv-vmm`, `prefill-lend` |
 | 16 | [`16-hot-lend.patch`](#16-hot-lend) | +674 / -34 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan` |
 | 17 | [`17-host-kv.patch`](#17-host-kv) | +477 / -7 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan`, `hot-lend` |
-| 18 | [`18-stream-mmq.patch`](#18-stream-mmq) | +20478 / -3 (of it +20,300 the vendored llama.cpp kernels) | `stream-prefill` |
+| 18 | [`18-stream-mmq.patch`](#18-stream-mmq) | +1618 / -3 (llama.cpp's kernels come from `lib/llama-mmq.sh`) | `stream-prefill` |
 | 19 | [`19-cpu-gpu-overlap.patch`](#19-cpu-gpu-overlap) | +190 / -2 | `loading`, `placement`, `prefill-lend`, `stream-prefill` |
 | 20 | [`20-expert-cache.patch`](#20-expert-cache) | +200 / -3 | `loading`, `placement`, `prefill-lend`, `stream-prefill`, `kv-vmm`, `kv-lend-plan`, `hot-lend`, `stream-mmq` |
 
@@ -522,6 +522,7 @@ On in `serve.sh` (`KT_GPU_STREAM_MMQ=1`; off in the code). The streamed prefill 
 - A group's slot goes back to the DMA as soon as it is regrouped.
 - Neither the bf16 MoE output nor the CUTLASS workspace is allocated, so `serve.sh` lets the plan's windows grow: 300 KiB a row and 36,864 rows at most (460 KiB and 6,144 without it).
 - A rank whose rows come from several kt-kernel parts (one GPU over two NUMA nodes) regroups part by part.
+- llama.cpp's own files (33 of `23b0202`) are not in the patch. `setup.sh` runs `lib/llama-mmq.sh`, which fetches them, applies `patches/llama-mmq.patch` (15 changed files and the IQ1_M instance, 679 lines) and checks all 36 against `patches/llama-mmq.sha256`.
 - `setup.sh` builds the extension for the GPU's arch.
 
 **Effect** (two RTX 5070 Ti and two EPYC 7452 unless noted):
@@ -549,7 +550,7 @@ Files (under `python/sglang/`):
 
 - `srt/layers/moe/kt_stream_prefill.py`
 - `srt/layers/moe/kt_gguf_moe_mmq.py` (new)
-- `srt/layers/moe/kt_gguf_moe_mmq/` (new: the binding and the vendored llama.cpp 23b0202 MMQ kernels, MIT)
+- `srt/layers/moe/kt_gguf_moe_mmq/` (new: the binding and the glue around llama.cpp 23b0202's MMQ kernels, MIT; the kernels themselves from `lib/llama-mmq.sh`)
 
 ## 19 cpu-gpu-overlap
 

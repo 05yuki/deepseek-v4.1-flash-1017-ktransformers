@@ -10,6 +10,7 @@
 | 1 | `patches/kt-kernel-tree.patch` | kvcache-ai/ktransformers `95009ea` (below tier 1 it is built as pinned) |
 | 1 | `patches/kt-kernel-llama-cpp.patch` | ktransformers' `third_party/llama.cpp` submodule |
 | 1 | `patches/kt-kernel-load-prefetch.py` | the installed kt-kernel (parallel expert loading) |
+| 1 | `patches/llama-mmq.patch` | 33 files of llama.cpp `23b0202`, for the `stream-mmq` feature (`lib/llama-mmq.sh` fetches them and checks them against `patches/llama-mmq.sha256`) |
 | 1 | `patches/kt-kernel-cpu-handoff.patch` | after the tree patch, with the `cpu-gpu-overlap` feature |
 | 1 | `patches/kt-kernel-expert-cache.patch` | after the tree patch, with the `expert-cache` feature |
 | - | `patches/sglang-dsv4-o-fp8-qdq.py`, `patches/dsv4_o_fp8_qdq.py` | another SGLang tree, on their own (tier 0 already has them) |

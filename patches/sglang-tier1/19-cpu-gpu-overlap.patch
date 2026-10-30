@@ -1,4 +1,4 @@
-From 0cd1ec00610bae5aca878099359e11ef2d4e8e5d Mon Sep 17 00:00:00 2001
+From b58bda7f4e588b40d1d6276cb93b03c01dc32fa6 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Thu, 29 Oct 2026 21:20:02 +0900
 Subject: [PATCH] cpu-gpu-overlap: the shared expert forks after the CPU
@@ -43,7 +43,7 @@ Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
  create mode 100644 python/sglang/srt/layers/moe/kt_handoff_pack.py
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index cfe462dd..c7cf9573 100644
+index cfe462dd59..c7cf957379 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -7,6 +7,7 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
@@ -95,7 +95,7 @@ index cfe462dd..c7cf9573 100644
          """Synchronize and retrieve CPU expert computation results.
 diff --git a/python/sglang/srt/layers/moe/kt_handoff_pack.py b/python/sglang/srt/layers/moe/kt_handoff_pack.py
 new file mode 100644
-index 00000000..f49aaac5
+index 0000000000..f49aaac55c
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_handoff_pack.py
 @@ -0,0 +1,145 @@
@@ -245,7 +245,7 @@ index 00000000..f49aaac5
 +    )
 +    return True
 diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
-index 031deeb5..32801525 100644
+index 031deeb507..32801525f0 100644
 --- a/python/sglang/srt/models/deepseek_v2.py
 +++ b/python/sglang/srt/models/deepseek_v2.py
 @@ -114,6 +114,9 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
