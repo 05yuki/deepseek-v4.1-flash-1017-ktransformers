@@ -6,3 +6,4 @@ hot-lend: kv-vmm prefill-lend stream-prefill kv-lend-plan
 host-kv: kv-vmm prefill-lend stream-prefill kv-lend-plan hot-lend
 stream-mmq: stream-prefill
 cpu-gpu-overlap: loading placement prefill-lend stream-prefill
+expert-cache: loading placement prefill-lend stream-prefill kv-vmm kv-lend-plan hot-lend stream-mmq

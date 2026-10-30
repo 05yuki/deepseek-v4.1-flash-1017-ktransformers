@@ -1,0 +1,288 @@
+From a7fabda32c1450d20beeb961d8df7f185005fcfd Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Fri, 30 Oct 2026 13:17:24 +0900
+Subject: [PATCH] expert-cache: the streamed prefill and the dynamic hot slots
+ read kt-kernel's MXFP4 expert cache
+
+With KT_MXFP4_EXPERT_CACHE_GIB (kt-kernel-expert-cache.patch) the routed experts live in a RAM cache
+of fixed slots instead of arenas holding all of them, so V4.1-1017 runs on one socket with 256 GB.
+
+- kt_stream_prefill: the cache's memfd is mapped and registered as pinned; a group's cached experts
+  are copied from their slots, the others are read from the checkpoint (O_DIRECT,
+  KT_MXFP4_STREAM_READERS threads) into a pinned bounce first. The ue8m0 scale bytes are widened
+  to the fp32 scales the regroup reads on the GPU (e << 23).
+- kt_kv_hot_lend: a swapped-in expert is copied from its cache slot, which stays pinned in the
+  cache until the copy is done, or read from the checkpoint when the cache does not hold it.
+- KT_MXFP4_STREAM_REPORT: the cache counters every that many streamed layers (40).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
+---
+ .../sglang/srt/layers/moe/kt_kv_hot_lend.py   |  48 +++++-
+ .../srt/layers/moe/kt_stream_prefill.py       | 155 +++++++++++++++++-
+ 2 files changed, 200 insertions(+), 3 deletions(-)
+
+diff --git a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
+index 117b828237..653948b711 100644
+--- a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
++++ b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
+@@ -736,8 +736,11 @@ def _arena_load(L: _Layer, e: int, dst, order: int) -> None:
+     from sglang.srt.layers.moe import kt_stream_prefill
+ 
+     st = kt_stream_prefill._instance
+-    st._register_arenas(L.layer_idx)
+     w13, s13, w2, s2 = (dst[k].view(torch.uint8) for k in (("w13", False), ("w13", True), ("w2", False), ("w2", True)))
++    if getattr(st, "_mxc", None) is not None:
++        _mxc_load(st, L, e, w13, s13, w2, s2, order)
++        return
++    st._register_arenas(L.layer_idx)
+     if not getattr(st, "_seg_whole", True):
+         _arena_load_parts(st, L, e, w13, s13, w2, s2, order)
+         return
+@@ -756,6 +759,47 @@ def _arena_load(L: _Layer, e: int, dst, order: int) -> None:
+         out.view(-1).copy_(((stage[:c].view(torch.int32) >> 23) & 0xFF).to(torch.uint8))
+ 
+ 
++def _mxc_unpin_done() -> None:
++    """Gives the cache back the slots whose copies to the GPU are done."""
++    left = []
++    for moe, lid, ev in DYN.get("mxc_pins", []):
++        if ev.query():
++            moe.kt_cache_unpin(lid)
++        else:
++            left.append((moe, lid, ev))
++    DYN["mxc_pins"] = left
++
++
++def _mxc_load(st, L: _Layer, e: int, w13, s13, w2, s2, order: int) -> None:
++    """_arena_load from kt-kernel's expert cache (KT_MXFP4_EXPERT_CACHE_GIB): the slot's gate, up, down weights and
++    ue8m0 scale bytes as they are; the slot stays pinned in the cache until the copy is done. An expert the cache
++    does not hold is read from the checkpoint through the streamer's bounce (and waited for)."""
++    _mxc_unpin_done()
++    X = st._mxc
++    w = X["layers"][L.layer_idx]
++    moe, lid = w.moe, w._mxc_p2l[int(e)]
++    n = w13.shape[0] // 2
++    a, b = (0, 1) if order == 0 else (1, 0)
++    s = moe.kt_cache_pin(lid)
++    if s >= 0:
++        base, cache = s * X["sb"], X["cache"]
++        src = [cache[base + o:base + o + c] for o, c in zip(X["off"], X["nb"])]
++    else:
++        src = st._mxc_read(0, [(0, lid)], w._mxc_where)[0]
++    w13[:n].view(-1).copy_(src[a], non_blocking=True)
++    w13[n:].view(-1).copy_(src[b], non_blocking=True)
++    w2.view(-1).copy_(src[2], non_blocking=True)
++    s13[:n].view(-1).copy_(src[3 + a], non_blocking=True)
++    s13[n:].view(-1).copy_(src[3 + b], non_blocking=True)
++    s2.view(-1).copy_(src[5], non_blocking=True)
++    if s >= 0:
++        ev = torch.cuda.Event()
++        ev.record()
++        DYN.setdefault("mxc_pins", []).append((moe, lid, ev))
++    else:
++        torch.cuda.current_stream().synchronize()  # the bounce is reused by the next read
++
++
+ def _arena_load_parts(st, L: _Layer, e: int, w13, s13, w2, s2, order: int) -> None:
+     """_arena_load when this rank's rows sit in other than one whole kt-kernel part
+     (kt_stream_prefill._rank_segments): gate/up rows lo..lo+c of each part are contiguous;
+@@ -797,7 +841,7 @@ def _dyn_setup(dev) -> None:
+     L = LAYERS[0]
+     roles = _roles(L)
+     st = getattr(kt_stream_prefill, "_instance", None)
+-    if st is None or L.layer_idx not in getattr(st, "_arenas", {}):
++    if st is None or (getattr(st, "_mxc", None) is None and L.layer_idx not in getattr(st, "_arenas", {})):
+         why = "no zero-copy arenas (KT_GPU_STREAM_ZEROCOPY=1 with KT_EXPERT_SHM=1)"
+     elif roles is None:
+         why = f"slot tensors {[(nm, str(L.slots[nm].dtype)) for _, nm in L.names]} are not packed MXFP4 bytes"
+diff --git a/python/sglang/srt/layers/moe/kt_stream_prefill.py b/python/sglang/srt/layers/moe/kt_stream_prefill.py
+index aa45f083fe..c269c0697b 100644
+--- a/python/sglang/srt/layers/moe/kt_stream_prefill.py
++++ b/python/sglang/srt/layers/moe/kt_stream_prefill.py
+@@ -107,6 +107,12 @@ CPUCHECK = os.environ.get("KT_GPU_STREAM_CPUCHECK", "1") == "1"
+ # graph of memcpy nodes per (layer, group). The fp32 group scales land in a
+ # small device pad and become e8m0 bytes inside the compute graph.
+ ZEROCOPY = os.environ.get("KT_GPU_STREAM_ZEROCOPY") == "1"
++# KT_MXFP4_EXPERT_CACHE_GIB (kt-kernel's MXFP4 expert cache): no arenas; the zero-copy DMAs come from the cache's
++# slots, and experts it does not hold are read from the checkpoint (O_DIRECT, KT_MXFP4_STREAM_READERS threads,
++# KT_MXFP4_STREAM_PIECE_KIB a read) into a pinned bounce first
++MXC = float(os.environ.get("KT_MXFP4_EXPERT_CACHE_GIB", "0") or 0) > 0
++MXC_READERS = int(os.environ.get("KT_MXFP4_STREAM_READERS", "8") or 8)
++MXC_PIECE = max(64, int(os.environ.get("KT_MXFP4_STREAM_PIECE_KIB", "1024") or 1024)) << 10
+ # KT_STREAM_SHARED_INPUTS=1 (default): the graph inputs of every chunk size
+ # are views of one base per buffer (kt-stream-shared-graph-inputs, 09-30).
+ SHARED_INPUTS = os.environ.get("KT_STREAM_SHARED_INPUTS", "1") == "1"
+@@ -533,7 +539,10 @@ class KTStreamPrefill:
+         # The groups never run concurrently: one mempool for every graph so
+         # their temporaries (scale conversions, local ids) share storage.
+         self._graph_pool = torch.cuda.graph_pool_handle()
+-        if ZEROCOPY:
++        self._mxc = None
++        if ZEROCOPY and MXC:
++            self._map_expert_cache()
++        elif ZEROCOPY:
+             self._map_expert_arenas(method)
+         else:
+             self._make_host_buffers()
+@@ -755,9 +764,150 @@ class KTStreamPrefill:
+             _log(f"rank {self.rank}: registered layer {layer_idx} arenas, {total/1e9:.1f} GB in {time.time()-t0:.1f} s"
+                  + (f" ({time.time()-t1:.1f} s pinning)" if lock is not None else ""))
+ 
++    # -- KT_MXFP4_EXPERT_CACHE_GIB: kt-kernel's expert cache -------------------------------------------------
++
++    def _map_expert_cache(self):
++        """Maps kt-kernel's expert cache (one memfd of fixed slots: gate, up, down weights, then their ue8m0
++        scale bytes) and registers it as pinned, with a pinned bounce of G experts for each DMA slot."""
++        import mmap
++        from concurrent.futures import ThreadPoolExecutor
++
++        from sglang.srt.layers.moe.kt_ep_wrapper import KT_LAYERS
++
++        if self.world != 1:
++            raise RuntimeError("KT_MXFP4_EXPERT_CACHE_GIB streams on one GPU")
++        layers = {li: m.wrapper for li, m in KT_LAYERS.items()}
++        info = next(iter(layers.values())).moe.kt_cache_info()
++        fd, sb, ns = int(info[0]), int(info[1]), int(info[2])
++        off, nb = [int(v) for v in info[3:9]], [int(v) for v in info[9:15]]
++        if nb[0] != nb[1] or nb[0] != nb[2] or nb[3] != nb[4] or nb[3] != nb[5]:
++            raise RuntimeError(f"KT_MXFP4_EXPERT_CACHE_GIB: pieces of unequal size {nb}")
++        t0 = time.time()
++        mm = mmap.mmap(fd, sb * ns, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
++        try:
++            mm.madvise(mmap.MADV_HUGEPAGE)
++        except (AttributeError, OSError):
++            pass
++        cache = torch.frombuffer(mm, dtype=torch.uint8)
++        rc = torch.cuda.cudart().cudaHostRegister(cache.data_ptr(), sb * ns, 0)
++        if int(rc) != 0:
++            raise RuntimeError(f"cudaHostRegister(expert cache, {sb * ns} bytes) failed: {int(rc)}")
++        per = sum(((b + 8192 + 4095) // 4096) * 4096 for b in nb)
++        bmm = mmap.mmap(-1, 2 * self.G * per)
++        bounce = torch.frombuffer(bmm, dtype=torch.uint8)
++        rc = torch.cuda.cudart().cudaHostRegister(bounce.data_ptr(), 2 * self.G * per, 0)
++        if int(rc) != 0:
++            raise RuntimeError(f"cudaHostRegister(expert cache bounce) failed: {int(rc)}")
++        self._mxc = dict(mm=mm, cache=cache, sb=sb, off=off, nb=nb, layers=layers, bmm=bmm, bounce=bounce, per=per,
++                         fds={}, pool=ThreadPoolExecutor(MXC_READERS), reads=0, read_bytes=0, read_s=0.0, hits=0)
++        _log(f"rank {self.rank}: expert cache mapped, {ns} slots of {sb / 2**20:.1f} MiB "
++             f"({sb * ns / 2**30:.1f} GiB) registered in {time.time() - t0:.1f} s; misses read with "
++             f"{MXC_READERS} readers into a {2 * self.G * per / 2**20:.0f} MiB bounce")
++
++    def _mxc_fd(self, path: str) -> int:
++        X = self._mxc
++        f = X["fds"].get(path)
++        if f is None:
++            f = X["fds"][path] = os.open(path, os.O_RDONLY | os.O_DIRECT)
++        return f
++
++    def _mxc_pread(self, fd: int, boff: int, foff: int, n: int) -> int:
++        mv = memoryview(self._mxc["bmm"])[boff:boff + n]
++        got = 0
++        while got < n:
++            r = os.preadv(fd, [mv[got:]], foff + got)
++            if r <= 0:
++                break
++            got += r
++        return got
++
++    def _mxc_read(self, half: int, miss, where):
++        """The missing experts' six pieces from the checkpoint into this DMA slot's half of the bounce: views
++        of each, by the group position."""
++        X = self._mxc
++        per = X["per"]
++        jobs, views = [], {}
++        need = 0
++        for k, (j, lid) in enumerate(miss):
++            o = (half * self.G + k) * per
++            vs = []
++            for path, off, nb in where[lid]:
++                lo = off & ~4095
++                hi = (off + nb + 4095) & ~4095
++                fd = self._mxc_fd(path)
++                for p in range(lo, hi, MXC_PIECE):
++                    jobs.append((fd, o + (p - lo), p, min(MXC_PIECE, hi - p)))
++                vs.append(X["bounce"][o + (off - lo):o + (off - lo) + nb])
++                need = max(need, o + (off - lo) + nb)
++                o += hi - lo
++            views[j] = vs
++        t0 = time.perf_counter()
++        got = list(X["pool"].map(lambda a: self._mxc_pread(*a), jobs))
++        X["read_s"] += time.perf_counter() - t0
++        X["reads"] += len(miss)
++        X["read_bytes"] += sum(got)
++        return views
++
++    def _stage_cache(self, layer_idx: int, gi: int, experts, stats):
++        """_stage_zc from the expert cache: per expert six H2D copies into the slot's raw landing (the scale
++        bytes into raw_e, widened on the GPU to the fp32 scales raw_s holds: ue8m0 e -> e << 23)."""
++        from sglang.srt.layers.moe import kt_lend
++
++        X = self._mxc
++        slot = self.slots[gi % 2]
++        n = len(experts)
++        W, S = X["nb"][0], X["nb"][3]
++        if slot.raw is None:
++            with kt_lend.scratch_region():
++                slot.raw = torch.empty((3, self.G, W), dtype=torch.uint8, device=self.device)
++                slot.raw_s = torch.empty((3, self.G, 4 * S), dtype=torch.uint8, device=self.device)
++                slot.raw_e = torch.empty((3, self.G, S), dtype=torch.uint8, device=self.device)
++        w = X["layers"][layer_idx]
++        moe, where, p2l = w.moe, w._mxc_where, w._mxc_p2l
++        srcs, miss = [], []
++        sb, off, nb, cache = X["sb"], X["off"], X["nb"], X["cache"]
++        for j, e in enumerate(experts):
++            lid = p2l[int(e)]
++            s = moe.kt_cache_slot(lid)
++            if s >= 0:
++                b = s * sb
++                srcs.append([cache[b + o:b + o + c] for o, c in zip(off, nb)])
++                X["hits"] += 1
++            else:
++                srcs.append(None)
++                miss.append((j, lid))
++        t0 = time.perf_counter()
++        if miss:
++            # this slot's bounce half is free once the slot's last DMA is done
++            if getattr(slot, "bounce_used", False):
++                slot.dma_done.synchronize()
++            for j, v in self._mxc_read(gi % 2, miss, where).items():
++                srcs[j] = v
++            slot.bounce_used = True
++        with torch.cuda.stream(self.transfer_stream):
++            if slot.compute_used:
++                self.transfer_stream.wait_event(slot.compute_done)
++            for j, src in enumerate(srcs):
++                for pi in range(3):
++                    slot.raw[pi, j].copy_(src[pi], non_blocking=True)
++                    slot.raw_e[pi, j].copy_(src[3 + pi], non_blocking=True)
++            slot.raw_s[:, :n].view(torch.int32).copy_(slot.raw_e[:, :n].to(torch.int32) << 23)
++            slot.dma_done.record(self.transfer_stream)
++        stats["dma_enq"] += time.perf_counter() - t0
++
++    def mxc_report(self) -> str:
++        X = self._mxc
++        if X is None:
++            return ""
++        return (f"expert cache: {X['hits']} experts streamed from the cache, {X['reads']} read from the drive "
++                f"({X['read_bytes'] / 1e9:.1f} GB in {X['read_s']:.1f} s)")
++
+     def _stage_zc(self, layer_idx: int, gi: int, experts, stats):
+         """Three contiguous H2D copies: the group's consecutive expert blocks
+         of the gate, up and down arenas, into the slot's raw landing."""
++        if self._mxc is not None:
++            self._stage_cache(layer_idx, gi, experts, stats)
++            return
+         self._register_arenas(layer_idx)
+         slot = self.slots[gi % 2]
+         n = len(experts)
+@@ -1588,6 +1738,9 @@ class KTStreamPrefill:
+             layer_idx = method.kt_config.layer_idx
+             self._run_mmq(method, layer_idx, x, ids, topk_weights, groups, acc, stats)
+             self.calls += 1
++            if self._mxc is not None and self.calls % int(os.environ.get("KT_MXFP4_STREAM_REPORT", "40") or 40) == 0:
++                _log(self.mxc_report())
++                method.wrapper.moe.kt_cache_report()
+             if TIMING:
+                 torch.cuda.current_stream(self.device).synchronize()
+                 _log(f"rank{self.rank} layer{layer_idx} tokens={T} groups={len(groups)} mmq "

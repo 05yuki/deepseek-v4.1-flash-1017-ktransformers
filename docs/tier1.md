@@ -35,6 +35,8 @@ the code" are on as soon as the patch is applied.
 | 16 | [`16-hot-lend.patch`](#16-hot-lend) | +674 / -34 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan` |
 | 17 | [`17-host-kv.patch`](#17-host-kv) | +477 / -7 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan`, `hot-lend` |
 | 18 | [`18-stream-mmq.patch`](#18-stream-mmq) | +20478 / -3 (of it +20,300 the vendored llama.cpp kernels) | `stream-prefill` |
+| 19 | [`19-cpu-gpu-overlap.patch`](#19-cpu-gpu-overlap) | +190 / -2 | `loading`, `placement`, `prefill-lend`, `stream-prefill` |
+| 20 | [`20-expert-cache.patch`](#20-expert-cache) | +200 / -3 | `loading`, `placement`, `prefill-lend`, `stream-prefill`, `kv-vmm`, `kv-lend-plan`, `hot-lend`, `stream-mmq` |
 
 ## Effect of each patch
 
@@ -580,3 +582,63 @@ Switches (code / serve.sh):
 
 - `KT_SHARED_AFTER_SUBMIT`: 0 / 1
 - `KT_HANDOFF_PACK`: 0 / 1
+
+## 20 expert-cache
+
+On in `serve.sh` when one CPU expert pool's NUMA node has less than 370 GiB (`KT_MXFP4_FULL_GIB`);
+off in the code (`KT_MXFP4_EXPERT_CACHE_GIB` unset). With `patches/kt-kernel-expert-cache.patch`,
+kt-kernel keeps a RAM cache of the routed experts instead of all of them, and reads the others from
+the checkpoint when they are routed. This is what runs the model on one socket with 256 GB of RAM.
+
+**Why.** The MXFP4 experts are 269 GiB in the checkpoint and 316 GiB in kt-kernel's arenas (their
+scales widened to fp32). One NUMA node of 256 GB does not hold them: kt-kernel's threads allocate
+on their own node, and the load ends in the OOM killer.
+
+**What it does** (kt-kernel, `operators/avx2/mxfp4-expert-cache.hpp`):
+
+- One memfd arena of fixed 18 MiB slots, one expert a slot: the gate, up and down weights as the
+  checkpoint packs them, then their ue8m0 scale bytes, each at a 4 KiB boundary.
+- The kernels read the scale bytes as their one-byte scale codes against one fixed table
+  (ue8m0 e → 2^(e−127), the values the bf16 load gives bit for bit), so no fp32 scales are kept.
+  A forward of more than one row expands the fp32 scales its kernels read into a scratch.
+- At load, each layer reads its share of the slots (its CPU experts in id order) at the drive's
+  speed. A decode step (fewer than 16 rows, `KT_MXFP4_CACHE_KEEP_ROWS`) keeps what it reads, least
+  recently used out first; wider forwards read their misses for themselves and leave the cache alone.
+- Reads are O_DIRECT, 1 MiB at a time, on `KT_MXFP4_CACHE_READERS` threads (16) on `KT_IO_CPUS`.
+  A forward computes its cached experts while the missing ones are read
+  (`KT_MXFP4_CACHE_OVERLAP`, 1); the weighted sum is one pass over the routing order either way.
+
+**What it does** (SGLang, this patch):
+
+- The streamed prefill maps the cache's memfd and registers it as pinned. A group's cached experts
+  are copied from their slots; the others are read from the checkpoint into a pinned bounce first
+  (`KT_MXFP4_STREAM_READERS`, 8). The scale bytes become fp32 scales on the GPU (e << 23).
+- The dynamic hot slots copy a swapped-in expert from its cache slot, which stays pinned in the
+  cache until the copy is done (an expert the cache does not hold is read from the checkpoint).
+
+**Effect** (one EPYC 7452 and its 251 GiB, one RTX 5070 Ti, `numactl -N 0 -m 0`, one launch each):
+
+- Without the cache the server does not start on one node.
+- Cache 160 GiB: Japanese prose 16.1 tok/s, 35K prefill 451-470 tok/s.
+- Cache 200 GiB: 18.1 tok/s and 519-598 tok/s; decode reads half as many experts again
+  (2.9% of the expert uses miss, against 5.1%).
+- Reading while computing: 18.7 tok/s with the decode's reads, 19.1 with the prefill's too.
+- The dynamic hot slots from the cache: 19.8 tok/s; the other texts 14.8-16.7 (13.6-15.7 without).
+- The wall is the one socket's memory bandwidth in decode, and the drive (6.5 GB/s here) for the
+  experts a prefill touches that the cache does not hold: a 400-token prompt takes 7.8 s.
+
+Numerics: bit-identical. Two layers loaded both ways (`KT_MXFP4_EXPERT_CACHE_GIB` 0 and 4) give
+byte-identical outputs for 34 forwards of 1, 8 and 128 rows, through misses, evictions and the
+reads of wide forwards, with and without the overlap. The server's 24-piece NLL is 0.7224 with
+the hot slots held fixed (cache 160 and 200 GiB: 0.7223, 0.7224; the hot slots differ a little
+between launches).
+
+Switches (code / serve.sh):
+
+- `KT_MXFP4_EXPERT_CACHE_GIB`: unset (off) / the node's memory less `KT_MXFP4_HOST_RESERVE_GIB`
+  (50) when it has less than `KT_MXFP4_FULL_GIB` (370) and one pool; 0 keeps every expert in RAM
+- `KT_MXFP4_CACHE_KEEP_ROWS`: 16
+- `KT_MXFP4_CACHE_READERS`: 16; `KT_IO_CPUS`: unset / the second hardware threads of the pool's cores
+- `KT_MXFP4_CACHE_OVERLAP`: 1
+- `KT_MXFP4_STREAM_READERS`: 8
+- `KT_MXFP4_CACHE_REPORT=<forwards>`, `KT_MXFP4_STREAM_REPORT=<layers>` (40): the cache's counters

@@ -30,10 +30,16 @@ fi
 MODEL="${MODEL:-$here/models/DeepSeek-V4.1-Flash-1017}"
 
 command -v nvidia-smi >/dev/null || { echo "no nvidia-smi: this recipe needs an NVIDIA GPU and its driver" >&2; exit 3; }
-# the server holds about 420 GiB (README, What it needs); it does not start with much less
+# the server holds about 420 GiB (README, What it needs); one socket with 256 GB runs it from an expert cache
 ram_gib=$(( $(sed -n 's/^MemTotal: *\([0-9]*\) kB/\1/p' /proc/meminfo) / 1048576 ))
+n_nodes="$(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l)"
 if (( ram_gib < 430 )); then
-  echo "note: $ram_gib GiB of RAM; the server holds about 420 GiB and needs a 512 GB class machine" >&2
+  if (( ram_gib >= 240 )); then
+    echo "note: $ram_gib GiB of RAM; the server keeps part of the experts in a RAM cache and reads the others from the drive" >&2
+    (( n_nodes > 1 )) && echo "      (one CPU expert pool: KT_THREADPOOL_COUNT=1, and numactl -N 0 -m 0 keeps the server on that node)" >&2
+  else
+    echo "note: $ram_gib GiB of RAM; this recipe needs one socket with 256 GB or a 512 GB class machine" >&2
+  fi
   echo "      (the GGUF recipe runs this model in 64 GB: github.com/05yuki/deepseek-v4.1-flash-1017-gguf-ktransformers)" >&2
 fi
 

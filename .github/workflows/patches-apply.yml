@@ -56,6 +56,10 @@ jobs:
           git apply --whitespace=nowarn ../patches/kt-kernel-tree.patch
           # the cpu-gpu-overlap feature's kt-kernel patch sits on the tree patch
           git apply --check --whitespace=nowarn ../patches/kt-kernel-cpu-handoff.patch
+          # the expert-cache feature's kt-kernel patch fits on the tree patch, with or without the hand-off
+          git apply --check --whitespace=nowarn ../patches/kt-kernel-expert-cache.patch
+          git apply --whitespace=nowarn ../patches/kt-kernel-cpu-handoff.patch
+          git apply --check --whitespace=nowarn ../patches/kt-kernel-expert-cache.patch
           llama=$(git ls-tree HEAD third_party/llama.cpp | awk '{print $3}')
           git init -q ../llama && cd ../llama
           git fetch -q --depth 1 https://github.com/ggerganov/llama.cpp.git "$llama"

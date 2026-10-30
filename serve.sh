@@ -88,8 +88,45 @@ max_total_tokens="${SGLANG_MAX_TOTAL_TOKENS:-$context_length}"
 # memory with more, swapped for what the text routes to (more here only takes memory the
 # lend would use, and must fit at load)
 gpu_experts="${KT_GPU_EXPERTS:-1}"
-cpu_threads="${KT_CPU_THREADS:-$phys_cores}"
 threadpools="${KT_THREADPOOL_COUNT:-$n_nodes}"
+# one pool on a machine of several nodes runs on the first rank's node: its physical cores
+pool_node="${numa_list%% *}"
+node_cpus() { lscpu -p=CPU,CORE,NODE 2>/dev/null | grep -v '^#' | awk -F, -v n="$1" '$3 == n'; }
+if (( threadpools == 1 && n_nodes > 1 )); then
+  node_cores="$(node_cpus "$pool_node" | awk -F, '!seen[$2]++' | grep -c . || true)"
+  (( node_cores > 0 )) && phys_cores="$node_cores"
+fi
+cpu_threads="${KT_CPU_THREADS:-$phys_cores}"
+
+# --- the expert cache (tier-1 expert-cache) ---------------------------------
+# The MXFP4 experts take 316 GiB in RAM with everything else the server holds about 420 GiB.
+# With one CPU expert pool (one NUMA node: a one-socket machine, or KT_THREADPOOL_COUNT=1)
+# whose node has less than KT_MXFP4_FULL_GIB (370), kt-kernel keeps a cache of
+# KT_MXFP4_EXPERT_CACHE_GIB of them in RAM (the node's memory, or this process's cgroup limit
+# if lower, less KT_MXFP4_HOST_RESERVE_GIB, 50, for everything else) and reads the others from
+# the checkpoint when they are routed. KT_MXFP4_EXPERT_CACHE_GIB=0 keeps every expert in RAM.
+if has expert-cache && (( threadpools == 1 )) && [[ -z "${KT_MXFP4_EXPERT_CACHE_GIB:-}" ]]; then
+  pool_gib="$(awk '/MemTotal/ {printf "%d", $4 / 1048576}' "/sys/devices/system/node/node$pool_node/meminfo" 2>/dev/null || true)"
+  [[ "${pool_gib:-0}" -gt 0 ]] || pool_gib="$(awk '/MemTotal/ {printf "%d", $2 / 1048576}' /proc/meminfo)"
+  cg_max="$(cat "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup | head -1)/memory.max" 2>/dev/null || echo max)"
+  if [[ "$cg_max" =~ ^[0-9]+$ ]] && (( cg_max / 1073741824 < pool_gib )); then pool_gib=$(( cg_max / 1073741824 )); fi
+  if (( pool_gib < ${KT_MXFP4_FULL_GIB:-370} )); then
+    export KT_MXFP4_EXPERT_CACHE_GIB=$(( pool_gib - ${KT_MXFP4_HOST_RESERVE_GIB:-50} ))
+    if (( KT_MXFP4_EXPERT_CACHE_GIB < 100 )); then
+      echo "node $pool_node has $pool_gib GiB: too little for the MXFP4 expert cache (the GGUF recipe runs this model in 64 GB)" >&2
+      exit 5
+    fi
+  fi
+fi
+if [[ "${KT_MXFP4_EXPERT_CACHE_GIB:-0}" != 0 ]]; then
+  has expert-cache || { echo "KT_MXFP4_EXPERT_CACHE_GIB requires the expert-cache tier-1 feature" >&2; exit 3; }
+  (( threadpools == 1 )) || { echo "KT_MXFP4_EXPERT_CACHE_GIB needs one CPU expert pool (KT_THREADPOOL_COUNT=1)" >&2; exit 3; }
+  # the cache's drive reads run on the second hardware threads of the pool's cores (none without SMT)
+  if [[ -z "${KT_IO_CPUS:-}" ]]; then
+    io_cpus="$(node_cpus "$pool_node" | awk -F, 'seen[$2]++ {print $1}' | paste -sd, -)"
+    [[ -n "$io_cpus" ]] && export KT_IO_CPUS="$io_cpus"
+  fi
+fi
 deferred_experts="${KT_DEFERRED_EXPERTS:-0}"  # >0 drops expert work for speed; it hurts the text
 mem_fraction="${SGLANG_MEM_FRACTION:-0.81}"
 kv_cache_dtype="${SGLANG_KV_CACHE_DTYPE:-fp8_e4m3}"
@@ -350,6 +387,7 @@ command=(
 
 printf '%s\n' "DeepSeek-V4.1-Flash on SGLang + KTransformers: $model"
 printf '%s\n' "GPUs ${CUDA_VISIBLE_DEVICES} (sm $cap), TP $tp on NUMA nodes $numa_list; CPU experts: $cpu_threads threads in $threadpools pools; GPU experts $gpu_experts a layer"
+[[ "${KT_MXFP4_EXPERT_CACHE_GIB:-0}" != 0 ]] && printf '%s\n' "expert cache: $KT_MXFP4_EXPERT_CACHE_GIB GiB of node $pool_node's RAM, the other experts read from $model when routed (reads on CPUs ${KT_IO_CPUS:-any})"
 printf '%s\n' "patch tier $tier; context $context_length; attention output FP8 before wo_a: block ${SGLANG_DSV4_O_FP8_QDQ_BLOCK:-0}; KV layout ${SGLANG_DSV4_KV_LAYOUT:-v4}"
 (( tier >= 1 )) && printf '%s\n' "tier-1 features: $( [[ -f "$features_file" ]] && tr '\n' ' ' < "$features_file" || echo all)"
 (( tier >= 1 )) && printf '%s\n' "wo_a native FP8: $SGLANG_DSV4_WO_A_FP8_NATIVE; vision tower on demand: $SGLANG_DSV4_VISION_ON_DEMAND; MXFP4 MoE fp32: $SGLANG_MXFP4_MOE_FP32; Marlin MoE fp32 glue: $SGLANG_MARLIN_MOE_FP32_GLUE; CPU scale codes: $KT_MXFP4_SCALE_CODES; hot lend spare floor: ${KT_KV_HOT_SPARE_FLOOR_MB:-off} MiB; dynamic hot slots: ${KT_KV_HOT_DYNAMIC_SLOTS:-0}, resident rows too: ${KT_KV_HOT_DYNAMIC_RESIDENT:-0}; shared expert after submit: ${KT_SHARED_AFTER_SUBMIT:-0}; packed hand-off: ${KT_HANDOFF_PACK:-0}"

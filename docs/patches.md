@@ -10,6 +10,8 @@
 | 1 | `patches/kt-kernel-tree.patch` | kvcache-ai/ktransformers `95009ea` (below tier 1 it is built as pinned) |
 | 1 | `patches/kt-kernel-llama-cpp.patch` | ktransformers' `third_party/llama.cpp` submodule |
 | 1 | `patches/kt-kernel-load-prefetch.py` | the installed kt-kernel (parallel expert loading) |
+| 1 | `patches/kt-kernel-cpu-handoff.patch` | after the tree patch, with the `cpu-gpu-overlap` feature |
+| 1 | `patches/kt-kernel-expert-cache.patch` | after the tree patch, with the `expert-cache` feature |
 | - | `patches/sglang-dsv4-o-fp8-qdq.py`, `patches/dsv4_o_fp8_qdq.py` | another SGLang tree, on their own (tier 0 already has them) |
 | - | `patches/sglang-optional/NN-*.patch` | the full stack, by hand; `setup.sh` never applies them (below) |
 
@@ -147,6 +149,7 @@ are for:
 | decode | [`fp8-decode`](tier1.md#01-fp8-decode), [`engram-row-prefetch`](tier1.md#04-engram-row-prefetch), [`wo-a-fp8`](tier1.md#05-wo-a-fp8), [`placement`](tier1.md#11-placement), [`hot-lend`](tier1.md#16-hot-lend), [`cpu-gpu-overlap`](tier1.md#19-cpu-gpu-overlap) |
 | long prompts | [`stream-prefill`](tier1.md#14-stream-prefill), [`stream-mmq`](tier1.md#18-stream-mmq), [`prefill-lend`](tier1.md#13-prefill-lend), [`kv-vmm`](tier1.md#12-kv-vmm), [`kv-lend-plan`](tier1.md#15-kv-lend-plan) |
 | GPU memory | [`wo-a-fp8`](tier1.md#05-wo-a-fp8), [`vision-on-demand`](tier1.md#06-vision-on-demand) |
+| RAM | [`expert-cache`](tier1.md#20-expert-cache) |
 | numerics | [`gpu-moe-fp32`](tier1.md#02-gpu-moe-fp32) |
 | startup | [`loading`](tier1.md#08-loading), [`launch-timing`](tier1.md#09-launch-timing), [`pool-swa-guard`](tier1.md#10-pool-swa-guard) |
 | fixes | [`cutlass-kt-expert-count`](tier1.md#03-cutlass-kt-expert-count), [`thinking-default-parser`](tier1.md#07-thinking-default-parser) |
@@ -194,6 +197,14 @@ Tier 1.
 - Code for other models also comes with the tree (the llama.cpp-format GGUF experts and
   `kt-kernel-llama-cpp.patch`, EXL3 experts, Gemma 4 BF16 experts). This repository does
   not use it, but the build needs it.
+
+## kt-kernel expert cache patch
+
+With the `expert-cache` feature. `operators/avx2/mxfp4-expert-cache.hpp` is a RAM cache of the
+routed experts in fixed slots of one memfd, filled from the checkpoint's safetensors files with
+O_DIRECT reads; the MXFP4 backend binds each forward's experts to their slots, reads what is
+missing while it computes the rest, and the Python loader registers where each expert is in the
+checkpoint instead of reading it ([tier1.md](tier1.md#20-expert-cache)).
 
 ## Values tuned on the test machine
 

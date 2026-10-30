@@ -1,0 +1,984 @@
+diff --git a/kt-kernel/ext_bindings.cpp b/kt-kernel/ext_bindings.cpp
+index 4766629..b105e7e 100644
+--- a/kt-kernel/ext_bindings.cpp
++++ b/kt-kernel/ext_bindings.cpp
+@@ -486,6 +486,17 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
+     moe_cls.def("expert_arena_infos", &MoeClass::expert_arena_infos);
+   }
+ 
++  // kt-mxfp4-expert-cache
++  if constexpr (requires { &MoeClass::kt_cache_source; }) {
++    moe_cls.def("kt_cache_source", &MoeClass::kt_cache_source);
++    moe_cls.def("kt_cache_fill", &MoeClass::kt_cache_fill);
++    moe_cls.def("kt_cache_slot", &MoeClass::kt_cache_slot);
++    moe_cls.def("kt_cache_pin", &MoeClass::kt_cache_pin);
++    moe_cls.def("kt_cache_unpin", &MoeClass::kt_cache_unpin);
++    moe_cls.def("kt_cache_info", &MoeClass::kt_cache_info);
++    moe_cls.def("kt_cache_report", &MoeClass::kt_cache_report);
++  }
++
+   // Bind write_weight_scale_to_buffer_task for MoE types that support it
+   // Uses SFINAE to detect if MoeClass has write_weight_scale_to_buffer method
+   if constexpr (requires { &MoeClass::write_weight_scale_to_buffer; }) {
+diff --git a/kt-kernel/operators/avx2/moe_base.hpp b/kt-kernel/operators/avx2/moe_base.hpp
+index a3f2a2e..136bda7 100644
+--- a/kt-kernel/operators/avx2/moe_base.hpp
++++ b/kt-kernel/operators/avx2/moe_base.hpp
+@@ -180,10 +180,13 @@ class AVX2_MOE_BASE {
+     // KT_EXPERT_SHM=1: per-expert loaders keep the packed weights in the TP
+     // class's per-part buffers, so the base block only ever holds the fp32
+     // group scales; allocate scale-only arenas and scale-only BufferBs.
+-    const bool use_expert_shm = expert_shm_enabled() && kHasScaleOnlyBufferB;
++    // kt-mxfp4-expert-cache: the experts' bytes live in the cache's slots, bound per forward
++    bool kt_cache_mode = false;
++    if constexpr (requires { Derived::kt_cache_mode(); }) kt_cache_mode = Derived::kt_cache_mode();
++    const bool use_expert_shm = !kt_cache_mode && expert_shm_enabled() && kHasScaleOnlyBufferB;
+     // Backends whose BufferB is the plain weight matrix (BF16): the whole
+     // BufferB goes into the arenas, so the GPU can DMA it as is.
+-    const bool use_full_shm = expert_shm_enabled() && !kHasScaleOnlyBufferB;
++    const bool use_full_shm = !kt_cache_mode && expert_shm_enabled() && !kHasScaleOnlyBufferB;
+     if (use_expert_shm) {
+       expert_arenas_.push_back(make_expert_arena(
+           buffer_b_scale_size(config_.intermediate_size, config_.hidden_size), config_.expert_num, "kt_gate_s"));
+@@ -206,6 +209,12 @@ class AVX2_MOE_BASE {
+       up_bc_.push_back(make_buffer_c(config_.max_len, config_.intermediate_size, nullptr));
+       down_ba_.push_back(make_buffer_a(config_.max_len, config_.intermediate_size, nullptr));
+       down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
++      if (kt_cache_mode) {
++        gate_bb_.push_back(make_buffer_b_scale_only(config_.intermediate_size, config_.hidden_size, nullptr));
++        up_bb_.push_back(make_buffer_b_scale_only(config_.intermediate_size, config_.hidden_size, nullptr));
++        down_bb_.push_back(make_buffer_b_scale_only(config_.hidden_size, config_.intermediate_size, nullptr));
++        continue;
++      }
+ 
+       void *gate_bb_ptr, *up_bb_ptr, *down_bb_ptr;
+       if (use_expert_shm || use_full_shm) {
+@@ -283,11 +292,14 @@ class AVX2_MOE_BASE {
+   }
+ 
+   void forward(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
++    if constexpr (requires(Derived* d) { d->kt_cache_before(qlen, k, expert_ids); })
++      derived()->kt_cache_before(qlen, k, expert_ids);
+     if (qlen > 1) {
+       forward_prefill(qlen, k, expert_ids, weights, input, output);
+     } else {
+       forward_decode(k, expert_ids, weights, input, output);
+     }
++    if constexpr (requires(Derived* d) { d->kt_cache_after(); }) derived()->kt_cache_after();
+   }
+ 
+   template <typename... Args>
+@@ -412,6 +424,26 @@ class AVX2_MOE_BASE {
+     if constexpr (has_fused_prefill()) {
+       if (activated_expert > 0) run_fused_prefill(activated_expert, qlen);
+     } else {
++    // kt-mxfp4-expert-cache: with reads still running, the cached experts first, then the rest once read
++    const int kt_all = activated_expert;
++    int kt_first = activated_expert;
++    if constexpr (requires(Derived* d) { d->kt_cache_missed(0); }) {
++      if (derived()->kt_cache_pending()) {
++        auto mid = std::stable_partition(m_expert_id_map_.begin(), m_expert_id_map_.begin() + kt_all,
++                                         [this](int e) { return !derived()->kt_cache_missed(e); });
++        kt_first = (int)(mid - m_expert_id_map_.begin());
++      }
++    }
++    for (int kt_round = 0; kt_round < 2; kt_round++) {
++      if (kt_round == 1) {
++        if (kt_first == kt_all) break;
++        if constexpr (requires(Derived* d) { d->kt_cache_wait(); }) derived()->kt_cache_wait();
++        std::copy(m_expert_id_map_.begin() + kt_first, m_expert_id_map_.begin() + kt_all, m_expert_id_map_.begin());
++        activated_expert = kt_all - kt_first;
++      } else {
++        activated_expert = kt_first;
++        if (activated_expert == 0) continue;
++      }
+       // Gate + Up GEMM
+       int nth = T::recommended_nth(config_.intermediate_size);
+       pool->do_work_stealing_job(
+@@ -430,10 +462,10 @@ class AVX2_MOE_BASE {
+           },
+           nullptr);
+ 
+-      st_mark();  // 4: gate/up gemm
++      if (kt_round == 0) st_mark();  // 4: gate/up gemm
+       // Activation: SiLU(gate) * up — AVX2 version (8 elements at a time)
+       apply_activation(activated_expert, nth, qlen);
+-      st_mark();  // 5: activation
++      if (kt_round == 0) st_mark();  // 5: activation
+ 
+       // Pack activation output into BufferA for down projection
+       pool->do_work_stealing_job(
+@@ -444,7 +476,7 @@ class AVX2_MOE_BASE {
+           },
+           nullptr);
+ 
+-      st_mark();  // 6: pack down
++      if (kt_round == 0) st_mark();  // 6: pack down
+       // Down GEMM
+       nth = T::recommended_nth(config_.hidden_size);
+       pool->do_work_stealing_job(
+@@ -457,6 +489,8 @@ class AVX2_MOE_BASE {
+           },
+           nullptr);
+     }
++    activated_expert = kt_all;
++    }
+ 
+     st_mark();  // 7: down gemm
+     // Weighted sum of expert outputs — AVX2 version (16 BF16 = 2x8 FP32 at a time)
+@@ -567,6 +601,27 @@ class AVX2_MOE_BASE {
+     }
+ 
+     if (kt_timed) kt_t1 = std::chrono::steady_clock::now();
++    // kt-mxfp4-expert-cache: with reads still running, the cached experts first (gate, up, down), then the rest
++    // once they are read; the weighted sum below is one pass either way
++    const int kt_all = activated_expert;
++    int kt_first = activated_expert;
++    if constexpr (requires(Derived* d) { d->kt_cache_missed(0); }) {
++      if (derived()->kt_cache_pending()) {
++        auto mid = std::stable_partition(m_expert_id_map_.begin(), m_expert_id_map_.begin() + kt_all,
++                                         [this](int e) { return !derived()->kt_cache_missed(e); });
++        kt_first = (int)(mid - m_expert_id_map_.begin());
++      }
++    }
++    for (int kt_round = 0; kt_round < 2; kt_round++) {
++    if (kt_round == 1) {
++      if (kt_first == kt_all) break;
++      if constexpr (requires(Derived* d) { d->kt_cache_wait(); }) derived()->kt_cache_wait();
++      std::copy(m_expert_id_map_.begin() + kt_first, m_expert_id_map_.begin() + kt_all, m_expert_id_map_.begin());
++      activated_expert = kt_all - kt_first;
++    } else {
++      activated_expert = kt_first;
++      if (activated_expert == 0) continue;
++    }
+     // Gate + Up GEMM
+     int nth = T::recommended_nth(config_.intermediate_size);
+     if constexpr (has_fused_gate_up_decode()) {
+@@ -601,7 +656,7 @@ class AVX2_MOE_BASE {
+           nullptr);
+     }
+ 
+-    if (kt_timed) kt_t2 = std::chrono::steady_clock::now();
++    if (kt_timed && kt_round == 0) kt_t2 = std::chrono::steady_clock::now();
+     // Down GEMM
+     nth = T::recommended_nth(config_.hidden_size);
+     if constexpr (has_fused_down_decode()) {
+@@ -617,6 +672,8 @@ class AVX2_MOE_BASE {
+           },
+           nullptr);
+     }
++    }
++    activated_expert = kt_all;
+ 
+     if (kt_timed) kt_t3 = std::chrono::steady_clock::now();
+     // Weighted sum — AVX2 (16 BF16 at a time)
+diff --git a/kt-kernel/operators/avx2/mxfp4-expert-cache.hpp b/kt-kernel/operators/avx2/mxfp4-expert-cache.hpp
+new file mode 100644
+index 0000000..5dfce52
+--- /dev/null
++++ b/kt-kernel/operators/avx2/mxfp4-expert-cache.hpp
+@@ -0,0 +1,469 @@
++// KT_MXFP4_EXPERT_CACHE_GIB=<n>: the routed experts of the MXFP4 backend live in a RAM cache of n GiB instead of
++// being copied whole into RAM at load. Each expert is read from the checkpoint's safetensors files (O_DIRECT) into a
++// fixed slot of one memfd arena: gate, up and down weights as the checkpoint packs them, then their ue8m0 scale
++// bytes, each piece at a 4 KiB boundary. The FP4 kernels read the scale bytes as their one-byte scale codes against
++// a fixed 256-entry table (ue8m0 e -> 2^(e-127), the values the bf16 load path gives bit for bit); forwards wider
++// than one token get their fp32 scales expanded into a scratch for the kernels that read them.
++//
++// Decode forwards (narrower than KT_MXFP4_CACHE_KEEP_ROWS, 16) keep what they read, least recently used out first;
++// wider forwards read their misses for themselves and leave the cache alone. The arena is a memfd so the GPU side
++// can map it and DMA hits straight from the slots (kt_cache_info()).
++#ifndef KT_MXFP4_EXPERT_CACHE_HPP
++#define KT_MXFP4_EXPERT_CACHE_HPP
++
++#include <fcntl.h>
++#include <sched.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <functional>
++#include <list>
++#include <mutex>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <vector>
++
++namespace kt_mxc {
++
++inline double env_f(const char* n, double dflt) {
++  const char* e = std::getenv(n);
++  return e && e[0] ? std::atof(e) : dflt;
++}
++
++inline bool on() {
++  static const bool v = env_f("KT_MXFP4_EXPERT_CACHE_GIB", 0) > 0;
++  return v;
++}
++
++// ue8m0 -> fp32 as the bf16 load path converts it: e << 7 as bf16 (e = 0 gives +0, e = 255 gives +inf)
++inline float e8m0_f32(uint8_t e) {
++  uint32_t bits = (uint32_t)e << 23;
++  float f;
++  std::memcpy(&f, &bits, 4);
++  return f;
++}
++
++inline const float* e8m0_table() {
++  alignas(64) static float t[256];
++  static bool init = [] {
++    for (int i = 0; i < 256; i++) t[i] = e8m0_f32((uint8_t)i);
++    return true;
++  }();
++  (void)init;
++  return t;
++}
++
++inline std::vector<int> parse_cpus(const char* spec) {
++  std::vector<int> v;
++  if (!spec) return v;
++  std::string s(spec);
++  size_t p = 0;
++  while (p < s.size()) {
++    size_t q = s.find(',', p);
++    if (q == std::string::npos) q = s.size();
++    std::string part = s.substr(p, q - p);
++    size_t d = part.find('-');
++    if (!part.empty()) {
++      int lo = std::atoi(part.substr(0, d).c_str());
++      int hi = d == std::string::npos ? lo : std::atoi(part.substr(d + 1).c_str());
++      for (int c = lo; c <= hi; c++) v.push_back(c);
++    }
++    p = q + 1;
++  }
++  return v;
++}
++
++// reader threads (KT_MXFP4_CACHE_READERS, 16), on KT_IO_CPUS when set
++class Jobs {
++ public:
++  Jobs() {
++    int n = (int)env_f("KT_MXFP4_CACHE_READERS", 16);
++    if (n < 1) n = 1;
++    std::vector<int> cpus = parse_cpus(std::getenv("KT_IO_CPUS"));
++    for (int i = 0; i < n; i++)
++      th_.emplace_back([this, cpus] {
++        if (!cpus.empty()) {
++          cpu_set_t set;
++          CPU_ZERO(&set);
++          for (int c : cpus) CPU_SET(c, &set);
++          sched_setaffinity(0, sizeof(set), &set);
++        }
++        for (;;) {
++          std::function<void()> f;
++          {
++            std::unique_lock<std::mutex> lk(mu_);
++            cv_.wait(lk, [this] { return stop_ || !q_.empty(); });
++            if (stop_ && q_.empty()) return;
++            f = std::move(q_.front());
++            q_.pop_front();
++          }
++          f();
++          {
++            std::lock_guard<std::mutex> lk(mu_);
++            if (--pending_ == 0) done_.notify_all();
++          }
++        }
++      });
++  }
++  ~Jobs() {
++    {
++      std::lock_guard<std::mutex> lk(mu_);
++      stop_ = true;
++    }
++    cv_.notify_all();
++    for (auto& t : th_) t.join();
++  }
++  // queues the jobs on the readers
++  void submit(std::vector<std::function<void()>>& jobs) {
++    if (jobs.empty()) return;
++    {
++      std::lock_guard<std::mutex> lk(mu_);
++      for (auto& j : jobs) q_.push_back(std::move(j));
++      pending_ += jobs.size();
++    }
++    cv_.notify_all();
++    jobs.clear();
++  }
++  // returns when every queued job is done
++  void wait() {
++    std::unique_lock<std::mutex> lk(mu_);
++    done_.wait(lk, [this] { return pending_ == 0; });
++  }
++  void run_all(std::vector<std::function<void()>>& jobs) {
++    submit(jobs);
++    wait();
++  }
++
++ private:
++  std::vector<std::thread> th_;
++  std::deque<std::function<void()>> q_;
++  std::mutex mu_;
++  std::condition_variable cv_, done_;
++  size_t pending_ = 0;
++  bool stop_ = false;
++};
++
++class Cache {
++ public:
++  static Cache& get() {
++    static Cache c;
++    return c;
++  }
++
++  // the six pieces of a slot: gate, up, down weights, gate, up, down scale bytes
++  size_t off[6] = {0}, bytes[6] = {0};
++  size_t slot_bytes = 0, nslots = 0;
++  int fd = -1;
++  uint8_t* base = nullptr;
++  int keep_rows = 16;
++  std::atomic<uint64_t> hits{0}, misses{0}, transient_reads{0}, read_bytes{0}, read_ns{0}, evictions{0};
++
++  // the slot layout from the first layer's shapes (all layers share them); allocates the arena
++  void init(size_t n_inter, size_t hidden, size_t group) {
++    std::lock_guard<std::mutex> lk(mu_);
++    const size_t w13 = n_inter * hidden / 2, w2 = hidden * n_inter / 2;
++    const size_t s13 = n_inter * (hidden / group), s2 = hidden * (n_inter / group);
++    const size_t want[6] = {w13, w13, w2, s13, s13, s2};
++    if (base) {
++      for (int i = 0; i < 6; i++)
++        if (bytes[i] != want[i]) throw std::runtime_error("KT_MXFP4_EXPERT_CACHE_GIB: layers differ in expert shape");
++      return;
++    }
++    size_t o = 0;
++    for (int i = 0; i < 6; i++) {
++      off[i] = o;
++      bytes[i] = want[i];
++      o += (want[i] + 4095) & ~size_t(4095);
++    }
++    slot_bytes = (o + (size_t(2) << 20) - 1) & ~((size_t(2) << 20) - 1);  // whole 2 MB pages
++    const size_t budget = (size_t)(env_f("KT_MXFP4_EXPERT_CACHE_GIB", 0) * (double)(size_t(1) << 30));
++    nslots = budget / slot_bytes;
++    if (nslots < 64) throw std::runtime_error("KT_MXFP4_EXPERT_CACHE_GIB: under 64 experts' worth");
++    keep_rows = std::max(1, (int)env_f("KT_MXFP4_CACHE_KEEP_ROWS", 16));
++    fd = memfd_create("kt_mxfp4_cache", 0);
++    if (fd < 0) throw std::runtime_error("memfd_create failed for the expert cache");
++    if (ftruncate(fd, (off_t)(nslots * slot_bytes)) != 0) throw std::runtime_error("ftruncate of the expert cache");
++    void* m = mmap(nullptr, nslots * slot_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    if (m == MAP_FAILED) throw std::runtime_error("mmap of the expert cache");
++    madvise(m, nslots * slot_bytes, MADV_HUGEPAGE);
++    base = (uint8_t*)m;
++    free_.reserve(nslots);
++    for (size_t i = nslots; i-- > 0;) free_.push_back((int)i);
++    std::printf("[kt-mxfp4-cache] %zu slots of %.2f MiB (%.1f GiB), expert %.2f MiB, keep rows < %d\n", nslots,
++                slot_bytes / 1048576.0, nslots * slot_bytes / 1073741824.0, o / 1048576.0, keep_rows);
++    std::fflush(stdout);
++  }
++
++  int file_index(const std::string& path) {
++    std::lock_guard<std::mutex> lk(mu_);
++    auto f = file_idx_.find(path);
++    if (f != file_idx_.end()) return f->second;
++    int fdd = open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
++    int fdb = open(path.c_str(), O_RDONLY | O_CLOEXEC);
++    if (fdb < 0) throw std::runtime_error("KT_MXFP4_EXPERT_CACHE_GIB: cannot open " + path);
++    files_.push_back({fdd, fdb});
++    file_idx_[path] = (int)files_.size() - 1;
++    return (int)files_.size() - 1;
++  }
++
++  // where expert lid of a layer is in the checkpoint: per piece (as off/bytes above) a file and a byte offset
++  void set_source(int layer, uint64_t lid, const int file[6], const uint64_t foff[6], const uint64_t fbytes[6]) {
++    Src s;
++    for (int i = 0; i < 6; i++) {
++      if (fbytes[i] != bytes[i])
++        throw std::runtime_error("KT_MXFP4_EXPERT_CACHE_GIB: piece " + std::to_string(i) + " of layer " +
++                                 std::to_string(layer) + " expert " + std::to_string(lid) + " has " +
++                                 std::to_string(fbytes[i]) + " bytes, the slot " + std::to_string(bytes[i]));
++      s.file[i] = file[i];
++      s.off[i] = foff[i];
++    }
++    std::lock_guard<std::mutex> lk(mu_);
++    src_[key(layer, lid)] = s;
++  }
++
++  // Pins the n experts and gives each one's slot (or, for a forward that does not keep, a buffer of its own);
++  // reads what is missing. Every acquire is paired with release_all().
++  // missed[i] (when given) is set for the experts read now; async leaves their reads running (wait_reads())
++  void acquire(int layer, const uint64_t* lids, int n, uint8_t** out, bool keep, uint8_t* missed = nullptr,
++               bool async = false) {
++    std::vector<std::function<void()>> reads;
++    {
++      std::lock_guard<std::mutex> lk(mu_);
++      for (int i = 0; i < n; i++) {
++        const uint64_t k = key(layer, lids[i]);
++        held_.push_back(k);
++        auto f = map_.find(k);
++        if (missed) missed[i] = f == map_.end();
++        if (f != map_.end()) {
++          Entry& e = f->second;
++          if (keep) lru_.splice(lru_.begin(), lru_, e.at);
++          e.pins++;
++          out[i] = base + (size_t)e.slot * slot_bytes;
++          hits.fetch_add(1, std::memory_order_relaxed);
++          continue;
++        }
++        auto s = src_.find(k);
++        if (s == src_.end())
++          throw std::runtime_error("KT_MXFP4_EXPERT_CACHE_GIB: no source for layer " + std::to_string(layer) +
++                                   " expert " + std::to_string(lids[i]));
++        uint8_t* dst = nullptr;
++        if (keep) {
++          int slot = take_slot();
++          if (slot >= 0) {
++            Entry e;
++            e.slot = slot;
++            e.pins = 1;
++            lru_.push_front(k);
++            e.at = lru_.begin();
++            map_.emplace(k, e);
++            dst = base + (size_t)slot * slot_bytes;
++          }
++        }
++        if (!dst) {  // read for this forward only
++          void* b = nullptr;
++          if (posix_memalign(&b, 4096, slot_bytes) != 0) throw std::runtime_error("expert cache: out of memory");
++          dst = (uint8_t*)b;
++          transient_.push_back(dst);
++          held_.pop_back();  // not in the map: nothing to unpin
++          transient_reads.fetch_add(1, std::memory_order_relaxed);
++        }
++        misses.fetch_add(1, std::memory_order_relaxed);
++        plan_reads(s->second, dst, reads);
++        out[i] = dst;
++      }
++    }
++    if (async) {
++      jobs_.submit(reads);
++      return;
++    }
++    const auto t0 = std::chrono::steady_clock::now();
++    jobs_.run_all(reads);
++    read_ns.fetch_add(
++        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(),
++        std::memory_order_relaxed);
++  }
++
++  // waits for an asynchronous acquire's reads (the time counts as waiting on the drive)
++  void wait_reads() {
++    const auto t0 = std::chrono::steady_clock::now();
++    jobs_.wait();
++    read_ns.fetch_add(
++        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(),
++        std::memory_order_relaxed);
++  }
++
++  void release_all() {
++    std::lock_guard<std::mutex> lk(mu_);
++    for (uint64_t k : held_) {
++      auto f = map_.find(k);
++      if (f != map_.end() && f->second.pins > 0) f->second.pins--;
++    }
++    held_.clear();
++    for (uint8_t* p : transient_) std::free(p);
++    transient_.clear();
++  }
++
++  // at load: reads the layer's experts in the given order into free slots, up to `count` of them
++  size_t fill(int layer, const uint64_t* lids, int n, int count) {
++    std::vector<std::function<void()>> reads;
++    size_t got = 0;
++    {
++      std::lock_guard<std::mutex> lk(mu_);
++      for (int i = 0; i < n && (int)got < count; i++) {
++        const uint64_t k = key(layer, lids[i]);
++        if (map_.count(k)) continue;
++        auto s = src_.find(k);
++        if (s == src_.end() || free_.empty()) break;
++        Entry e;
++        e.slot = free_.back();
++        free_.pop_back();
++        e.pins = 0;
++        lru_.push_back(k);  // filled at load: behind anything used since
++        e.at = std::prev(lru_.end());
++        map_.emplace(k, e);
++        plan_reads(s->second, base + (size_t)e.slot * slot_bytes, reads);
++        got++;
++      }
++    }
++    jobs_.run_all(reads);
++    return got;
++  }
++
++  // a cached expert held in its slot (not evicted) until unpin: its slot, or -1 when not cached
++  int pin(int layer, uint64_t lid) {
++    std::lock_guard<std::mutex> lk(mu_);
++    auto f = map_.find(key(layer, lid));
++    if (f == map_.end()) return -1;
++    f->second.pins++;
++    return f->second.slot;
++  }
++  void unpin(int layer, uint64_t lid) {
++    std::lock_guard<std::mutex> lk(mu_);
++    auto f = map_.find(key(layer, lid));
++    if (f != map_.end() && f->second.pins > 0) f->second.pins--;
++  }
++
++  // the slot of a cached expert, or -1 (the GPU side DMAs hits from the arena)
++  int slot_of(int layer, uint64_t lid) {
++    std::lock_guard<std::mutex> lk(mu_);
++    auto f = map_.find(key(layer, lid));
++    return f == map_.end() ? -1 : f->second.slot;
++  }
++
++  void tick() {
++    static const uint64_t every = (uint64_t)env_f("KT_MXFP4_CACHE_REPORT", 0);
++    if (every && ++ticks_ % every == 0) report();
++  }
++
++  void report() {
++    const uint64_t h = hits.load(), m = misses.load();
++    std::printf(
++        "[kt-mxfp4-cache] hits %llu, misses %llu (%.2f%%, %llu of them not kept), read %.2f GB in %.2f s, "
++        "evictions %llu, %zu of %zu slots used\n",
++        (unsigned long long)h, (unsigned long long)m, h + m ? 100.0 * m / (h + m) : 0.0,
++        (unsigned long long)transient_reads.load(), read_bytes.load() / 1e9, read_ns.load() / 1e9,
++        (unsigned long long)evictions.load(), map_.size(), nslots);
++    std::fflush(stdout);
++  }
++
++ private:
++  struct Src {
++    int file[6];
++    uint64_t off[6];
++  };
++  struct Entry {
++    int slot = -1;
++    int pins = 0;
++    std::list<uint64_t>::iterator at;
++  };
++  static uint64_t key(int layer, uint64_t lid) { return ((uint64_t)(uint32_t)layer << 32) | (lid & 0xffffffffu); }
++
++  // a free slot, else the least recently used unpinned entry's; -1 when everything is pinned
++  int take_slot() {
++    if (!free_.empty()) {
++      int s = free_.back();
++      free_.pop_back();
++      return s;
++    }
++    for (auto it = lru_.end(); it != lru_.begin();) {
++      --it;
++      auto f = map_.find(*it);
++      if (f->second.pins) continue;
++      int s = f->second.slot;
++      map_.erase(f);
++      lru_.erase(it);
++      evictions.fetch_add(1, std::memory_order_relaxed);
++      return s;
++    }
++    return -1;
++  }
++
++  // the six pieces in reads of up to KT_MXFP4_CACHE_PIECE_KIB (1024) of 4 KiB-aligned file range each, through a
++  // per-thread bounce buffer (the pieces' file offsets are not aligned)
++  void plan_reads(const Src& s, uint8_t* dst, std::vector<std::function<void()>>& out) {
++    static const size_t piece = [] {
++      size_t k = (size_t)env_f("KT_MXFP4_CACHE_PIECE_KIB", 1024);
++      return (k < 64 ? 64 : k) << 10;
++    }();
++    for (int t = 0; t < 6; t++) {
++      const uint64_t a = s.off[t], b = a + bytes[t];
++      const uint64_t lo = a & ~uint64_t(4095);
++      const int fdd = files_[s.file[t]].first, fdb = files_[s.file[t]].second;
++      uint8_t* d = dst + off[t];
++      for (uint64_t p = lo; p < b; p += piece) {
++        const uint64_t q = std::min<uint64_t>(p + piece, (b + 4095) & ~uint64_t(4095));
++        out.push_back([this, p, q, a, b, d, fdd, fdb] {
++          static thread_local uint8_t* bounce = nullptr;
++          static thread_local size_t cap = 0;
++          const size_t len = q - p;
++          if (cap < len) {
++            std::free(bounce);
++            if (posix_memalign((void**)&bounce, 4096, len) != 0) throw std::runtime_error("expert cache bounce");
++            cap = len;
++          }
++          size_t got = 0;
++          while (got < len) {
++            ssize_t r = fdd >= 0 ? pread(fdd, bounce + got, len - got, p + got) : -1;
++            if (r < 0) r = pread(fdb, bounce + got, len - got, p + got);
++            if (r <= 0) break;
++            got += size_t(r);
++          }
++          read_bytes.fetch_add(got, std::memory_order_relaxed);
++          const uint64_t c0 = std::max(p, a), c1 = std::min<uint64_t>(std::min(q, p + got), b);
++          if (c1 > c0) std::memcpy(d + (c0 - a), bounce + (c0 - p), c1 - c0);
++          if (p + got < std::min(q, b)) {
++            std::fprintf(stderr, "[kt-mxfp4-cache] short read at %llu (%zu of %zu)\n", (unsigned long long)p, got,
++                         len);
++            std::abort();
++          }
++        });
++      }
++    }
++  }
++
++  std::mutex mu_;
++  std::vector<int> free_;
++  std::unordered_map<uint64_t, Entry> map_;
++  std::list<uint64_t> lru_;
++  std::unordered_map<uint64_t, Src> src_;
++  std::vector<std::pair<int, int>> files_;
++  std::unordered_map<std::string, int> file_idx_;
++  std::vector<uint64_t> held_;
++  std::vector<uint8_t*> transient_;
++  uint64_t ticks_ = 0;
++  Jobs jobs_;
++};
++
++}  // namespace kt_mxc
++
++#endif  // KT_MXFP4_EXPERT_CACHE_HPP
+diff --git a/kt-kernel/operators/avx2/mxfp4-moe.hpp b/kt-kernel/operators/avx2/mxfp4-moe.hpp
+index b482ee1..4aea239 100644
+--- a/kt-kernel/operators/avx2/mxfp4-moe.hpp
++++ b/kt-kernel/operators/avx2/mxfp4-moe.hpp
+@@ -53,6 +53,7 @@ static inline bool kt_scale_codes_load_all() {
+ #include "avx2_bf16_gemm.hpp"
+ #include "avx2_bf16_utils.hpp"
+ #include "moe_base.hpp"
++#include "mxfp4-expert-cache.hpp"
+ 
+ 
+ // kt-kernel-nvfp4-cpu-a4.py: flashinfer's NVFP4 activation quantize, on the CPU
+@@ -1677,6 +1678,144 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+   size_t buffer_a_required_size_impl(size_t m, size_t k) const {
+     return T::BufferA::required_size(m, k, config_.quant_config.group_size);
+   }
++
++  // kt-mxfp4-expert-cache (mxfp4-expert-cache.hpp): every expert's BufferBs point into its cache slot for the
++  // forwards that route to it, the scale bytes as one-byte codes against the fixed ue8m0 table
++  static bool kt_cache_mode() { return kt_mxc::on(); }
++  std::vector<uint64_t> kt_c_p2l_;
++  std::vector<int64_t> kt_c_eids_;
++  std::vector<uint64_t> kt_c_lids_;
++  std::vector<uint8_t*> kt_c_ptrs_;
++  std::vector<uint8_t> kt_c_seen_;
++  std::vector<uint8_t> kt_c_missed_;   // per bound expert: read by this forward
++  std::vector<uint8_t> kt_c_is_miss_;  // per physical expert, while the reads run
++  bool kt_c_bound_ = false;
++  bool kt_c_pending_ = false;
++  bool kt_c_need_d_ = false;
++  static std::vector<float>& kt_cache_scratch() {
++    static std::vector<float> s;
++    return s;
++  }
++
++  void kt_cache_load(const uint64_t* p2l) {
++    kt_c_p2l_.resize(config_.expert_num);
++    for (int e = 0; e < config_.expert_num; e++) kt_c_p2l_[e] = expert_map(p2l, e);
++    const float* t = kt_mxc::e8m0_table();
++    for (int e = 0; e < config_.expert_num; e++)
++      for (auto* bb : {gate_bb_[e].get(), up_bb_[e].get(), down_bb_[e].get()}) {
++        bb->b = nullptr;
++        bb->d = nullptr;
++        bb->code = nullptr;
++        std::memcpy(bb->lut, t, sizeof(bb->lut));
++      }
++  }
++
++  // binds the experts among ids (physical; the GPU's left out when skip_gpu) to their slots; need_d expands the
++  // fp32 scales the kernels for more than one row read
++  void kt_cache_bind(const int64_t* ids, int n_ids, bool need_d, bool keep, bool skip_gpu = true,
++                     bool async = false) {
++    auto& C = kt_mxc::Cache::get();
++    kt_c_seen_.assign(config_.expert_num, 0);
++    kt_c_eids_.clear();
++    kt_c_lids_.clear();
++    for (int i = 0; i < n_ids; i++) {
++      const int64_t e = ids[i];
++      if (e < 0 || e >= config_.expert_num || kt_c_seen_[e]) continue;
++      if (skip_gpu && config_.should_skip_expert(e)) continue;
++      kt_c_seen_[e] = 1;
++      kt_c_eids_.push_back(e);
++      kt_c_lids_.push_back(kt_c_p2l_.empty() ? (uint64_t)e : kt_c_p2l_[e]);
++    }
++    const int n = (int)kt_c_eids_.size();
++    kt_c_ptrs_.resize(n);
++    kt_c_bound_ = true;
++    if (n == 0) return;
++    kt_c_missed_.assign(n, 0);
++    C.acquire(config_.layer_idx, kt_c_lids_.data(), n, kt_c_ptrs_.data(), keep, kt_c_missed_.data(), async);
++    if (async) {
++      kt_c_is_miss_.assign(config_.expert_num, 0);
++      for (int i = 0; i < n; i++)
++        if (kt_c_missed_[i]) kt_c_is_miss_[kt_c_eids_[i]] = 1, kt_c_pending_ = true;
++    }
++    for (int i = 0; i < n; i++) {
++      const int64_t e = kt_c_eids_[i];
++      uint8_t* p = kt_c_ptrs_[i];
++      typename T::BufferB* bbs[3] = {gate_bb_[e].get(), up_bb_[e].get(), down_bb_[e].get()};
++      for (int t = 0; t < 3; t++) {
++        bbs[t]->b = p + C.off[t];
++        bbs[t]->code = p + C.off[3 + t];
++        bbs[t]->d = nullptr;
++      }
++    }
++    kt_c_need_d_ = need_d;
++    if (!need_d) return;
++    const size_t s13 = C.bytes[3], s2 = C.bytes[5], per = 2 * s13 + s2;
++    auto& sc = kt_cache_scratch();
++    if (sc.size() < (size_t)n * per) sc.resize((size_t)n * per);
++    for (int i = 0; i < n; i++) {
++      const int64_t e = kt_c_eids_[i];
++      float* q = sc.data() + (size_t)i * per;
++      gate_bb_[e]->d = q;
++      up_bb_[e]->d = q + s13;
++      down_bb_[e]->d = q + 2 * s13;
++    }
++    kt_cache_expand(kt_c_pending_ ? 0 : 2);
++  }
++  // the fp32 scales from the scale bytes: of the experts read already (0), of those read now (1), of all (2)
++  void kt_cache_expand(int which) {
++    auto& C = kt_mxc::Cache::get();
++    std::vector<int> sel;
++    for (int i = 0; i < (int)kt_c_eids_.size(); i++)
++      if (which == 2 || (int)kt_c_missed_[i] == which) sel.push_back(i);
++    if (sel.empty()) return;
++    const float* tab = kt_mxc::e8m0_table();
++    auto pool = config_.pool->get_subpool(tp_part_idx);
++    pool->do_work_stealing_job(
++        (int)sel.size() * 3, nullptr,
++        [this, tab, &C, &sel](int task) {
++          const int64_t e = kt_c_eids_[sel[task / 3]];
++          const int t = task % 3;
++          auto* bb = t == 0 ? gate_bb_[e].get() : t == 1 ? up_bb_[e].get() : down_bb_[e].get();
++          const size_t cnt = C.bytes[3 + t];
++          float* d = bb->d;
++          const uint8_t* c = bb->code;
++          for (size_t j = 0; j < cnt; j++) d[j] = tab[c[j]];
++        },
++        nullptr);
++  }
++  // forward_decode: whether reads are still running, which experts they are for, and the wait
++  bool kt_cache_pending() const { return kt_c_pending_; }
++  bool kt_cache_missed(int e) const { return kt_c_pending_ && kt_c_is_miss_[e]; }
++  void kt_cache_wait() {
++    if (!kt_c_pending_) return;
++    kt_mxc::Cache::get().wait_reads();
++    kt_c_pending_ = false;
++    if (kt_c_need_d_) kt_cache_expand(1);
++  }
++  void kt_cache_unbind() {
++    if (!kt_c_bound_) return;
++    kt_cache_wait();
++    kt_mxc::Cache::get().release_all();
++    for (int64_t e : kt_c_eids_)
++      for (auto* bb : {gate_bb_[e].get(), up_bb_[e].get(), down_bb_[e].get()}) {
++        bb->b = nullptr;
++        bb->d = nullptr;
++        bb->code = nullptr;
++      }
++    kt_c_bound_ = false;
++  }
++  void kt_cache_before(int qlen, int k, const int64_t* expert_ids) {
++    if (!kt_mxc::on()) return;
++    // a decode step computes its cached experts while the missing ones are read (KT_MXFP4_CACHE_OVERLAP, 1)
++    static const bool overlap = kt_mxc::env_f("KT_MXFP4_CACHE_OVERLAP", 1) != 0;
++    kt_cache_bind(expert_ids, qlen * k, qlen > 1, qlen < kt_mxc::Cache::get().keep_rows, true,
++                  overlap);
++  }
++  void kt_cache_after() {
++    if (!kt_mxc::on()) return;
++    kt_cache_unbind();
++    kt_mxc::Cache::get().tick();
++  }
+   size_t buffer_b_required_size_impl(size_t n, size_t k) const {
+     // Always allocate full buffer (weights + scales) for both per-expert and flat-buffer modes.
+     // Per-expert mode used to only allocate scales and point b into mmap, but that caused
+@@ -2001,6 +2140,16 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
+     auto pool = config.pool;
+     const uint64_t* physical_to_logical_map = (const uint64_t*)config.physical_to_logical_map;
+     bool use_per_expert = !config.gate_projs.empty();
++    if (kt_mxc::on()) {  // kt-mxfp4-expert-cache: nothing is copied; the sources came with kt_cache_source
++      if (this->tp_count != 1)
++        throw std::runtime_error("KT_MXFP4_EXPERT_CACHE_GIB needs one CPU expert pool (KT_THREADPOOL_COUNT=1)");
++      tps[0]->config_.physical_to_logical_map = config.physical_to_logical_map;
++      auto* tp = static_cast<AVX2_MXFP4_MOE_TP<K>*>(tps[0].get());
++      kt_mxc::Cache::get().init(config.intermediate_size, config.hidden_size, config.quant_config.group_size);
++      tp->kt_cache_load(physical_to_logical_map);
++      this->weights_loaded = true;
++      return;
++    }
+     if (config.gate_projs.empty() && config.gate_scale == nullptr)
+       throw std::runtime_error("MXFP4 AVX2 MoE only supports packed FP4 with KGroup scales");
+ 
+@@ -2238,11 +2387,49 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
+         (int)w2_weight_ptrs.size() != gpu_tp_count || (int)w2_scale_ptrs.size() != gpu_tp_count) {
+       throw std::runtime_error("Pointer arrays size must match gpu_tp_count");
+     }
++    if (kt_mxc::on()) {  // the expert read for this write alone (GPU experts are not cached)
++      auto* tp = static_cast<AVX2_MXFP4_MOE_TP<K>*>(this->tps[0].get());
++      const int64_t e = expert_id;
++      tp->kt_cache_bind(&e, 1, true, false, false);
++      tp->write_weights_to_buffer(gpu_tp_count, this->tp_count, expert_id, this->config, w13_weight_ptrs,
++                                  w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs);
++      tp->kt_cache_unbind();
++      return;
++    }
+     this->config.pool->dispense_backend()->do_numa_job([&, this](int i) {
+       this->tps[i]->write_weights_to_buffer(gpu_tp_count, this->tp_count, expert_id, this->config, w13_weight_ptrs,
+                                             w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs);
+     });
+   }
++
++  // kt-mxfp4-expert-cache: where logical expert lid's six pieces are in the checkpoint (gate, up, down weights,
++  // then their scales: file path, byte offset, bytes)
++  void kt_cache_source(int64_t lid, const std::vector<std::string>& paths, const std::vector<uint64_t>& offs,
++                       const std::vector<uint64_t>& nbytes) {
++    if (paths.size() != 6 || offs.size() != 6 || nbytes.size() != 6)
++      throw std::runtime_error("kt_cache_source: six pieces");
++    auto& C = kt_mxc::Cache::get();
++    C.init(this->config.intermediate_size, this->config.hidden_size, this->config.quant_config.group_size);
++    int f[6];
++    for (int i = 0; i < 6; i++) f[i] = C.file_index(paths[i]);
++    C.set_source(this->config.layer_idx, (uint64_t)lid, f, offs.data(), nbytes.data());
++  }
++  // reads up to count of this layer's experts (logical ids, in order) into free slots
++  size_t kt_cache_fill(const std::vector<int64_t>& lids, int count) {
++    return kt_mxc::Cache::get().fill(this->config.layer_idx, (const uint64_t*)lids.data(), (int)lids.size(), count);
++  }
++  int kt_cache_slot(int64_t lid) { return kt_mxc::Cache::get().slot_of(this->config.layer_idx, (uint64_t)lid); }
++  int kt_cache_pin(int64_t lid) { return kt_mxc::Cache::get().pin(this->config.layer_idx, (uint64_t)lid); }
++  void kt_cache_unpin(int64_t lid) { kt_mxc::Cache::get().unpin(this->config.layer_idx, (uint64_t)lid); }
++  // fd, slot bytes, slots, the six pieces' offsets in a slot, their bytes
++  std::vector<int64_t> kt_cache_info() {
++    auto& C = kt_mxc::Cache::get();
++    std::vector<int64_t> v = {C.fd, (int64_t)C.slot_bytes, (int64_t)C.nslots};
++    for (int i = 0; i < 6; i++) v.push_back((int64_t)C.off[i]);
++    for (int i = 0; i < 6; i++) v.push_back((int64_t)C.bytes[i]);
++    return v;
++  }
++  void kt_cache_report() { kt_mxc::Cache::get().report(); }
+ };
+ 
+ #endif  // CPUINFER_OPERATOR_AVX2_MXFP4_MOE_H
+diff --git a/kt-kernel/python/utils/amx.py b/kt-kernel/python/utils/amx.py
+index 62abd34..2119dbe 100644
+--- a/kt-kernel/python/utils/amx.py
++++ b/kt-kernel/python/utils/amx.py
+@@ -735,6 +735,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
+     def load_weights(self, physical_to_logical_map_cpu: torch.Tensor):
+         import time
+ 
++        if self.method == "MXFP4" and float(os.environ.get("KT_MXFP4_EXPERT_CACHE_GIB", "0") or 0) > 0:
++            return self._load_weights_mxfp4_cache(physical_to_logical_map_cpu)
++
+         if NativeMoEWrapper._native_loader_instance is None:
+             t_recreate_start = time.time()
+             NativeMoEWrapper._native_loader_instance = NativeMoEWrapper._create_loader(self.method, self.weight_path)
+@@ -1043,6 +1046,96 @@ class NativeMoEWrapper(BaseMoEWrapper):
+             f"total: {(t6-t0)*1000:.1f}ms"
+         )
+ 
++    _mxc_headers: dict = {}
++    _mxc_layers = None
++
++    @staticmethod
++    def _mxc_header(path: str):
++        """A safetensors file's tensor table and where its data starts."""
++        import json
++        import struct
++
++        h = NativeMoEWrapper._mxc_headers.get(path)
++        if h is None:
++            with open(path, "rb") as f:
++                n = struct.unpack("<Q", f.read(8))[0]
++                h = (json.loads(f.read(n)), 8 + n)
++            NativeMoEWrapper._mxc_headers[path] = h
++        return h
++
++    def _load_weights_mxfp4_cache(self, physical_to_logical_map_cpu: torch.Tensor):
++        """KT_MXFP4_EXPERT_CACHE_GIB: kt-kernel reads the routed experts from the checkpoint's files into its RAM
++        cache when routed; this registers each expert's six pieces (gate, up, down weights and scales) with their
++        file offsets and fills the layer's share of the cache."""
++        import re
++        import time
++
++        t0 = time.time()
++        root = self.weight_path if os.path.isdir(self.weight_path) else os.path.dirname(self.weight_path)
++        files = sorted(os.path.join(dp, f) for dp, _, fs in os.walk(root) for f in fs if f.endswith(".safetensors"))
++        where = {}
++        if NativeMoEWrapper._mxc_layers is None:
++            NativeMoEWrapper._mxc_layers = set()
++        for p in files:
++            table, start = self._mxc_header(p)
++            for k, v in table.items():
++                if k == "__metadata__":
++                    continue
++                m = re.match(r"(?:model\.)?layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)$", k)
++                if not m:
++                    continue
++                NativeMoEWrapper._mxc_layers.add(int(m.group(1)))
++                if int(m.group(1)) != self.layer_idx:
++                    continue
++                a, b = v["data_offsets"]
++                where[(int(m.group(2)), m.group(3), m.group(4))] = (p, start + a, b - a, v["shape"])
++        if not where:
++            raise ValueError(f"KT_MXFP4_EXPERT_CACHE_GIB: no experts of layer {self.layer_idx} under {root}")
++        group_size = self.hidden_size // where[(0, "w1", "scale")][3][1]
++
++        moe_config = MOEConfig(
++            self.num_experts,
++            self.num_experts_per_tok,
++            self.hidden_size,
++            self.moe_intermediate_size,
++            self.gpu_experts_mask.data_ptr(),
++        )
++        moe_config.layer_idx = self.layer_idx
++        moe_config.pool = self.cpu_infer.backend_
++        moe_config.max_len = self.chunked_prefill_size
++        moe_config.swiglu_limit = self.swiglu_limit
++        moe_config.activation_type = 1 if self._activation == "gelu_pytorch_tanh" else 0
++        moe_config.quant_config.bits = 4
++        moe_config.quant_config.group_size = group_size
++        moe_config.quant_config.zero_point = False
++        if AVX2MXFP4_MOE is None or _select_mxfp4_backend() is not AVX2MXFP4_MOE:
++            raise RuntimeError("KT_MXFP4_EXPERT_CACHE_GIB needs the AVX2 MXFP4 backend (KT_MXFP4_BACKEND=avx2)")
++        self.moe = AVX2MXFP4_MOE(moe_config)
++        for lid in range(self.num_experts):
++            pieces = [where[(lid, w, kind)] for kind in ("weight", "scale") for w in ("w1", "w3", "w2")]
++            self.moe.kt_cache_source(lid, [q[0] for q in pieces], [q[1] for q in pieces], [q[2] for q in pieces])
++        self.cpu_infer.submit(self.moe.load_weights_task(physical_to_logical_map_cpu.data_ptr()))
++        self.cpu_infer.sync()
++        t1 = time.time()
++
++        # the layer's share of the slots, its CPU experts in id order (the decode's use reorders them)
++        info = self.moe.kt_cache_info()
++        share = info[2] // max(1, len(NativeMoEWrapper._mxc_layers))
++        mask = self.gpu_experts_mask.cpu()
++        p2l = physical_to_logical_map_cpu.cpu()
++        lids = [int(p2l[p]) for p in range(self.num_experts) if not bool(mask[p])]
++        got = self.moe.kt_cache_fill(lids, share)
++        # the GPU side's streamed prefill reads the misses from the same files
++        self._mxc_where = {lid: [where[(lid, w, kind)][:3] for kind in ("weight", "scale") for w in ("w1", "w3", "w2")]
++                           for lid in range(self.num_experts)}
++        self._mxc_p2l = [int(x) for x in p2l.tolist()]
++        t2 = time.time()
++        print(
++            f"[NativeMoEWrapper Layer {self.layer_idx}] expert cache: {len(where) // 6} experts registered in "
++            f"{(t1 - t0) * 1000:.0f} ms, {got} of {len(lids)} CPU experts read in {(t2 - t1) * 1000:.0f} ms",
++            flush=True,
++        )
++
+     def submit_write_weight_scale_to_buffer(
+         self,
+         gpu_tp_count: int,

@@ -70,6 +70,9 @@ kt_patches=(kt-kernel-tree.patch kt-kernel-llama-cpp.patch kt-kernel-load-prefet
 if [[ " ${features[*]} " == *" cpu-gpu-overlap "* ]]; then
   kt_patches+=(kt-kernel-cpu-handoff.patch)
 fi
+if [[ " ${features[*]} " == *" expert-cache "* ]]; then
+  kt_patches+=(kt-kernel-expert-cache.patch)
+fi
 (( TIER >= 1 )) && kt_variant="patched $(patch_hash "${kt_patches[@]}")"
 # a patch is checked against the pinned tree first; nothing is applied when it does not fit
 apply_checked() {
@@ -110,6 +113,9 @@ if ! built_as third_party/ktransformers/.dsv41-1017-patched "$kt_variant"; then
     apply_checked third_party/ktransformers "$here/patches/kt-kernel-tree.patch"
     if [[ " ${features[*]} " == *" cpu-gpu-overlap "* ]]; then
       apply_checked third_party/ktransformers "$here/patches/kt-kernel-cpu-handoff.patch"
+    fi
+    if [[ " ${features[*]} " == *" expert-cache "* ]]; then
+      apply_checked third_party/ktransformers "$here/patches/kt-kernel-expert-cache.patch"
     fi
     apply_checked third_party/ktransformers/third_party/llama.cpp "$here/patches/kt-kernel-llama-cpp.patch"
   fi
