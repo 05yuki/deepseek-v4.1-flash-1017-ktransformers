@@ -1,4 +1,4 @@
-From f5130aab56b8f65bd97205d76a4dd1636950d141 Mon Sep 17 00:00:00 2001
+From e3226638702f8eb999aa2ac54fe590b253c04e8b Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 23 Oct 2026 12:16:53 +0900
 Subject: [PATCH] host-kv: DeepSeek-V4.1's KV pool covers the whole context,
@@ -145,7 +145,7 @@ index fbda6822..6beaf884 100644
              swa_kv_page_size = token_to_kv_pool.get_swa_key_page_size()
              assert swa_k_cache.ndim == 2
 diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
-index 25494eee..c79e1dab 100644
+index cd11fa95..c34f019d 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 @@ -159,7 +159,7 @@ def _whole_chunks(tensors, mark, n: int, dev):

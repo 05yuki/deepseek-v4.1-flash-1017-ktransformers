@@ -1,4 +1,4 @@
-From b9dc14a22407acb050caf653b611a465e536e9e4 Mon Sep 17 00:00:00 2001
+From 2a0a24ab6d447ecda58670fe91a901aa945ecc71 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] hot-lend: more hot experts in the KV pool's free pages
@@ -53,6 +53,12 @@ turns the dynamic slots off, the slots shrink to the banks' experts and the
 lend's plan is cut to them; that fallback had been the else of the resident
 rows' check (the GGUF tree had both fixes since 10-25).
 
+A pool clear (/flush_cache) gives the slots back before the SWA lend
+maps its pages again: SWAKVPool clears the SWA allocator before the full
+one, and the SWA clear mapped every lent page while the slots still held
+the memory (11-01: after a decode with 684 slots, "SWA pages for clear
+cannot be mapped back on cuda:0 (3 MiB free)", both ranks down).
+
 Numerics: Not bit-identical: the lent experts run in the GPU MoE kernel
 instead of kt-kernel, and which and how many are lent depends on the free
 KV pages and the routing so far, so decode output depends on load and
@@ -71,8 +77,8 @@ Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
  .../srt/layers/moe/fused_moe_triton/layer.py  |   7 +
  python/sglang/srt/layers/moe/kt_ep_wrapper.py |  37 +-
  .../sglang/srt/layers/moe/kt_kv_hot_lend.py   | 718 +++++++++++++++++-
- .../srt/layers/moe/kt_kv_prefill_lend.py      |   6 +
- 4 files changed, 734 insertions(+), 34 deletions(-)
+ .../srt/layers/moe/kt_kv_prefill_lend.py      |   8 +
+ 4 files changed, 736 insertions(+), 34 deletions(-)
 
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 index 40d89d80..d131eaec 100644
@@ -1117,7 +1123,7 @@ index 8a7aa149..e5e0706e 100644
      for L in LAYERS:
          if L.k:
 diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
-index 823b55ed..25494eee 100644
+index 823b55ed..cd11fa95 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 @@ -48,6 +48,9 @@ from sglang.srt.layers.moe import kt_kv_vmm
@@ -1139,4 +1145,13 @@ index 823b55ed..25494eee 100644
 +            fn(why)
      if STATE["lent"] is not None and STATE.get("owner") == "hot":
          restore(why)
+ 
+@@ -909,6 +915,8 @@ def _wrap_swa(a) -> None:
+         return orig["available_size"]() + _lent() * a.page_size
+ 
+     def clear():
++        # the hot slots and the KV pages first: the SWA pages map into that memory
++        hot_release("clear")
+         swa_restore_all("clear")
+         return orig["clear"]()
  
