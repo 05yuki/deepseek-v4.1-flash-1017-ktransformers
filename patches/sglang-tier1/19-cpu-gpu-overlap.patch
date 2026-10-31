@@ -1,4 +1,4 @@
-From be1e58c26211c09ba36ed2996978accef78f6d53 Mon Sep 17 00:00:00 2001
+From b947f19d67aaa0ab1cc46abd5a1e5830dc0d23cf Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Thu, 29 Oct 2026 21:20:02 +0900
 Subject: [PATCH] cpu-gpu-overlap: the shared expert forks after the CPU

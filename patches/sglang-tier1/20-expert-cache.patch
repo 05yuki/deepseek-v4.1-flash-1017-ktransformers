@@ -1,4 +1,4 @@
-From 2a215ae0ffaefd194e248a9f8188d2a52f7fcb0a Mon Sep 17 00:00:00 2001
+From 04a00d89a7c29c1a93efa0c3e2092d3107aa659e Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 30 Oct 2026 13:17:24 +0900
 Subject: [PATCH] expert-cache: the streamed prefill and the dynamic hot slots
@@ -23,7 +23,7 @@ Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
  2 files changed, 200 insertions(+), 3 deletions(-)
 
 diff --git a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
-index 117b8282..653948b7 100644
+index e5e0706e..54c13aca 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
 @@ -736,8 +736,11 @@ def _arena_load(L: _Layer, e: int, dst, order: int) -> None:

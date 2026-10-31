@@ -1,4 +1,4 @@
-From e88b2885c579d24b23fd8f2dc0aaf059c435881c Mon Sep 17 00:00:00 2001
+From b9dc14a22407acb050caf653b611a465e536e9e4 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] hot-lend: more hot experts in the KV pool's free pages
@@ -32,10 +32,16 @@ math for one recorded on Japanese prose).
 `KT_KV_HOT_DYNAMIC_RESIDENT=1` (with the dynamic slots): the resident
 rows swap too, from one pool with the slots. kt-kernel then loads every
 expert (no GPU mask), and the route sends it -1 for each route the GPU
-takes. In a prefill window the rows hold experts 0..N-1 again (the
-prefill lend reads every layer from its pinned mirror), and the next
-lend fills them again. The route runs as one Triton kernel a layer: as
-separate torch ops the resident rows' table cost 4% of decode.
+takes. When a prefill window opens, before the weights are paused, the
+rows are loaded with experts 0..N-1 again from the arenas, weights and
+scales, and the next lend fills them again. (Until 10-31 the rows were
+left to the prefill lend's pinned mirror, which holds only tensors of at
+least 1 MiB: the rows' E8M0 scales stayed the swapped-in expert's
+through the window, and every streamed prefill after a swap ran in the
+swapped layers with another expert's scales. Eight 1,536-token pieces
+after an English decode: NLL 0.8362, now 0.5328; fresh 0.5297.)
+The route runs as one Triton kernel a layer: as separate torch ops the
+resident rows' table cost 4% of decode.
 
 A round does not wait for the stream (10-29): its table updates go up from
 pinned memory without blocking and split by table on the host, and the
@@ -60,11 +66,13 @@ the dynamic slots), `kv-lend-plan`.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
+Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
 ---
  .../srt/layers/moe/fused_moe_triton/layer.py  |   7 +
  python/sglang/srt/layers/moe/kt_ep_wrapper.py |  37 +-
- .../sglang/srt/layers/moe/kt_kv_hot_lend.py   | 685 +++++++++++++++++-
- 3 files changed, 695 insertions(+), 34 deletions(-)
+ .../sglang/srt/layers/moe/kt_kv_hot_lend.py   | 718 +++++++++++++++++-
+ .../srt/layers/moe/kt_kv_prefill_lend.py      |   6 +
+ 4 files changed, 734 insertions(+), 34 deletions(-)
 
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 index 40d89d80..d131eaec 100644
@@ -191,7 +199,7 @@ index f91552de..cfe462dd 100644
  
      def __getattr__(self, name: str):
 diff --git a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
-index 8a7aa149..117b8282 100644
+index 8a7aa149..e5e0706e 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
 @@ -31,19 +31,45 @@ ones most worth adding. This module:
@@ -611,7 +619,7 @@ index 8a7aa149..117b8282 100644
          _log(f"slot diag rank {wrapper.tp_rank} layer {L.idx} (k {k}, slots vs CPU {rel_slots:.3e}): "
               f"{len(bad)} of {k * len(L.names)} slot tensors differ from their bank: {bad[:16]}")
      if n_lent and rel_slots > 0.5 and STATE.get("diag", 0) < 3:
-@@ -456,6 +680,373 @@ def _plan(budget: int) -> List[int]:
+@@ -456,15 +680,415 @@ def _plan(budget: int) -> List[int]:
      return ks
  
  
@@ -985,7 +993,49 @@ index 8a7aa149..117b8282 100644
  def _hook() -> None:
      if STATE["hooked"]:
          return
-@@ -473,6 +1064,8 @@ def tick(runner) -> None:
+     from sglang.srt.layers.moe import kt_kv_prefill_lend as m
+ 
+     m.PRE_RESTORE.append(release)
++    if hasattr(m, "WINDOW_START"):
++        m.WINDOW_START.append(rows_home)
+     STATE["hooked"] = True
+ 
+ 
++def rows_home(why: str) -> None:
++    """A prefill window opens, the weights not yet paused: the resident rows hold experts
++    0..N-1 again, loaded from the arenas whole (the lend's mirror brings back only the
++    tensors it lends: the scales stayed the swapped-in expert's), and the table says so."""
++    if not DYN_RES or not DYN.get("res") or not LAYERS:
++        return
++    if all(L.res_now == list(range(L.n)) for L in LAYERS):
++        return
++    t0 = time.perf_counter()
++    dev = LAYERS[0].slots[LAYERS[0].names[0][1]].device
++    torch.cuda.synchronize(dev)  # a round's copies into the rows land first
++    DYN["pending"] = None
++    moved = 0
++    for L in LAYERS:
++        if L.res_t is None:
++            continue
++        for r in range(L.n):
++            if L.res_now[r] != r:
++                _arena_load(L, r, {key: t[r] for key, t in L.res_t.items()}, DYN["order"])
++                L.res_now[r] = r
++                moved += 1
++    rtbl = STATE["rtbl"]
++    rtbl.fill_(-1)
++    for L in LAYERS:
++        rtbl[L.idx, : L.n] = torch.arange(L.n, device=dev)
++    torch.cuda.synchronize(dev)  # before the pause unmaps them
++    if moved and DYN.get("home_logged", 0) < 3:
++        DYN["home_logged"] = DYN.get("home_logged", 0) + 1
++        _log(f"{why}: {moved} resident rows back to experts 0..N-1 in {(time.perf_counter() - t0) * 1e3:.1f} ms")
++
++
+ def tick(runner) -> None:
+     """kt_lend.before_forward outside a prefill window (decode, and extends below
+     the streaming threshold), outside any graph: lend when there is room."""
+@@ -473,6 +1097,8 @@ def tick(runner) -> None:
      from sglang.srt.layers.moe import kt_kv_prefill_lend as m
  
      if m.STATE["lent"] is not None:
@@ -994,7 +1044,7 @@ index 8a7aa149..117b8282 100644
          return
      if not STATE["want"]:
          STATE["since"] += 1
-@@ -481,10 +1074,18 @@ def tick(runner) -> None:
+@@ -481,10 +1107,18 @@ def tick(runner) -> None:
      STATE["want"], STATE["since"] = False, 0
      _hook()
      t0 = time.perf_counter()
@@ -1015,7 +1065,7 @@ index 8a7aa149..117b8282 100644
      budget = got - (MARGIN_MB << 20)
      spare = 0
      if SPARE_FLOOR_MB >= 0:
-@@ -494,6 +1095,14 @@ def tick(runner) -> None:
+@@ -494,6 +1128,14 @@ def tick(runner) -> None:
          if free > budget:
              spare, budget = free - budget, free
      ks = _plan(budget)
@@ -1030,7 +1080,7 @@ index 8a7aa149..117b8282 100644
      for i, (L, k) in enumerate(zip(LAYERS, ks)):
          if k and any(kt_kv_vmm.restore(L.slots[nm], 0, _span(L, nm, k)) < 0 for _, nm in L.names):
              # no memory after all: this layer and the rest get nothing
-@@ -504,11 +1113,22 @@ def tick(runner) -> None:
+@@ -504,11 +1146,22 @@ def tick(runner) -> None:
                      kt_kv_vmm.release(M.slots[nm], 0, _span(M, nm, M.x))
              ks = ks[:i] + [0] * (len(LAYERS) - i)
              break
@@ -1054,7 +1104,7 @@ index 8a7aa149..117b8282 100644
      kd = _k_dev(dev)
      kd.copy_(torch.tensor(ks, dtype=torch.int64), non_blocking=True)
      torch.cuda.synchronize(dev)
-@@ -534,6 +1154,11 @@ def release(why: str) -> None:
+@@ -534,6 +1187,11 @@ def release(why: str) -> None:
      dev = LAYERS[0].slots[LAYERS[0].names[0][1]].device
      kd = _k_dev(dev)
      kd.zero_()
@@ -1066,3 +1116,27 @@ index 8a7aa149..117b8282 100644
      torch.cuda.synchronize(dev)
      for L in LAYERS:
          if L.k:
+diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
+index 823b55ed..25494eee 100644
+--- a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
++++ b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
+@@ -48,6 +48,9 @@ from sglang.srt.layers.moe import kt_kv_vmm
+ ENABLED = os.environ.get("KT_PREFILL_KV_LEND", "0") == "1" and kt_kv_vmm.ENABLED
+ HOT = os.environ.get("KT_KV_HOT_LEND", "0") == "1" and kt_kv_vmm.ENABLED
+ PRE_RESTORE = []  # fn(why), run before lent pages are mapped back (the hot lend's slots out)
++# fn(why), run when a window opens before the weights are paused (the hot lend's resident
++# rows back to experts 0..N-1: kv-hot-lend-rows-home.py)
++WINDOW_START = []
+ RESERVE = int(os.environ.get("KT_PREFILL_KV_LEND_RESERVE", "4096"))  # tokens kept free beyond the prompt
+ CHECK = os.environ.get("KT_PREFILL_KV_LEND_CHECK", "0") == "1"
+ # KT_PREFILL_KV_LEND_VERIFY=1: every page in use when a window lends (but the
+@@ -313,6 +316,9 @@ def decode_lend(runner, reserve_tokens: int, min_bytes: int) -> int:
+ 
+ def hot_release(why: str) -> None:
+     """Give back what the hot lend holds (a window opens, the pool is cleared)."""
++    if why == "window start":
++        for fn in WINDOW_START:
++            fn(why)
+     if STATE["lent"] is not None and STATE.get("owner") == "hot":
+         restore(why)
+ 

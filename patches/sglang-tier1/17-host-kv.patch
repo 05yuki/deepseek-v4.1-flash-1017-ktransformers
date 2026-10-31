@@ -1,4 +1,4 @@
-From 0c9db687fa94a480a44003b05f2b2efe80ddf55b Mon Sep 17 00:00:00 2001
+From f5130aab56b8f65bd97205d76a4dd1636950d141 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 23 Oct 2026 12:16:53 +0900
 Subject: [PATCH] host-kv: DeepSeek-V4.1's KV pool covers the whole context,
@@ -145,10 +145,10 @@ index fbda6822..6beaf884 100644
              swa_kv_page_size = token_to_kv_pool.get_swa_key_page_size()
              assert swa_k_cache.ndim == 2
 diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
-index 823b55ed..478a9615 100644
+index 25494eee..c79e1dab 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
-@@ -156,7 +156,7 @@ def _whole_chunks(tensors, mark, n: int, dev):
+@@ -159,7 +159,7 @@ def _whole_chunks(tensors, mark, n: int, dev):
  
  def _setup(runner) -> bool:
      if STATE["alloc"] is not None:
@@ -157,7 +157,7 @@ index 823b55ed..478a9615 100644
      if STATE.get("off"):
          return False
      STATE["off"] = True  # until set up
-@@ -177,9 +177,17 @@ def _setup(runner) -> bool:
+@@ -180,9 +180,17 @@ def _setup(runner) -> bool:
      n = int(getattr(a, "num_pages", 0) or a.size // a.page_size)
      tensors = _kv_tensors(kvp, n, a.page_size)
      if not tensors:
@@ -176,7 +176,7 @@ index 823b55ed..478a9615 100644
      _wrap_allocator(a)
      _log(f"{len(tensors)} K/V tensors of {kvp.__class__.__name__}, {n} pages of {a.page_size} tokens "
           f"({min(t[1] for t in tensors)}-{max(t[1] for t in tensors)} B a page per tensor), "
-@@ -250,9 +258,17 @@ def loan_estimate(scheduler, rem: int) -> int:
+@@ -253,9 +261,17 @@ def loan_estimate(scheduler, rem: int) -> int:
          if runner is None or not _setup(runner):
              return 0
      a, ps = STATE["alloc"], STATE["ps"]
@@ -197,7 +197,7 @@ index 823b55ed..478a9615 100644
      keep = -(-(rem + RESERVE) // ps) + 1
      pages = max(0, free - keep)
      # only whole chunks are unmapped: a tensor loses up to one chunk at the
-@@ -271,6 +287,11 @@ def _release_free(keep_pages: int):
+@@ -274,6 +290,11 @@ def _release_free(keep_pages: int):
      if free.numel() <= keep_pages:
          return None
      cand = free[keep_pages:]
@@ -209,7 +209,7 @@ index 823b55ed..478a9615 100644
      mark = torch.zeros(n + 2, dtype=torch.int32, device=dev)
      mark[cand] = 1
      torch.cuda.synchronize(dev)
-@@ -292,18 +313,31 @@ def decode_lend(runner, reserve_tokens: int, min_bytes: int) -> int:
+@@ -295,18 +316,31 @@ def decode_lend(runner, reserve_tokens: int, min_bytes: int) -> int:
      """The hot lend, outside prefill: every free page beyond reserve_tokens (and a
      page a running request) leaves the free list and its whole chunks are unmapped,
      when that is at least min_bytes. Returns the bytes unmapped (0: nothing lent)."""
