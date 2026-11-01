@@ -107,12 +107,14 @@ PY
 then pass "prefix cache" "$(tail -1 "$work/cache.out")"; else fail "prefix cache" "$(tail -1 "$work/cache.out" | cut -c1-200)"; fi
 
 slots="$(grep -a -o "lend 1: [^;]*" "$log" | head -1 | sed -n 's/.* \([0-9]*\) slots .*/\1/p' || true)"
+# the GPUs the server saw, read while it still runs (an idle GeForce drops its link generation);
+# nvidia-smi ignores CUDA_VISIBLE_DEVICES, -i takes its indices or UUIDs
+gpus="$(nvidia-smi ${CUDA_VISIBLE_DEVICES:+-i "$CUDA_VISIBLE_DEVICES"} --format=csv,noheader \
+  --query-gpu=name,compute_cap,memory.total,driver_version,pcie.link.gen.current,pcie.link.width.current,pcie.link.gen.max,pcie.link.width.max \
+  2>/dev/null | sed -E 's/^/- GPU: /; s/, ([0-9]+), ([0-9]+), ([0-9]+), ([0-9]+)$/, PCIe gen \1 x\2 (max gen \3 x\4)/')"
 server_stop
 
 # the machine
-# the GPUs the server saw (nvidia-smi ignores CUDA_VISIBLE_DEVICES; -i takes its indices or UUIDs)
-gpus="$(nvidia-smi ${CUDA_VISIBLE_DEVICES:+-i "$CUDA_VISIBLE_DEVICES"} --query-gpu=name,compute_cap,memory.total,driver_version --format=csv,noheader 2>/dev/null |
-  sed 's/^/- GPU: /')"
 cpu="$(LC_ALL=C lscpu | sed -n 's/^Model name: *//p' | head -1)"
 sockets="$(LC_ALL=C lscpu | sed -n 's/^Socket(s): *//p')"
 cores="$(LC_ALL=C lscpu | sed -n 's/^Core(s) per socket: *//p')"
