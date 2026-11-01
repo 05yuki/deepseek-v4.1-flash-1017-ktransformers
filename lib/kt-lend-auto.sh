@@ -14,6 +14,9 @@
 #     KT_PREFILL_LEND_CALIBRATING=1 at a first guess from the card size, one
 #     ~50K-token prompt, the server stopped; out of memory halves the guess
 #     (down to 2048). KT_PREFILL_LEND_CALIBRATE=0 skips it (chunk 8192).
+# The hints and the calibration log live in KT_LEND_CACHE_DIR (default
+# ${XDG_CACHE_HOME:-~/.cache}/kt-lend). Only the GPUs in CUDA_VISIBLE_DEVICES count:
+# the card size for the first guess, and the GPUs the calibration waits to see free.
 # The launcher must print "Run directory: <dir>" (or "log directory: <dir>")
 # and leave <dir>/server.pid
 # and <dir>/server.log in --background mode.
@@ -48,8 +51,9 @@ _kt_lend_auto_core() {
     echo "kt-lend hint key $key"
     exit 0
   fi
-  mkdir -p "$HOME/.cache/kt-lend"
-  export KT_PREFILL_LEND_HINT="$HOME/.cache/kt-lend/chunk-$key"
+  local cache_dir="${KT_LEND_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:?set KT_LEND_CACHE_DIR when HOME is unset}/.cache}/kt-lend}"
+  mkdir -p "$cache_dir"
+  export KT_PREFILL_LEND_HINT="$cache_dir/chunk-$key"
   local user="${!chunk_var:-}"
   if [[ -n "$user" ]]; then
     KT_LEND_CHUNK="$user"
@@ -66,10 +70,13 @@ _kt_lend_auto_core() {
     KT_LEND_CHUNK=8192
     return 0
   fi
-  local cal_log="$HOME/.cache/kt-lend/calibrate-$key.log"
+  local cal_log="$cache_dir/calibrate-$key.log"
   : >"$cal_log"
   local vram_mb cal_chunk cal_run cal_pid cal_ok
-  vram_mb="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | sort -n | head -1)"
+  # the GPUs the server sees (nvidia-smi ignores CUDA_VISIBLE_DEVICES; -i takes its indices or UUIDs)
+  local gpu_sel=()
+  [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]] && gpu_sel=(-i "$CUDA_VISIBLE_DEVICES")
+  vram_mb="$(nvidia-smi "${gpu_sel[@]}" --query-gpu=memory.total --format=csv,noheader,nounits | sort -n | head -1)"
   cal_chunk=16384
   (( vram_mb < 15000 )) && cal_chunk=8192
   (( vram_mb > 23000 )) && cal_chunk=24576
@@ -125,7 +132,7 @@ PY
     kill -KILL "$cal_pid" 2>/dev/null || true
     # the GPUs, the port and the server processes, as the launchers check them
     for _ in $(seq 1 90); do
-      nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -q . || \
+      nvidia-smi "${gpu_sel[@]}" --query-compute-apps=pid --format=csv,noheader | grep -q . || \
         ss -ltn | grep -q ":$port " || pgrep -f 'sglang[. ](serve|launch_server)' >/dev/null || \
         pgrep '^sglang::' >/dev/null || break
       sleep 5
