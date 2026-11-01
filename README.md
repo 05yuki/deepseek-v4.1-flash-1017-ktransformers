@@ -34,6 +34,13 @@ It remembers the directory in `state/run.env`, so the next `./run.sh` only start
 `MODEL=/models/dsv41-1017 tools/check.sh` starts the server once, sends one short request,
 checks that an answer comes back, and stops the server: the one command that says a setup works.
 
+`MODEL=<dir> tools/qualify.sh` writes a report for the machine it runs on, as one Markdown file.
+It checks an answer, tool calls, the NLL against the reference implementation's scores, and the prefix cache.
+It also measures decode on seven kinds of text and the 35K-token prefill.
+It takes about 15 minutes after the server is up.
+The report names the hardware and software, and nothing that identifies the machine.
+The Results here come from one machine, so reports from other GPUs and CPUs are welcome as issues.
+
 The server speaks SGLang's OpenAI-compatible API on `127.0.0.1:8080`, one request at a
 time by default. `SGLANG_MAX_RUNNING_REQUESTS=4` runs up to four at once.
 
@@ -397,6 +404,8 @@ MODEL=<checkpoint dir> ./serve.sh --background
 python tools/nll.py score <checkpoint dir> served.json
 python tools/nll.py compare ref.json served.json
 ```
+
+`tools/nll-ref-1017.json` holds the reference run's scores on an RTX 5070 Ti; `tools/qualify.sh` compares against them.
 
 ## Fixes from dsv41-flash-dual-epyc
 
