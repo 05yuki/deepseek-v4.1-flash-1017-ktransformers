@@ -1,7 +1,7 @@
-From 3d49a50a336e97f59d94fa1ee12d6f5257836d2e Mon Sep 17 00:00:00 2001
+From 1dc98b32ddfce678bdbae2f17a1db5a5dd0575ec Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Sun, 25 Oct 2026 09:28:20 +0900
-Subject: [PATCH] [tier 0] Ada SM89 sparse attention fallback
+Subject: [PATCH] Ada SM89 sparse attention fallback
 
 Select the existing dual-scope BF16 Triton kernels only on compute capability
 8.9. Skip FlashMLA metadata and the SM90+ sparse-prefill path on Ada. Native

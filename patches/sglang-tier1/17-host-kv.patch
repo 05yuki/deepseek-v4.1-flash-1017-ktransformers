@@ -1,4 +1,4 @@
-From e3226638702f8eb999aa2ac54fe590b253c04e8b Mon Sep 17 00:00:00 2001
+From 18f0ddcf790dc9589efba34fee6002b7d885980e Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 23 Oct 2026 12:16:53 +0900
 Subject: [PATCH] host-kv: DeepSeek-V4.1's KV pool covers the whole context,
@@ -65,8 +65,8 @@ Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
  python/sglang/srt/layers/moe/kt_kv_vmm.py     |  35 ++-
  .../srt/mem_cache/deepseek_v4_memory_pool.py  |  57 +++-
  python/sglang/srt/mem_cache/dsv41_host_kv.py  | 278 ++++++++++++++++++
- .../srt/model_executor/pool_configurator.py   |  30 ++
- 6 files changed, 488 insertions(+), 10 deletions(-)
+ .../srt/model_executor/pool_configurator.py   |  29 ++
+ 6 files changed, 487 insertions(+), 10 deletions(-)
  create mode 100644 python/sglang/srt/mem_cache/dsv41_host_kv.py
 
 diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
@@ -145,7 +145,7 @@ index fbda6822..6beaf884 100644
              swa_kv_page_size = token_to_kv_pool.get_swa_key_page_size()
              assert swa_k_cache.ndim == 2
 diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
-index cd11fa95..c34f019d 100644
+index 461c5211..b6e6da98 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 @@ -159,7 +159,7 @@ def _whole_chunks(tensors, mark, n: int, dev):
@@ -244,10 +244,10 @@ index cd11fa95..c34f019d 100644
      cand, _, ranges, total = got
      STATE.update(lent=cand, ranges=ranges, bytes=total, owner="hot")
 diff --git a/python/sglang/srt/layers/moe/kt_kv_vmm.py b/python/sglang/srt/layers/moe/kt_kv_vmm.py
-index cf208235..4b62f982 100644
+index d6a2431f..2646726b 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_vmm.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_vmm.py
-@@ -77,6 +77,11 @@ def _load():
+@@ -76,6 +76,11 @@ def _load():
      if hasattr(_lib, "kv_vmm_malloc_shadow"):
          _lib.kv_vmm_malloc_shadow.restype = ctypes.c_void_p
          _lib.kv_vmm_malloc_shadow.argtypes = [ctypes.c_ssize_t, ctypes.c_int]
@@ -259,7 +259,7 @@ index cf208235..4b62f982 100644
      _lib.kv_vmm_free.restype = None
      _lib.kv_vmm_free.argtypes = [ctypes.c_void_p, ctypes.c_ssize_t, ctypes.c_int, ctypes.c_void_p]
      if not DIRECT:
-@@ -89,9 +94,11 @@ class _Block:
+@@ -88,9 +93,11 @@ class _Block:
      """One kv_vmm allocation, owned by the tensor made over it (torch keeps the
      object of a __cuda_array_interface__ alive as long as the tensor)."""
  
@@ -273,7 +273,7 @@ index cf208235..4b62f982 100644
              self.ptr = _lib.kv_vmm_malloc_shadow(nbytes, device)
          else:
              self.ptr = _lib.kv_vmm_malloc_lazy(nbytes, device) if lazy else _lib.kv_vmm_malloc(nbytes, device, None)
-@@ -209,6 +216,30 @@ def shadow_tensor(shape, dtype, device: int) -> torch.Tensor:
+@@ -208,6 +215,30 @@ def shadow_tensor(shape, dtype, device: int) -> torch.Tensor:
      return t[:size_b].view(dtype).view(tuple(int(d) for d in shape))
  
  
@@ -305,7 +305,7 @@ index cf208235..4b62f982 100644
      return int(_load().kv_vmm_chunk_bytes(device))
  
 diff --git a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
-index f7a5d41d..28f1d27e 100644
+index 271e4f21..a551b3b6 100644
 --- a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
 +++ b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
 @@ -1,6 +1,7 @@
@@ -316,7 +316,7 @@ index f7a5d41d..28f1d27e 100644
  from contextlib import nullcontext
  from typing import (
      FrozenSet,
-@@ -335,6 +336,15 @@ class DeepSeekV4SingleKVPool(KVCache):
+@@ -348,6 +349,15 @@ class DeepSeekV4SingleKVPool(KVCache):
              )
          assert self.store_dtype == torch.uint8
  
@@ -332,8 +332,8 @@ index f7a5d41d..28f1d27e 100644
          return torch.zeros(
              num_pages,
              self.bytes_per_page_padded,
-@@ -955,6 +965,15 @@ class DeepSeekV4UnifiedKVPool:
-         return data_ptrs, data_lens, item_lens
+@@ -1026,6 +1036,15 @@ _DSV4_REGION_NAMES = {
+ }
  
  
 +class HostMappedSingleKVPool(DeepSeekV4SingleKVPool):
@@ -348,7 +348,7 @@ index f7a5d41d..28f1d27e 100644
  class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
      # object.__new__ stubs (disagg wire test) skip __init__; False is the env
      # default, so the fp8 PD/HiCache refuses don't AttributeError on them.
-@@ -1303,6 +1322,34 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+@@ -1375,6 +1394,34 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
              kv_pool_cls=kv_pool_cls,
          )
  
@@ -383,7 +383,7 @@ index f7a5d41d..28f1d27e 100644
          # The distinct compress ratios this stage has, sorted. Registry pools kept
          # for a ratio the model lacks (wire-layout alignment) do not count.
          model_ratios = set(self.compression_ratios)
-@@ -1603,6 +1650,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+@@ -1793,6 +1840,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                      cls=pool_cls,
                      kv_layout=self.compressed_kv_layout(ratio),
                  )
@@ -398,7 +398,7 @@ index f7a5d41d..28f1d27e 100644
              for ratio, sources in low_ratio_sources.items():
                  self.kv_pools[ratio] = self._make_kv_pool(
                      size=self.full_size // ratio,
-@@ -1612,7 +1667,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+@@ -1802,7 +1857,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                      device=device,
                      enable_memory_saver=enable_memory_saver,
                      global_page_size=page_size,
@@ -692,18 +692,10 @@ index 00000000..942f7a5e
 +            num_warps=4,
 +        )
 diff --git a/python/sglang/srt/model_executor/pool_configurator.py b/python/sglang/srt/model_executor/pool_configurator.py
-index 75fcc617..47ac71dc 100644
+index 6d92ff82..300b235e 100644
 --- a/python/sglang/srt/model_executor/pool_configurator.py
 +++ b/python/sglang/srt/model_executor/pool_configurator.py
-@@ -9,6 +9,7 @@ from available GPU memory using a unified coeff+bias model:
- from __future__ import annotations
- 
- import logging
-+import os
- from bisect import bisect_right
- from dataclasses import dataclass
- from typing import TYPE_CHECKING, Optional
-@@ -1701,6 +1702,35 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
+@@ -1722,6 +1722,35 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                  f"or SGLANG_SWA_EVICTION_INTERVAL, or increase --mem-fraction-static."
              )
  

@@ -1,4 +1,4 @@
-From 71c210dd948f1f9041dff05a217213a556249356 Mon Sep 17 00:00:00 2001
+From 5b93f8a027720865144ad6ec5c7ef3b8b4a2f158 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Wed, 28 Oct 2026 16:00:40 +0900
 Subject: [PATCH] stream-mmq: the streamed experts through llama.cpp's MMQ, the
@@ -1585,7 +1585,7 @@ index 00000000..989d09bc
 +
 +}  // namespace sgl_llama_mmq
 diff --git a/python/sglang/srt/layers/moe/kt_stream_prefill.py b/python/sglang/srt/layers/moe/kt_stream_prefill.py
-index 77fc0f42..aa45f083 100644
+index d400b72c..66910aa7 100644
 --- a/python/sglang/srt/layers/moe/kt_stream_prefill.py
 +++ b/python/sglang/srt/layers/moe/kt_stream_prefill.py
 @@ -72,6 +72,14 @@ USE_GRAPH = os.environ.get("KT_GPU_STREAM_GRAPH", "1") == "1"
@@ -1652,7 +1652,7 @@ index 77fc0f42..aa45f083 100644
  def _rank_segments(rank: int, world: int, parts: int, inter: int):
      """[(part, first row in the part, rows, first row in the rank's slice, rows a part)] for
      rank's rows rank*N..(rank+1)*N of the intermediate size, N = inter / world, that
-@@ -971,6 +1021,100 @@ class KTStreamPrefill:
+@@ -970,6 +1020,100 @@ class KTStreamPrefill:
              self._cutlass_fused_moe(**part)
          return kw["output"]
  
@@ -1753,7 +1753,7 @@ index 77fc0f42..aa45f083 100644
      def _group_body(self, layer, gi: int, base: int, n: int, xq, sf, topk_weights, ids32, acc, out):
          """Scale prep + MoE + accumulate for one group, on the current stream.
          Captured into a graph in graph mode; run eagerly otherwise."""
-@@ -1365,12 +1509,14 @@ class KTStreamPrefill:
+@@ -1362,12 +1506,14 @@ class KTStreamPrefill:
          x = dispatch_output.hidden_states
          T = x.shape[0]
          acc = torch.zeros((T, self.K), dtype=torch.bfloat16, device=x.device)
@@ -1770,7 +1770,7 @@ index 77fc0f42..aa45f083 100644
          # W16: the group body calls the MoE over blocks of rows
          T_call = _block_rows(T) if W16 else T
          self._tune_tokens = next_power_of_2(T_call)
-@@ -1380,7 +1526,7 @@ class KTStreamPrefill:
+@@ -1377,7 +1523,7 @@ class KTStreamPrefill:
              xq, sf = x, None
          else:
              xq, sf = mxfp8_quantize(x, is_sf_swizzled_layout=True, alignment=32)
@@ -1779,7 +1779,7 @@ index 77fc0f42..aa45f083 100644
              from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
              from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import _workspace_max_tokens
  
-@@ -1438,6 +1584,16 @@ class KTStreamPrefill:
+@@ -1435,6 +1581,16 @@ class KTStreamPrefill:
          ids = physical_ids.to(torch.int64)
          stats = {"write": 0.0, "hostwait": 0.0, "dma_enq": 0.0, "prep_enq": 0.0, "moe_enq": 0.0}
          t0 = time.perf_counter()

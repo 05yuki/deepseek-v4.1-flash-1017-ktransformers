@@ -1,4 +1,4 @@
-From c0e2b6311211b0edcb35f23de1d8b4bcf389765b Mon Sep 17 00:00:00 2001
+From 46bc262e1a1f9eb3f166e78e3f467efd02c0d00d Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] stream-prefill: stream the CPU experts to the GPU for long
@@ -36,10 +36,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
  python/sglang/srt/layers/moe/kt_ep_wrapper.py |   83 +-
- .../srt/layers/moe/kt_stream_prefill.py       | 1744 +++++++++++++++++
+ .../srt/layers/moe/kt_stream_prefill.py       | 1741 +++++++++++++++++
  .../moe/moe_runner/flashinfer_cutlass.py      |  191 ++
  .../mxfp4_flashinfer_cutlass_moe.py           |   41 +
- 4 files changed, 2045 insertions(+), 14 deletions(-)
+ 4 files changed, 2042 insertions(+), 14 deletions(-)
  create mode 100644 python/sglang/srt/layers/moe/kt_stream_prefill.py
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
@@ -202,10 +202,10 @@ index 0c17adfe..f91552de 100644
  
 diff --git a/python/sglang/srt/layers/moe/kt_stream_prefill.py b/python/sglang/srt/layers/moe/kt_stream_prefill.py
 new file mode 100644
-index 00000000..77fc0f42
+index 00000000..d400b72c
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_stream_prefill.py
-@@ -0,0 +1,1744 @@
+@@ -0,0 +1,1741 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""GPU-streamed prefill for the KT EP wrapper: expert groups over PCIe.
 +
@@ -718,7 +718,6 @@ index 00000000..77fc0f42
 +
 +        sock_path = f"/tmp/kt_stream_{os.getppid()}_r{self.rank}.sock"
 +        infos = {}  # layer_idx -> the parts this rank reads, each [(fd, size, stride) x 6]
-+        fd_objs = []
 +        segs = None
 +        if self.rank == 0:
 +            per_rank = {r: {} for r in range(self.world)}
@@ -1380,7 +1379,6 @@ index 00000000..77fc0f42
 +        sf_f = torch.ldexp(torch.ones_like(sf_lin, dtype=torch.float32), sf_lin.to(torch.int32) - 127)
 +        xdq = xq_lin.float().view(x.shape[0], K // 32, 32) * sf_f.view(x.shape[0], K // 32, 1)
 +        xdq = xdq.view(x.shape[0], K)
-+        xq_rel = ((xdq - xf).norm(dim=1) / xf.norm(dim=1).clamp(min=1e-6))
 +        ref = torch.zeros((hit.numel(), K), dtype=torch.float32, device=x.device)
 +        ref_swapped = torch.zeros_like(ref)
 +        ref_q = torch.zeros_like(ref)
@@ -1435,7 +1433,6 @@ index 00000000..77fc0f42
 +        c4, r4 = cmp(ref_clip)
 +        c5, r5 = cmp(ref_hq)
 +        ratio5 = (got.norm() / ref_hq.norm().clamp(min=1e-6)).item()
-+        per_tok = [(f"{float(xq_rel[t]):.3f}", f"{float(xf[t].norm()):.0f}") for t in hit.tolist()]
 +        _log(f"rank{self.rank} refcheck layer{layer_idx} gi={gi} base={base} n={n} tokens={hit.tolist()}: "
 +             f"cos={c1:.5f} rel={r1:.4f} | swapped-fc1 cos={c2:.5f} rel={r2:.4f} | "
 +             f"from mxfp8(x): cos={c3:.5f} rel={r3:.4f} | +mxfp8(h): cos={c5:.5f} rel={r5:.4f} |got|/|ref_hq|={ratio5:.4f} hmax={hmax:.0f} | "

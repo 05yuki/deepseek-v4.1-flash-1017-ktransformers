@@ -1,4 +1,4 @@
-From f205542557f281a5d2a126ec355787fefbec9f32 Mon Sep 17 00:00:00 2001
+From b25dd2935198e8c3f65495d3533f6e3104b8584b Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] launch-timing: KT_LAUNCH_TIMING, a timeline of the weight
@@ -18,17 +18,17 @@ Prerequisites: none; applies alone on tier 0.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
- .../sglang/srt/layers/moe/kt_launch_timing.py | 397 ++++++++++++++++++
+ .../sglang/srt/layers/moe/kt_launch_timing.py | 395 ++++++++++++++++++
  .../sglang/srt/model_executor/model_runner.py |   5 +
- 2 files changed, 402 insertions(+)
+ 2 files changed, 400 insertions(+)
  create mode 100644 python/sglang/srt/layers/moe/kt_launch_timing.py
 
 diff --git a/python/sglang/srt/layers/moe/kt_launch_timing.py b/python/sglang/srt/layers/moe/kt_launch_timing.py
 new file mode 100644
-index 00000000..39159dac
+index 00000000..0582aba5
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_launch_timing.py
-@@ -0,0 +1,397 @@
+@@ -0,0 +1,395 @@
 +"""KT_LAUNCH_TIMING=1: a per-step timeline of the weight load (launch-time
 +instrument, no behaviour change). Installed from ModelRunner.load_model
 +(patches/sglang-kt-launch-timing.py); wraps the load's functions in place and
@@ -43,7 +43,6 @@ index 00000000..39159dac
 +"""
 +import functools
 +import os
-+import re
 +import resource
 +import threading
 +import time
@@ -394,7 +393,6 @@ index 00000000..39159dac
 +        orig = sl.DefaultModelLoader.__dict__["load_weights_and_postprocess"]
 +        fn = orig.__func__ if isinstance(orig, staticmethod) else orig
 +        if not getattr(fn, "_kt_launch_wrapped", False):
-+            src_ok = True
 +
 +            @functools.wraps(fn)
 +            def lwp(model, weights, target_device):
@@ -427,10 +425,10 @@ index 00000000..39159dac
 +        log(f"loader not wrapped: {e}")
 +    log("installed")
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 5e44aac3..c89dafff 100644
+index 3eeed012..f6fe31ed 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -1302,6 +1302,11 @@ class ModelRunner:
+@@ -1305,6 +1305,11 @@ class ModelRunner:
  
      def load_model(self):
          tic_total = time.perf_counter()

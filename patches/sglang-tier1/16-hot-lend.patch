@@ -1,4 +1,4 @@
-From 2a0a24ab6d447ecda58670fe91a901aa945ecc71 Mon Sep 17 00:00:00 2001
+From e56010b00f9adfd657f53d2b9521634196c329bd Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] hot-lend: more hot experts in the KV pool's free pages
@@ -205,7 +205,7 @@ index f91552de..cfe462dd 100644
  
      def __getattr__(self, name: str):
 diff --git a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
-index 8a7aa149..e5e0706e 100644
+index f2a4d736..7fba8c33 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
 @@ -31,19 +31,45 @@ ones most worth adding. This module:
@@ -238,7 +238,7 @@ index 8a7aa149..e5e0706e 100644
  import copy
  import os
  import time
- from typing import List, Optional
+ from typing import List
  
 +import numpy as np
  import torch
@@ -1123,7 +1123,7 @@ index 8a7aa149..e5e0706e 100644
      for L in LAYERS:
          if L.k:
 diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
-index 823b55ed..cd11fa95 100644
+index a1f87d71..461c5211 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 @@ -48,6 +48,9 @@ from sglang.srt.layers.moe import kt_kv_vmm
@@ -1146,7 +1146,7 @@ index 823b55ed..cd11fa95 100644
      if STATE["lent"] is not None and STATE.get("owner") == "hot":
          restore(why)
  
-@@ -909,6 +915,8 @@ def _wrap_swa(a) -> None:
+@@ -907,6 +913,8 @@ def _wrap_swa(a) -> None:
          return orig["available_size"]() + _lent() * a.page_size
  
      def clear():

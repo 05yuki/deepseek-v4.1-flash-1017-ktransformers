@@ -1,4 +1,4 @@
-From 4bc1cec15131bc538aeffb13a9d073be1a301a0b Mon Sep 17 00:00:00 2001
+From 8e3eba520379cd809003af39ad94c939833cc109 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Thu, 29 Oct 2026 21:20:02 +0900
 Subject: [PATCH] cpu-gpu-overlap: the shared expert forks after the CPU
@@ -245,10 +245,10 @@ index 00000000..f49aaac5
 +    )
 +    return True
 diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
-index 031deeb5..32801525 100644
+index 4d1f460d..5dace6f2 100644
 --- a/python/sglang/srt/models/deepseek_v2.py
 +++ b/python/sglang/srt/models/deepseek_v2.py
-@@ -114,6 +114,9 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+@@ -120,6 +120,9 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
  from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
  from sglang.srt.layers.moe.hash_topk import HashTopK
  from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
@@ -258,7 +258,7 @@ index 031deeb5..32801525 100644
  from sglang.srt.layers.moe.token_dispatcher.base import (
      BaseDispatcher,
      CombineInput,
-@@ -1153,7 +1156,18 @@ class DeepseekV2MoE(nn.Module):
+@@ -1159,7 +1162,18 @@ class DeepseekV2MoE(nn.Module):
              if use_flashinfer_trtllm_bypass
              else self._maybe_quant_moe_input_once(hidden_states)
          )
@@ -278,7 +278,7 @@ index 031deeb5..32801525 100644
          should_quant_routed_input_mxfp8 = (
              not use_flashinfer_trtllm_bypass
              and pre_quant_input is None
-@@ -1249,6 +1263,13 @@ class DeepseekV2MoE(nn.Module):
+@@ -1255,6 +1269,13 @@ class DeepseekV2MoE(nn.Module):
  
          # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
          # Only the quant-once fp8 pair is shared with it; the routed MXFP8 pre-quant is not.

@@ -1,7 +1,7 @@
 # Tier 1, one patch per feature
 
 Tier 1 is one patch per feature in `patches/sglang-tier1/`, applied in the order of their numbers on
-SGLang main at `20036b7a` after tier 0; tier 2 applies on top. `setup.sh` applies all of them by
+SGLang main at `3edea93c` after tier 0; tier 2 applies on top. `setup.sh` applies all of them by
 default; `SGLANG_FEATURES=a,b,...` picks some (the names below), and `serve.sh` turns on only what
 was applied.
 
@@ -18,26 +18,26 @@ the code" are on as soon as the patch is applied.
 | # | patch | lines (+/-) | prerequisites |
 |---|---|---|---|
 | 01 | [`01-fp8-decode.patch`](#01-fp8-decode) | +222 / -1 | none |
-| 02 | [`02-gpu-moe-fp32.patch`](#02-gpu-moe-fp32) | +487 / -1 | none |
+| 02 | [`02-gpu-moe-fp32.patch`](#02-gpu-moe-fp32) | +486 / -1 | none |
 | 03 | [`03-cutlass-kt-expert-count.patch`](#03-cutlass-kt-expert-count) | +6 / -1 | none |
-| 04 | [`04-engram-row-prefetch.patch`](#04-engram-row-prefetch) | +71 / -6 | none |
+| 04 | [`04-engram-row-prefetch.patch`](#04-engram-row-prefetch) | +74 / -7 | none |
 | 05 | [`05-wo-a-fp8.patch`](#05-wo-a-fp8) | +174 / -2 | none |
 | 06 | [`06-vision-on-demand.patch`](#06-vision-on-demand) | +87 / -11 | `wo-a-fp8` |
 | 07 | [`07-thinking-default-parser.patch`](#07-thinking-default-parser) | +6 / -4 | none |
 | 08 | [`08-loading.patch`](#08-loading) | +250 / -2 | none |
-| 09 | [`09-launch-timing.patch`](#09-launch-timing) | +402 / -0 | none |
+| 09 | [`09-launch-timing.patch`](#09-launch-timing) | +400 / -0 | none |
 | 10 | [`10-pool-swa-guard.patch`](#10-pool-swa-guard) | +17 / -0 | none |
 | 11 | [`11-placement.patch`](#11-placement) | +45 / -0 | none |
-| 12 | [`12-kv-vmm.patch`](#12-kv-vmm) | +243 / -0 | none |
+| 12 | [`12-kv-vmm.patch`](#12-kv-vmm) | +242 / -0 | none |
 | 13 | [`13-prefill-lend.patch`](#13-prefill-lend) | +1664 / -1 | none |
-| 14 | [`14-stream-prefill.patch`](#14-stream-prefill) | +2045 / -14 | `loading`, `placement`, `prefill-lend` |
-| 15 | [`15-kv-lend-plan.patch`](#15-kv-lend-plan) | +1751 / -5 | `kv-vmm`, `prefill-lend` |
-| 16 | [`16-hot-lend.patch`](#16-hot-lend) | +674 / -34 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan` |
-| 17 | [`17-host-kv.patch`](#17-host-kv) | +477 / -7 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan`, `hot-lend` |
+| 14 | [`14-stream-prefill.patch`](#14-stream-prefill) | +2042 / -14 | `loading`, `placement`, `prefill-lend` |
+| 15 | [`15-kv-lend-plan.patch`](#15-kv-lend-plan) | +1753 / -5 | `kv-vmm`, `prefill-lend` |
+| 16 | [`16-hot-lend.patch`](#16-hot-lend) | +736 / -34 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan` |
+| 17 | [`17-host-kv.patch`](#17-host-kv) | +487 / -10 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan`, `hot-lend` |
 | 18 | [`18-stream-mmq.patch`](#18-stream-mmq) | +1618 / -3 (llama.cpp's kernels come from `lib/llama-mmq.sh`) | `stream-prefill` |
 | 19 | [`19-cpu-gpu-overlap.patch`](#19-cpu-gpu-overlap) | +190 / -2 | `loading`, `placement`, `prefill-lend`, `stream-prefill` |
 | 20 | [`20-expert-cache.patch`](#20-expert-cache) | +200 / -3 | `loading`, `placement`, `prefill-lend`, `stream-prefill`, `kv-vmm`, `kv-lend-plan`, `hot-lend`, `stream-mmq` |
-| 21 | [`21-hicache.patch`](#21-hicache) | +46 / -3 | `kv-vmm`, `prefill-lend`, `kv-lend-plan` |
+| 21 | [`21-hicache.patch`](#21-hicache) | +47 / -3 | `kv-vmm`, `prefill-lend`, `kv-lend-plan` |
 
 ## Effect of each patch
 

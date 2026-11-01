@@ -1,4 +1,4 @@
-From d88b0c4dfcf012c784c03b8e6056ba3e41e4c776 Mon Sep 17 00:00:00 2001
+From 79546ff64f4f4c642333fd0cecf3974ee7f18154 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Sun, 1 Nov 2026 10:16:27 +0900
 Subject: [PATCH] hicache: the prefix cache's copy in host memory with the
@@ -46,11 +46,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
 ---
  .../srt/layers/moe/kt_kv_prefill_lend.py      | 32 ++++++++++++++++++-
- .../sglang/srt/mem_cache/memory_pool_host.py  | 17 ++++++++--
- 2 files changed, 46 insertions(+), 3 deletions(-)
+ .../sglang/srt/mem_cache/memory_pool_host.py  | 18 +++++++++--
+ 2 files changed, 47 insertions(+), 3 deletions(-)
 
 diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
-index c34f019d..20e955c8 100644
+index b6e6da98..65fd3f95 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 @@ -525,6 +525,8 @@ SWA_TOKENS = int(os.environ.get("KT_PREFILL_SWA_TOKENS", "0") or 0)
@@ -109,13 +109,14 @@ index c34f019d..20e955c8 100644
      if over <= 4 * SWA["ps"]:
          return
 diff --git a/python/sglang/srt/mem_cache/memory_pool_host.py b/python/sglang/srt/mem_cache/memory_pool_host.py
-index 02e2d5cc..a94756b0 100644
+index 96b9889c..3117a805 100644
 --- a/python/sglang/srt/mem_cache/memory_pool_host.py
 +++ b/python/sglang/srt/mem_cache/memory_pool_host.py
-@@ -68,6 +68,15 @@ if _is_npu:
- logger = logging.getLogger(__name__)
+@@ -82,6 +82,16 @@ from sglang.srt.mem_cache.pool_host.common import (
+ )
+ from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
  
- 
++
 +def _staging_page_capacity(num_pages: int, page_bytes: int) -> int:
 +    """Write-back staging pages: at most _WRITE_BACK_STAGING_PAGE_CHUNK and at most
 +    SGLANG_HICACHE_STAGING_MB of device memory (the staged kernel loops over the rest)."""
@@ -125,10 +126,10 @@ index 02e2d5cc..a94756b0 100644
 +    return max(1, min(num_pages, _WRITE_BACK_STAGING_PAGE_CHUNK, cap // max(1, page_bytes)))
 +
 +
- from sglang.srt.mem_cache.pool_host import HostKVCache
- from sglang.srt.mem_cache.pool_host.base import (
-     _WRITE_BACK_STAGING_PAGE_CHUNK,
-@@ -379,7 +388,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
+ # ---- V4 Compressed KV Host Pools ----
+ 
+ 
+@@ -380,7 +390,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
          self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
              element_size=self.item_bytes * self.dtype.itemsize,
          )
@@ -139,7 +140,7 @@ index 02e2d5cc..a94756b0 100644
          self.staging_buffer = torch.empty(
              (staging_page_capacity, self.layer_num, self.item_bytes),
              dtype=self.dtype,
-@@ -933,7 +944,9 @@ class DeepSeekV4StateHostPool(HostKVCache):
+@@ -922,7 +934,9 @@ class DeepSeekV4StateHostPool(HostKVCache):
          self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
              element_size=self.state_page_bytes * self.dtype.itemsize,
          )

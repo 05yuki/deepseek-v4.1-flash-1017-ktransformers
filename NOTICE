@@ -15,5 +15,5 @@ fetches into kt_gguf_moe_mmq/llama_mmq/ggml/ with llama.cpp's LICENSE, and
 patches/sglang-tier1/18-stream-mmq.patch adds code derived from it
 (kt_gguf_moe_mmq/llama_mmq/). The MIT terms apply to those files.
 
-The patches under patches/ modify sgl-project/sglang (commit 20036b7a) and
+The patches under patches/ modify sgl-project/sglang (commit 3edea93c) and
 kvcache-ai/ktransformers (kt-kernel, commit 95009ea), both Apache-2.0.

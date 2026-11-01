@@ -1,4 +1,4 @@
-From 45b75faa72faf6f489d7905b2fbb57916c29f23d Mon Sep 17 00:00:00 2001
+From c00174472f088dd57bc520fca858464c44f0553f Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:33 +0900
 Subject: [PATCH] model-loader: make the unbalanced load barrier timeout

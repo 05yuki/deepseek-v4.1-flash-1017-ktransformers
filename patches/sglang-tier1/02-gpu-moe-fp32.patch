@@ -1,4 +1,4 @@
-From 547da80acc7718e3391a3df720b7ce90bc3b6234 Mon Sep 17 00:00:00 2001
+From fef7a853fc67d92dd6cfd001c3c4391426c48cd2 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:34 +0900
 Subject: [PATCH] gpu-moe-fp32: GPU MXFP4 experts in the checkpoint's layout,
@@ -23,10 +23,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
  .../moe/fused_moe_triton/fused_marlin_moe.py  |  66 ++-
- .../sglang/srt/layers/moe/mxfp4_fp32_moe.py   | 385 ++++++++++++++++++
+ .../sglang/srt/layers/moe/mxfp4_fp32_moe.py   | 384 ++++++++++++++++++
  python/sglang/srt/layers/quantization/fp8.py  |   5 +
  .../layers/quantization/mxfp4_marlin_moe.py   |  32 ++
- 4 files changed, 487 insertions(+), 1 deletion(-)
+ 4 files changed, 486 insertions(+), 1 deletion(-)
  create mode 100644 python/sglang/srt/layers/moe/mxfp4_fp32_moe.py
 
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py b/python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py
@@ -129,10 +129,10 @@ index b3e21ebe..c22f1a98 100644
          # mul_topk_weights, so this is a plain sum over the topk dim. The JIT
 diff --git a/python/sglang/srt/layers/moe/mxfp4_fp32_moe.py b/python/sglang/srt/layers/moe/mxfp4_fp32_moe.py
 new file mode 100644
-index 00000000..02a118ed
+index 00000000..49b33e4a
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/mxfp4_fp32_moe.py
-@@ -0,0 +1,385 @@
+@@ -0,0 +1,384 @@
 +"""MXFP4 MoE on the GPU with one rounding, in the checkpoint's layout
 +(SGLANG_MXFP4_MOE_FP32=1, patches/sglang-mxfp4-fp32-moe.py installs this as
 +sglang/srt/layers/moe/mxfp4_fp32_moe.py).
@@ -413,7 +413,6 @@ index 00000000..02a118ed
 +
 +def mxfp4_fp32_moe(hidden_states, w13, w13_scale, w2, w2_scale, topk_weights, topk_ids, swiglu_limit=None,
 +                   out=None):
-+    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import moe_align_block_size
 +
 +    if _SYNC and not torch.cuda.is_current_stream_capturing():
 +        torch.cuda.synchronize()
@@ -519,7 +518,7 @@ index 00000000..02a118ed
 +        out.index_add_(0, tok, y * topk_weights[tok, slot].double()[:, None])
 +    return out
 diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
-index ca511647..8e68923b 100644
+index 404661e0..ddd7595b 100644
 --- a/python/sglang/srt/layers/quantization/fp8.py
 +++ b/python/sglang/srt/layers/quantization/fp8.py
 @@ -5,6 +5,7 @@

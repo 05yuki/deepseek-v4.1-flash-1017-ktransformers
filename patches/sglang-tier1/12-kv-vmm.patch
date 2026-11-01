@@ -1,4 +1,4 @@
-From ed8917aae4a865c4973904e233e42b29fb48e7a3 Mon Sep 17 00:00:00 2001
+From c8ebc1084f8449dcc5105c6aef94e89b2ce9d084 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] kv-vmm: the KV pool on remappable memory (CUDA VMM)
@@ -16,17 +16,17 @@ Prerequisites: none; applies alone on tier 0.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 ---
- python/sglang/srt/layers/moe/kt_kv_vmm.py     | 235 ++++++++++++++++++
+ python/sglang/srt/layers/moe/kt_kv_vmm.py     | 234 ++++++++++++++++++
  .../srt/utils/torch_memory_saver_adapter.py   |   8 +
- 2 files changed, 243 insertions(+)
+ 2 files changed, 242 insertions(+)
  create mode 100644 python/sglang/srt/layers/moe/kt_kv_vmm.py
 
 diff --git a/python/sglang/srt/layers/moe/kt_kv_vmm.py b/python/sglang/srt/layers/moe/kt_kv_vmm.py
 new file mode 100644
-index 00000000..cf208235
+index 00000000..d6a2431f
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_kv_vmm.py
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,234 @@
 +"""The KV pool on remappable memory (KT_KV_VMM=1; libkv_vmm.so, kv_vmm.c).
 +
 +Every tensor made inside region() is one virtual range backed by physical
@@ -43,7 +43,6 @@ index 00000000..cf208235
 +import contextlib
 +import ctypes
 +import os
-+from typing import Optional
 +
 +import torch
 +
