@@ -1,4 +1,4 @@
-From 15ce177002897fc83747386f0fa9dfa0d69bee87 Mon Sep 17 00:00:00 2001
+From 5d116f2bc79a84a911fe2cd6b363f2e9e22e2a14 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:37 +0900
 Subject: [PATCH] distributed: all-reduce through pinned host memory for GPUs

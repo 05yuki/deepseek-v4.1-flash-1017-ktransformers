@@ -30,7 +30,7 @@ the code" are on as soon as the patch is applied.
 | 11 | [`11-placement.patch`](#11-placement) | +45 / -0 | none |
 | 12 | [`12-kv-vmm.patch`](#12-kv-vmm) | +242 / -0 | none |
 | 13 | [`13-prefill-lend.patch`](#13-prefill-lend) | +1664 / -1 | none |
-| 14 | [`14-stream-prefill.patch`](#14-stream-prefill) | +2042 / -14 | `loading`, `placement`, `prefill-lend` |
+| 14 | [`14-stream-prefill.patch`](#14-stream-prefill) | +2062 / -14 | `loading`, `placement`, `prefill-lend` |
 | 15 | [`15-kv-lend-plan.patch`](#15-kv-lend-plan) | +1753 / -5 | `kv-vmm`, `prefill-lend` |
 | 16 | [`16-hot-lend.patch`](#16-hot-lend) | +736 / -34 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan` |
 | 17 | [`17-host-kv.patch`](#17-host-kv) | +487 / -10 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan`, `hot-lend` |
@@ -352,6 +352,8 @@ Files (under `python/sglang/`):
 
 With GPUs and kt-kernel's NUMA parts that differ in number (one GPU on two sockets, two GPUs on one socket, NPS2 or NPS4 nodes), each rank reads every part its rows of the intermediate size sit in. Checked on one GPU with two parts: an 11,769-token document read and summarised correctly, and the 35K prompt at 210 tok/s; four parts on two GPUs read correctly too.
 
+A short prompt streams every expert all the same: 1,024 tokens at six experts each touch nearly all 384 of a layer, so the stream costs what a long prompt's does. `KT_STREAM_CPU_SHORT=<tokens>:<k>,...` lets a forward of at most `<tokens>` rows leave `k` of a layer's streamed groups to kt-kernel on the CPU, computed while the rest crosses PCIe. `serve.sh` sets `1024:64` on one GPU (64 of the 96 groups of 4) and `1024:32` on more. On one RTX 5070 Ti a fresh 1,024-token prompt takes 6.2-6.8 s instead of 9.2 s. On two it takes 5.4 s instead of 6.0 s. Longer prompts are unchanged: their forwards stream every group. Scored in one server with the share switched on and off, 23 pieces of 1,024 tokens give the same NLL: -0.0006 nats a token (z -0.32) on one GPU and -0.0006 (z -0.46) on two.
+
 Switches (code / serve.sh):
 
 - `KT_GPU_STREAM_PREFILL`: 0 (off) / 512
@@ -361,6 +363,7 @@ Switches (code / serve.sh):
 - `KT_GPU_STREAM_GRAPH`: 1 (on in the code) / 1
 - `KT_GPU_STREAM_EARLY_INIT`: 0 / 1
 - `KT_GPU_STREAM_ROW_BLOCK`: 0 / 4096 (lib/kt-lend-auto.sh)
+- `KT_STREAM_CPU_SHORT`: unset / `1024:64` on one GPU, `1024:32` on more (with a resident GPU expert)
 - `KT_STREAM_CPU_GROUPS, KT_HOT_CHECK`: 0 / unset
 - `KT_GPU_STREAM_IN_WINDOW`: 0 / 0
 - `KT_STREAM_GIN_STEP`: 4096 / unset (4096)

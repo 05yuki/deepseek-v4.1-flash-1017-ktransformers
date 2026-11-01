@@ -250,6 +250,16 @@ export KT_GPU_STREAM_W16="${KT_GPU_STREAM_W16:-1}"
 has stream-mmq && export KT_GPU_STREAM_MMQ="${KT_GPU_STREAM_MMQ:-1}"
 export KT_GPU_STREAM_PREFILL="${KT_GPU_STREAM_PREFILL:-512}"
 export KT_GPU_STREAM_GROUP="${KT_GPU_STREAM_GROUP:-4}"
+# A forward of up to 1,024 rows leaves 64 (one GPU) or 32 (more) of a layer's 96 streamed groups to the
+# CPU, computed while the rest crosses PCIe (a short prompt streams every expert whatever its length).
+# Longer forwards stream every group as before. Needs a resident GPU expert.
+if (( gpu_experts > 0 )); then
+  if (( tp == 1 )); then
+    export KT_STREAM_CPU_SHORT="${KT_STREAM_CPU_SHORT:-1024:64}"
+  else
+    export KT_STREAM_CPU_SHORT="${KT_STREAM_CPU_SHORT:-1024:32}"
+  fi
+fi
 export KT_GPU_STREAM_EARLY_INIT="${KT_GPU_STREAM_EARLY_INIT:-1}"
 export KT_GPU_STREAM_DROP_CACHE="${KT_GPU_STREAM_DROP_CACHE:-$model}"
 export KT_LOAD_PREFETCH="${KT_LOAD_PREFETCH:-4}"
@@ -405,7 +415,7 @@ printf '%s\n' "GPUs ${CUDA_VISIBLE_DEVICES} (sm $cap), TP $tp on NUMA nodes $num
 printf '%s\n' "prefix cache: $( [[ "${radix_args[0]:-}" == --disable-radix-cache ]] && echo off || { [[ "${radix_args[0]:-}" == --enable-hierarchical-cache ]] && echo "on, HiCache in host memory (ratio ${DSV41_HICACHE_RATIO:-2})" || echo "on, GPU only"; })"
 printf '%s\n' "patch tier $tier; context $context_length; attention output FP8 before wo_a: block ${SGLANG_DSV4_O_FP8_QDQ_BLOCK:-0}; KV layout ${SGLANG_DSV4_KV_LAYOUT:-v4}"
 (( tier >= 1 )) && printf '%s\n' "tier-1 features: $( [[ -f "$features_file" ]] && tr '\n' ' ' < "$features_file" || echo all)"
-(( tier >= 1 )) && printf '%s\n' "wo_a native FP8: $SGLANG_DSV4_WO_A_FP8_NATIVE; vision tower on demand: $SGLANG_DSV4_VISION_ON_DEMAND; MXFP4 MoE fp32: $SGLANG_MXFP4_MOE_FP32; Marlin MoE fp32 glue: $SGLANG_MARLIN_MOE_FP32_GLUE; CPU scale codes: $KT_MXFP4_SCALE_CODES; hot lend spare floor: ${KT_KV_HOT_SPARE_FLOOR_MB:-off} MiB; dynamic hot slots: ${KT_KV_HOT_DYNAMIC_SLOTS:-0}, resident rows too: ${KT_KV_HOT_DYNAMIC_RESIDENT:-0}; shared expert after submit: ${KT_SHARED_AFTER_SUBMIT:-0}; packed hand-off: ${KT_HANDOFF_PACK:-0}"
+(( tier >= 1 )) && printf '%s\n' "wo_a native FP8: $SGLANG_DSV4_WO_A_FP8_NATIVE; vision tower on demand: $SGLANG_DSV4_VISION_ON_DEMAND; MXFP4 MoE fp32: $SGLANG_MXFP4_MOE_FP32; Marlin MoE fp32 glue: $SGLANG_MARLIN_MOE_FP32_GLUE; CPU scale codes: $KT_MXFP4_SCALE_CODES; hot lend spare floor: ${KT_KV_HOT_SPARE_FLOOR_MB:-off} MiB; dynamic hot slots: ${KT_KV_HOT_DYNAMIC_SLOTS:-0}, resident rows too: ${KT_KV_HOT_DYNAMIC_RESIDENT:-0}; shared expert after submit: ${KT_SHARED_AFTER_SUBMIT:-0}; packed hand-off: ${KT_HANDOFF_PACK:-0}; short-prompt CPU share: ${KT_STREAM_CPU_SHORT:-off}"
 printf '%s\n' "Run directory: $run_dir"
 ln -sfn "$run_dir" "$log_root/$log_name/current"
 if [[ "$mode" == "--background" ]]; then

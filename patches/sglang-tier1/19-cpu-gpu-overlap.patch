@@ -1,4 +1,4 @@
-From 8e3eba520379cd809003af39ad94c939833cc109 Mon Sep 17 00:00:00 2001
+From 9e115e34da27dd48295b3381a96cdfa63dd175fa Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Thu, 29 Oct 2026 21:20:02 +0900
 Subject: [PATCH] cpu-gpu-overlap: the shared expert forks after the CPU
@@ -43,7 +43,7 @@ Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
  create mode 100644 python/sglang/srt/layers/moe/kt_handoff_pack.py
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index cfe462dd..c7cf9573 100644
+index 76d911dc..aed354bd 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -7,6 +7,7 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert

@@ -1,4 +1,4 @@
-From 18f0ddcf790dc9589efba34fee6002b7d885980e Mon Sep 17 00:00:00 2001
+From 83334f1e9305314374d1e7c71e3416127293917e Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 23 Oct 2026 12:16:53 +0900
 Subject: [PATCH] host-kv: DeepSeek-V4.1's KV pool covers the whole context,

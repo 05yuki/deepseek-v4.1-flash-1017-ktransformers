@@ -1,4 +1,4 @@
-From b838e7d61eeff63402be6ee5caeecdda255b47e2 Mon Sep 17 00:00:00 2001
+From 01ca343104efecc1916ecfb92aab6dcd71a47bc7 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 30 Oct 2026 13:17:24 +0900
 Subject: [PATCH] expert-cache: the streamed prefill and the dynamic hot slots
@@ -97,7 +97,7 @@ index 7fba8c33..5d098bf5 100644
      elif roles is None:
          why = f"slot tensors {[(nm, str(L.slots[nm].dtype)) for _, nm in L.names]} are not packed MXFP4 bytes"
 diff --git a/python/sglang/srt/layers/moe/kt_stream_prefill.py b/python/sglang/srt/layers/moe/kt_stream_prefill.py
-index 66910aa7..6f5874a0 100644
+index 8227eba0..ebf8bc1e 100644
 --- a/python/sglang/srt/layers/moe/kt_stream_prefill.py
 +++ b/python/sglang/srt/layers/moe/kt_stream_prefill.py
 @@ -107,6 +107,12 @@ CPUCHECK = os.environ.get("KT_GPU_STREAM_CPUCHECK", "1") == "1"
@@ -113,7 +113,7 @@ index 66910aa7..6f5874a0 100644
  # KT_STREAM_SHARED_INPUTS=1 (default): the graph inputs of every chunk size
  # are views of one base per buffer (kt-stream-shared-graph-inputs, 09-30).
  SHARED_INPUTS = os.environ.get("KT_STREAM_SHARED_INPUTS", "1") == "1"
-@@ -533,7 +539,10 @@ class KTStreamPrefill:
+@@ -550,7 +556,10 @@ class KTStreamPrefill:
          # The groups never run concurrently: one mempool for every graph so
          # their temporaries (scale conversions, local ids) share storage.
          self._graph_pool = torch.cuda.graph_pool_handle()
@@ -125,7 +125,7 @@ index 66910aa7..6f5874a0 100644
              self._map_expert_arenas(method)
          else:
              self._make_host_buffers()
-@@ -754,9 +763,150 @@ class KTStreamPrefill:
+@@ -771,9 +780,150 @@ class KTStreamPrefill:
              _log(f"rank {self.rank}: registered layer {layer_idx} arenas, {total/1e9:.1f} GB in {time.time()-t0:.1f} s"
                   + (f" ({time.time()-t1:.1f} s pinning)" if lock is not None else ""))
  
@@ -276,7 +276,7 @@ index 66910aa7..6f5874a0 100644
          self._register_arenas(layer_idx)
          slot = self.slots[gi % 2]
          n = len(experts)
-@@ -1585,6 +1735,9 @@ class KTStreamPrefill:
+@@ -1603,6 +1753,9 @@ class KTStreamPrefill:
              layer_idx = method.kt_config.layer_idx
              self._run_mmq(method, layer_idx, x, ids, topk_weights, groups, acc, stats)
              self.calls += 1

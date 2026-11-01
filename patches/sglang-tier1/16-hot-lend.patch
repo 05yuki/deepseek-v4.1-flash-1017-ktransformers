@@ -1,4 +1,4 @@
-From e56010b00f9adfd657f53d2b9521634196c329bd Mon Sep 17 00:00:00 2001
+From 8d582340b02bfd97c78e70a19258a7be8b4013ff Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] hot-lend: more hot experts in the KV pool's free pages
@@ -99,7 +99,7 @@ index 40d89d80..d131eaec 100644
  
          self._weight_loader_impl(
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index f91552de..cfe462dd 100644
+index 4cbfea4f..76d911dc 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -308,6 +308,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
