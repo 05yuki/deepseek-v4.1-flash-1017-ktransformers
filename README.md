@@ -44,6 +44,11 @@ time by default. `SGLANG_MAX_RUNNING_REQUESTS=4` runs up to four at once.
 - A long prompt holds the others while it prefills: the prefill lends the GPU's weights and free KV
   pages to itself. Three running answers waited 62 s for a 131K-token prompt.
 
+The prefix cache is on, with a copy in host memory (SGLang's HiCache).
+A prompt that starts like an earlier one reads that part from the cache.
+The same 35K-token prompt again takes 2 s instead of 20; a 900K-token one 5-17 s instead of 855.
+`DSV41_RADIX=0` turns the cache off ([docs/tier1.md](docs/tier1.md#21-hicache)).
+
 To serve other machines, set `SGLANG_HOST=0.0.0.0` and `SGLANG_API_KEY=<key>`
 (clients then send `Authorization: Bearer <key>`). The same setup also serves the earlier
 DeepSeek-V4.1-Flash release: point `MODEL` at it.
@@ -72,7 +77,7 @@ pages on the GPU. If the server runs out of memory at launch, a shorter context
 (`SGLANG_CONTEXT_LENGTH`) makes the pool smaller; it is the only setting memory needs.
 
 - **RAM: a 512 GB class machine, or one socket with 256 GB.** The server uses about 420 GiB,
-  most of it the MXFP4 CPU experts on 2 MB pages.
+  most of it the MXFP4 CPU experts on 2 MB pages. The prefix cache's host copy adds about 5 GiB a GPU.
   - With one CPU expert pool on a NUMA node of less than 370 GiB, `serve.sh` keeps the
     experts in a RAM cache of the node's memory less 50 GiB and reads the others from the
     checkpoint when they are routed ([One socket, 256 GB](#one-socket-256-gb)).

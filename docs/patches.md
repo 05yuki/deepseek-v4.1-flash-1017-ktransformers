@@ -149,6 +149,7 @@ are for:
 |---|---|
 | decode | [`fp8-decode`](tier1.md#01-fp8-decode), [`engram-row-prefetch`](tier1.md#04-engram-row-prefetch), [`wo-a-fp8`](tier1.md#05-wo-a-fp8), [`placement`](tier1.md#11-placement), [`hot-lend`](tier1.md#16-hot-lend), [`cpu-gpu-overlap`](tier1.md#19-cpu-gpu-overlap) |
 | long prompts | [`stream-prefill`](tier1.md#14-stream-prefill), [`stream-mmq`](tier1.md#18-stream-mmq), [`prefill-lend`](tier1.md#13-prefill-lend), [`kv-vmm`](tier1.md#12-kv-vmm), [`kv-lend-plan`](tier1.md#15-kv-lend-plan) |
+| prompts read again | [`hicache`](tier1.md#21-hicache) |
 | GPU memory | [`wo-a-fp8`](tier1.md#05-wo-a-fp8), [`vision-on-demand`](tier1.md#06-vision-on-demand) |
 | RAM | [`expert-cache`](tier1.md#20-expert-cache) |
 | numerics | [`gpu-moe-fp32`](tier1.md#02-gpu-moe-fp32) |

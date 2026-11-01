@@ -37,6 +37,7 @@ the code" are on as soon as the patch is applied.
 | 18 | [`18-stream-mmq.patch`](#18-stream-mmq) | +1618 / -3 (llama.cpp's kernels come from `lib/llama-mmq.sh`) | `stream-prefill` |
 | 19 | [`19-cpu-gpu-overlap.patch`](#19-cpu-gpu-overlap) | +190 / -2 | `loading`, `placement`, `prefill-lend`, `stream-prefill` |
 | 20 | [`20-expert-cache.patch`](#20-expert-cache) | +200 / -3 | `loading`, `placement`, `prefill-lend`, `stream-prefill`, `kv-vmm`, `kv-lend-plan`, `hot-lend`, `stream-mmq` |
+| 21 | [`21-hicache.patch`](#21-hicache) | +46 / -3 | `kv-vmm`, `prefill-lend`, `kv-lend-plan` |
 
 ## Effect of each patch
 
@@ -637,9 +638,67 @@ between launches).
 Switches (code / serve.sh):
 
 - `KT_MXFP4_EXPERT_CACHE_GIB`: unset (off) / the node's memory less `KT_MXFP4_HOST_RESERVE_GIB`
-  (50) when it has less than `KT_MXFP4_FULL_GIB` (370) and one pool; 0 keeps every expert in RAM
+  (50), and 6 GiB a GPU for HiCache's host copy of the prefix cache when it is on ([21](#21-hicache)),
+  when the node has less than `KT_MXFP4_FULL_GIB` (370) and one pool; 0 keeps every expert in RAM
 - `KT_MXFP4_CACHE_KEEP_ROWS`: 16
 - `KT_MXFP4_CACHE_READERS`: 16; `KT_IO_CPUS`: unset / the second hardware threads of the pool's cores
 - `KT_MXFP4_CACHE_OVERLAP`: 1
 - `KT_MXFP4_STREAM_READERS`: 8
 - `KT_MXFP4_CACHE_REPORT=<forwards>`, `KT_MXFP4_STREAM_REPORT=<layers>` (40): the cache's counters
+
+## 21 hicache
+
+`serve.sh` runs the prefix cache with SGLang's HiCache: `--enable-hierarchical-cache
+--hicache-write-policy write_back --hicache-ratio 2`. A prompt that starts like an earlier one reads
+that part from the cache, and the cache's pages are also kept in host memory, so a prefix the GPU
+pool has given up is loaded back instead of computed again. The host copy takes twice the GPU
+pool, about 5 GiB a GPU with the 1M pool. This patch makes HiCache work with the lends:
+
+- A load-back maps its SWA pages first. The SWA lend keeps the SWA pool's free pages beyond
+  `KT_PREFILL_SWA_LEND_KEEP` (4,096 tokens) unmapped outside prefill and maps the ones an
+  allocation hands out at the next forward's start. HiCache allocates a load-back's SWA slots in
+  the scheduler and starts the copy before that forward, into memory not mapped yet: the third
+  prefix loaded back faulted both ranks. The cache controller's `start_loading` now maps them first.
+- The write-back staging buffer takes at most `SGLANG_HICACHE_STAGING_MB` (32) MiB of GPU memory.
+  A V4 host pool kept 64 pages of all its layers on the GPU, 330 MiB for the SWA pool, memory the
+  hot lend's slots did not get. The staged kernel already loops over the buffer.
+- With HiCache attached the SWA trim keeps `KT_PREFILL_SWA_LEND_KEEP` tokens outside prefill
+  instead of the pool's budget (34,048 tokens); what the cache gives back goes to host memory and
+  comes back on the next match. A cached 35K prompt's SWA kept on the GPU (0.72 GiB) left the next
+  decode's lend 592 slots instead of 684.
+
+**Effect** (the machine in the README, two GPUs, against the prefix cache off; launches alternated):
+
+- Decode on all seven texts and the 35K prefill as without the cache (the first lend: 690 hot
+  slots against 695).
+- The same 35K prompt again: 2.0 s, 34,816 tokens from the cache, against 20 s.
+- Six 4,096-token documents trimmed from the GPU all come back from host memory on their next read.
+- Four sessions of 900K, 131K, 66K and 33K tokens (1.13M, past the 1M GPU pool) with fresh
+  200K prompts between rounds, four requests at once: 28 of 28 facts read back, the 900K session
+  again in 5-17 s instead of 855 s.
+- One GPU (the KV past it in host memory): the 35K prefill (37.9 s, 33.2 s) and decode as without
+  the cache; a 131K prompt again in 2.3 s instead of 127 s.
+
+The chunk calibration of a setup's first launch (`lib/kt-lend-auto.sh`) runs without the cache:
+its one long prompt is chunked before any plan is known, and the cache would hold every chunk's
+SWA pages (on one GPU every calibration ran out of SWA pages and the chunk fell to 2,048).
+
+Numerics: a prefix read from the cache scores as computed (six documents, NLL 0.6267-0.6328 first
+read, 0.6280-0.6341 from the cache, against 0.011 a document between two uncached reads). With the
+hot slots held fixed (`KT_KV_HOT_SLOTS_MAX=600`) the 24-piece NLL is 0.7169 with the cache off, on,
+and on with HiCache; without the cap HiCache's 5 fewer slots give 0.7208 instead of 0.7185.
+
+Switches (code / serve.sh):
+
+- the prefix cache: SGLang's / on; `DSV41_RADIX=0` turns it off
+- HiCache: off / on with this patch; `DSV41_HICACHE=0` keeps the cache on the GPU only (it then
+  holds memory the hot lend would use); `DSV41_HICACHE_RATIO`: 2
+- `SGLANG_HICACHE_STAGING_MB`: 32
+- `KT_PREFILL_SWA_HOST_TRIM`: 1 (only with HiCache attached)
+
+Prerequisites: `kv-vmm`, `prefill-lend`, `kv-lend-plan`.
+
+Files (under `python/sglang/`):
+
+- `srt/layers/moe/kt_kv_prefill_lend.py`
+- `srt/mem_cache/memory_pool_host.py`

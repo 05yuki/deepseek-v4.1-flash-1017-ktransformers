@@ -1,0 +1,152 @@
+From d88b0c4dfcf012c784c03b8e6056ba3e41e4c776 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Sun, 1 Nov 2026 10:16:27 +0900
+Subject: [PATCH] hicache: the prefix cache's copy in host memory with the
+ lends
+
+SGLang's HiCache (--enable-hierarchical-cache) keeps the prefix cache's
+pages in host memory as well, so a prefix the GPU pool has given up is
+loaded back instead of computed again. Three changes make it work with
+the lends on DeepSeek-V4.1:
+
+- A load-back maps its SWA pages first. The SWA lend keeps the SWA pool's
+  free pages beyond KT_PREFILL_SWA_LEND_KEEP unmapped outside prefill and
+  maps the ones an allocation hands out at the next forward's start;
+  HiCache allocates a load-back's SWA slots in the scheduler and starts
+  the host-to-device copy before that forward, into unmapped memory (the
+  third prefix loaded back faulted both ranks with an illegal memory
+  access). bind_tree now wraps the cache controller's start_loading to
+  map the pending SWA chunks before the copy.
+- The write-back staging buffer takes at most SGLANG_HICACHE_STAGING_MB
+  (32) MiB. A page_first V4 host pool kept 64 pages of all its layers on
+  the GPU, 330 MiB for the SWA pool, which the hot lend's slots then did
+  not get (659 slots instead of 695 on two 16 GB cards, decode -2 to -4%
+  on non-Japanese text). The staged kernel already loops over the
+  buffer's capacity.
+- With HiCache attached the SWA trim keeps KT_PREFILL_SWA_LEND_KEEP
+  (4,096) tokens outside prefill instead of the pool's budget (34,048 on
+  V4.1); what the cache gives back is backed up to host memory and loaded
+  on the next match. Kept on the GPU, a cached 35K prompt's SWA (0.72
+  GiB) left the next decode's lend 592 slots instead of 684.
+  KT_PREFILL_SWA_HOST_TRIM=0 keeps the budget.
+
+Two GPUs, --hicache-write-policy write_back --hicache-ratio 2 (about
+10.5 GiB of host memory with the 1M pool), against the prefix cache off:
+decode on all seven texts and the 35K prefill as before; a 35K prompt
+read again 2.0 s (34,816 tokens from the cache) against 20 s; six
+4,096-token documents trimmed from the GPU all come back from host
+memory; NLL as before. Four sessions of 900K/131K/66K/33K tokens (1.13M,
+past the 1M device pool) with 200K prompts between rounds, four requests
+at once: 28 of 28 facts read back, the 900K session again in 5-17 s
+instead of 855 s.
+
+Prerequisites: `kv-vmm`, `prefill-lend`, `kv-lend-plan`.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
+---
+ .../srt/layers/moe/kt_kv_prefill_lend.py      | 32 ++++++++++++++++++-
+ .../sglang/srt/mem_cache/memory_pool_host.py  | 17 ++++++++--
+ 2 files changed, 46 insertions(+), 3 deletions(-)
+
+diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
+index c34f019d..20e955c8 100644
+--- a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
++++ b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
+@@ -525,6 +525,8 @@ SWA_TOKENS = int(os.environ.get("KT_PREFILL_SWA_TOKENS", "0") or 0)
+ SWA_KEEP = int(os.environ.get("KT_PREFILL_SWA_LEND_KEEP", "4096"))  # tokens kept mapped outside prefill
+ SWA_MIN = int(os.environ.get("KT_PREFILL_SWA_LEND_MIN_MB", "64")) << 20  # smallest lend worth a sync
+ SWA_SLACK = 1024  # tokens mapped beyond an allocation's shortfall
++# with HiCache, the trim keeps SWA_KEEP tokens outside prefill (kv-lend-hicache-swa-trim.py)
++SWA_HOST_TRIM = os.environ.get("KT_PREFILL_SWA_HOST_TRIM", "1") == "1"
+ SWA = {"alloc": None, "tensors": None, "lent": None, "bytes": 0, "lends": 0, "maps": 0, "ticks": 0}
+ 
+ 
+@@ -770,9 +772,29 @@ def _defer_ok() -> bool:
+ 
+ 
+ def bind_tree(scheduler) -> None:
+-    """kt_prefill_plan, from the scheduler: its prefix cache, for swa_trim."""
++    """kt_prefill_plan, from the scheduler: its prefix cache, for swa_trim (and its
++    HiCache controller, for _wrap_hicache_load)."""
+     if SWA_ENABLED and "tree" not in SWA:
+         SWA["tree"] = getattr(scheduler, "tree_cache", None)
++        _wrap_hicache_load(SWA["tree"])
++
++
++def _wrap_hicache_load(tree) -> None:
++    """A HiCache load-back allocates its SWA slots in the scheduler and starts the
++    host-to-device copy before the next forward, which is where swa_map(defer=True)
++    maps the pages it handed back: map them before the copy starts."""
++    cc = getattr(tree, "cache_controller", None)
++    if cc is None or getattr(cc, "_kt_swa_load", False) or not hasattr(cc, "start_loading"):
++        return
++    orig = cc.start_loading
++
++    def start_loading(*args, **kw):
++        swa_flush("HiCache load", quiet=SWA["maps"] > 3 and not CHECK)
++        return orig(*args, **kw)
++
++    cc.start_loading = start_loading
++    cc._kt_swa_load = True
++    _log(f"SWA lend: {type(cc).__name__}.start_loading maps the SWA pages it loads into first")
+ 
+ 
+ def _swa_in_use(a) -> int:
+@@ -790,6 +812,14 @@ def swa_trim(why: str) -> None:
+     a, tree, budget = SWA["alloc"], SWA.get("tree"), SWA.get("budget")
+     if a is None or tree is None or not budget:
+         return
++    if SWA_HOST_TRIM and getattr(tree, "cache_controller", None) is not None:
++        # HiCache backs up what the cache gives back and loads it on the next match:
++        # keep only what the SWA lend keeps, the rest goes to the lends
++        if not SWA.get("host_trim_logged"):
++            SWA["host_trim_logged"] = True
++            _log(f"SWA trim: HiCache backs the cache in host memory, {SWA_KEEP} tokens kept outside prefill "
++                 f"(not the {budget}-token budget)")
++        budget = SWA_KEEP
+     over = _swa_in_use(a) - budget
+     if over <= 4 * SWA["ps"]:
+         return
+diff --git a/python/sglang/srt/mem_cache/memory_pool_host.py b/python/sglang/srt/mem_cache/memory_pool_host.py
+index 02e2d5cc..a94756b0 100644
+--- a/python/sglang/srt/mem_cache/memory_pool_host.py
++++ b/python/sglang/srt/mem_cache/memory_pool_host.py
+@@ -68,6 +68,15 @@ if _is_npu:
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _staging_page_capacity(num_pages: int, page_bytes: int) -> int:
++    """Write-back staging pages: at most _WRITE_BACK_STAGING_PAGE_CHUNK and at most
++    SGLANG_HICACHE_STAGING_MB of device memory (the staged kernel loops over the rest)."""
++    import os
++
++    cap = int(os.environ.get("SGLANG_HICACHE_STAGING_MB", "32")) << 20
++    return max(1, min(num_pages, _WRITE_BACK_STAGING_PAGE_CHUNK, cap // max(1, page_bytes)))
++
++
+ from sglang.srt.mem_cache.pool_host import HostKVCache
+ from sglang.srt.mem_cache.pool_host.base import (
+     _WRITE_BACK_STAGING_PAGE_CHUNK,
+@@ -379,7 +388,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
+         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
+             element_size=self.item_bytes * self.dtype.itemsize,
+         )
+-        staging_page_capacity = min(self.num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK)
++        staging_page_capacity = _staging_page_capacity(
++            self.num_host_pages, self.layer_num * self.item_bytes * self.dtype.itemsize
++        )
+         self.staging_buffer = torch.empty(
+             (staging_page_capacity, self.layer_num, self.item_bytes),
+             dtype=self.dtype,
+@@ -933,7 +944,9 @@ class DeepSeekV4StateHostPool(HostKVCache):
+         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
+             element_size=self.state_page_bytes * self.dtype.itemsize,
+         )
+-        staging_page_capacity = min(self.num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK)
++        staging_page_capacity = _staging_page_capacity(
++            self.num_host_pages, self.layer_num * self.state_page_bytes * self.dtype.itemsize
++        )
+         self.staging_buffer = torch.empty(
+             (staging_page_capacity, self.layer_num, self.state_page_bytes),
+             dtype=self.dtype,

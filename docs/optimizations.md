@@ -94,7 +94,7 @@ None of these takes tokens from the KV pool. The 1M-token pool comes first.
 On the earlier base the third request of a session came back as garbage with it, and it was
 kept off. SGLang main turns it on by default (the same scheme as DeepSeek's DeepInfer, "YoCo
 prefill truncation"): the layers from 20 on run only over the prompt's last 128 rows. Three
-turns of one chat with the prefix cache on (`DSV41_RADIX=1`, 512 tokens read from the cache in
+turns of one chat with the prefix cache on (512 tokens read from the cache in
 turns 2 and 3) come back intact. A 131,072-token prompt takes 242.7 s with it and 266.0 s
 without (`--no-enable-decoder-swa-bounded-replay`).
 

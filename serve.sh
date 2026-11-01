@@ -111,7 +111,10 @@ if has expert-cache && (( threadpools == 1 )) && [[ -z "${KT_MXFP4_EXPERT_CACHE_
   cg_max="$(cat "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup | head -1)/memory.max" 2>/dev/null || echo max)"
   if [[ "$cg_max" =~ ^[0-9]+$ ]] && (( cg_max / 1073741824 < pool_gib )); then pool_gib=$(( cg_max / 1073741824 )); fi
   if (( pool_gib < ${KT_MXFP4_FULL_GIB:-370} )); then
-    export KT_MXFP4_EXPERT_CACHE_GIB=$(( pool_gib - ${KT_MXFP4_HOST_RESERVE_GIB:-50} ))
+    # HiCache's host copy of the prefix cache (on by default, below): about 5 GiB a GPU
+    hicache_gib=0
+    if [[ "${DSV41_RADIX:-1}" != "0" && "${DSV41_HICACHE:-1}" != "0" ]] && has hicache; then hicache_gib=$(( 6 * tp )); fi
+    export KT_MXFP4_EXPERT_CACHE_GIB=$(( pool_gib - ${KT_MXFP4_HOST_RESERVE_GIB:-50} - hicache_gib ))
     if (( KT_MXFP4_EXPERT_CACHE_GIB < 100 )); then
       echo "node $pool_node has $pool_gib GiB: too little for the MXFP4 expert cache (the GGUF recipe runs this model in 64 GB)" >&2
       exit 5
@@ -134,8 +137,19 @@ chunked_prefill="${SGLANG_CHUNKED_PREFILL_SIZE:-2048}"
 swa_prefix_tails="${SGLANG_SWA_PREFIX_TAILS:-6}"
 # split on whitespace on purpose: SGLANG_EXTRA_ARGS="--a 1 --b 2" gives four words (no quoting inside)
 extra_args=(${SGLANG_EXTRA_ARGS:-})
-radix_args=(--disable-radix-cache)
-[[ "${DSV41_RADIX:-0}" == "1" ]] && radix_args=()
+# The prefix cache: a prompt that starts like an earlier one reads that part from the cache.
+# With tier-1 hicache its pages are also kept in host memory (HiCache, write-back, twice the
+# GPU pool: about 5 GiB a GPU with the 1M pool), so a prefix the GPU has given up is loaded
+# back instead of computed again. DSV41_HICACHE=0 keeps the cache on the GPU only (it then
+# holds memory the hot lend would use); DSV41_RADIX=0 turns the cache off.
+# The chunk calibration (lib/kt-lend-auto.sh) runs without it: its one long prompt is chunked
+# before any plan is known, and the cache would hold every chunk's SWA pages.
+radix_args=()
+if [[ "${DSV41_RADIX:-1}" == "0" || "${KT_PREFILL_LEND_CALIBRATING:-0}" == "1" ]]; then
+  radix_args=(--disable-radix-cache)
+elif has hicache && [[ "${DSV41_HICACHE:-1}" != "0" ]]; then
+  radix_args=(--enable-hierarchical-cache --hicache-write-policy write_back --hicache-ratio "${DSV41_HICACHE_RATIO:-2}")
+fi
 
 # DeepSeek-V4.1-Flash-1017 rounds the attention output to FP8 before wo_a; the block
 # comes from the checkpoint's own inference code (off for the earlier release)
@@ -388,6 +402,7 @@ command=(
 printf '%s\n' "DeepSeek-V4.1-Flash on SGLang + KTransformers: $model"
 printf '%s\n' "GPUs ${CUDA_VISIBLE_DEVICES} (sm $cap), TP $tp on NUMA nodes $numa_list; CPU experts: $cpu_threads threads in $threadpools pools; GPU experts $gpu_experts a layer"
 [[ "${KT_MXFP4_EXPERT_CACHE_GIB:-0}" != 0 ]] && printf '%s\n' "expert cache: $KT_MXFP4_EXPERT_CACHE_GIB GiB of node $pool_node's RAM, the other experts read from $model when routed (reads on CPUs ${KT_IO_CPUS:-any})"
+printf '%s\n' "prefix cache: $( [[ "${radix_args[0]:-}" == --disable-radix-cache ]] && echo off || { [[ "${radix_args[0]:-}" == --enable-hierarchical-cache ]] && echo "on, HiCache in host memory (ratio ${DSV41_HICACHE_RATIO:-2})" || echo "on, GPU only"; })"
 printf '%s\n' "patch tier $tier; context $context_length; attention output FP8 before wo_a: block ${SGLANG_DSV4_O_FP8_QDQ_BLOCK:-0}; KV layout ${SGLANG_DSV4_KV_LAYOUT:-v4}"
 (( tier >= 1 )) && printf '%s\n' "tier-1 features: $( [[ -f "$features_file" ]] && tr '\n' ' ' < "$features_file" || echo all)"
 (( tier >= 1 )) && printf '%s\n' "wo_a native FP8: $SGLANG_DSV4_WO_A_FP8_NATIVE; vision tower on demand: $SGLANG_DSV4_VISION_ON_DEMAND; MXFP4 MoE fp32: $SGLANG_MXFP4_MOE_FP32; Marlin MoE fp32 glue: $SGLANG_MARLIN_MOE_FP32_GLUE; CPU scale codes: $KT_MXFP4_SCALE_CODES; hot lend spare floor: ${KT_KV_HOT_SPARE_FLOOR_MB:-off} MiB; dynamic hot slots: ${KT_KV_HOT_DYNAMIC_SLOTS:-0}, resident rows too: ${KT_KV_HOT_DYNAMIC_RESIDENT:-0}; shared expert after submit: ${KT_SHARED_AFTER_SUBMIT:-0}; packed hand-off: ${KT_HANDOFF_PACK:-0}"
