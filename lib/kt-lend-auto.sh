@@ -29,6 +29,46 @@ print(min(hints) if hints else "")
 PY
 }
 
+# A shipped hint (KT_LEND_SEED_DIR/*.json, tools/lend-hint-export.py: the GPU model, its memory, the
+# GPU count and the rank files a calibrated setup of the recipe's defaults wrote) matching the GPUs in
+# CUDA_VISIBLE_DEVICES, written as this setup's rank files with KT_LEND_SEED_FREE_MARGIN_MB (512)
+# less free memory, for a display or another process on the card; the server rewrites them from its
+# own measurement at the first long prompt. Prints the file it seeded from, nothing when none fits.
+_kt_lend_seed_hint() {
+  local gpu_sel=() smi
+  [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]] && gpu_sel=(-i "$CUDA_VISIBLE_DEVICES")
+  smi="$(nvidia-smi "${gpu_sel[@]}" --query-gpu=name,memory.total --format=csv,noheader,nounits 2>/dev/null)" || return 0
+  # (the script is python's stdin: the GPU list goes in as an argument)
+  python3 - "$KT_LEND_SEED_DIR" "$KT_PREFILL_LEND_HINT" "${KT_LEND_SEED_FREE_MARGIN_MB:-512}" "$smi" <<'PY'
+import glob, json, os, sys
+seed_dir, prefix, margin = sys.argv[1], sys.argv[2], int(sys.argv[3])
+gpus = [l.split(", ") for l in sys.argv[4].strip().splitlines()]
+if not gpus or len({g[0].strip() for g in gpus}) != 1:
+    sys.exit(0)
+name, vram = gpus[0][0].strip(), min(int(g[1]) for g in gpus)
+for f in sorted(glob.glob(os.path.join(seed_dir, "*.json"))):
+    try:
+        d = json.load(open(f))
+    except Exception:
+        continue
+    if d.get("gpu") != name or d.get("gpus") != len(gpus) or abs(int(d.get("vram_mib", 0)) - vram) > 512:
+        continue
+    ranks = d.get("ranks") or []
+    if not ranks:
+        continue
+    for r in range(len(gpus)):
+        rec = dict(ranks[min(r, len(ranks) - 1)])
+        rec["free_at_prefill_mb"] = max(1024, int(rec.get("free_at_prefill_mb", 0)) - margin)
+        rec["points"] = {k: dict(p, free=max(1 << 30, int(p.get("free", 0)) - (margin << 20)))
+                         for k, p in (rec.get("points") or {}).items()}
+        rec["seeded_from"] = os.path.basename(f)
+        with open(f"{prefix}-rank{r}.json", "w") as out:
+            json.dump(rec, out)
+    print(os.path.relpath(f))
+    break
+PY
+}
+
 _kt_lend_auto_core() {
   local launcher="$1" chunk_var="$2" port="$3"
   shift 3
@@ -65,6 +105,18 @@ _kt_lend_auto_core() {
     echo "chunk $hint from the hint $KT_PREFILL_LEND_HINT-rank*.json" >&2
     KT_LEND_CHUNK="$hint"
     return 0
+  fi
+  # a shipped hint for this GPU model and count (KT_LEND_SEED_DIR, set by the launcher only at its
+  # recipe's defaults): seeded as this setup's rank files, so the calibration launch is skipped
+  if [[ -n "${KT_LEND_SEED_DIR:-}" && "${KT_LEND_SEED:-1}" == 1 && -z "${KT_PREFILL_LEND_CALIBRATING:-}" ]]; then
+    local seeded
+    seeded="$(_kt_lend_seed_hint)" || true
+    if [[ -n "$seeded" ]]; then
+      hint="$(_kt_lend_read_hint)"
+      echo "chunk $hint from the shipped hint $seeded (KT_LEND_SEED=0 calibrates instead)" >&2
+      KT_LEND_CHUNK="$hint"
+      return 0
+    fi
   fi
   if [[ "${KT_PREFILL_LEND_CALIBRATE:-1}" != 1 || -n "${KT_PREFILL_LEND_CALIBRATING:-}" ]]; then
     KT_LEND_CHUNK=8192

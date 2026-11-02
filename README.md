@@ -191,7 +191,11 @@ variable named next to it. Among them:
 - an expert cache in RAM when one CPU pool's NUMA node holds less than 370 GiB
   ([One socket, 256 GB](#one-socket-256-gb))
 - a prefill chunk calibrated once, on the first launch of a setup (the server starts
-  one extra time for this)
+  one extra time for this, about 12 minutes here). A shipped hint stands in for it when
+  one matches the GPU model and count (`hints/kt-lend/`; RTX 5070 Ti, one or two) and
+  the launch is at the defaults; the server replaces it with its own measurement at the
+  first long prompt. `KT_LEND_SEED=0` calibrates instead; `tools/lend-hint-export.py`
+  turns a calibrated setup's hint into a file to contribute
 - FlashInfer autotune off, so outputs reproduce across launches
 - V4.1's tool-call and reasoning parsers (below)
 

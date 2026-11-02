@@ -17,7 +17,7 @@
 # Measured, before the cache check: decode by text (tools/bench.py, --other-text) and the 35K prefill.
 #
 # About 15 minutes after the server is up; the first launch of a setup compiles kernels and may calibrate the
-# prefill chunk first (up to an hour). The report names the hardware and software: no host name, user,
+# prefill chunk first (up to an hour; a shipped hint for the GPU model and count skips the calibration). The report names the hardware and software: no host name, user,
 # path, address or serial number. Exit status 0 when every check passed.
 set -Eeuo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

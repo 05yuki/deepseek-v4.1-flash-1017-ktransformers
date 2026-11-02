@@ -322,6 +322,7 @@ Switches (code / serve.sh):
 
 - `KT_PREFILL_LEND`: 0; KT_PREFILL_LEND_HINT, _MARGIN_MB, _SKIP, _LONG_SEQ, _MAX_CHUNK, ... / 1 (via lib/kt-lend-auto.sh)
 - `KT_PREFILL_LEND_PROBE`: unset / set by lib/kt-lend-auto.sh on the calibration launch
+- `KT_LEND_SEED_DIR`, `KT_LEND_SEED`, `KT_LEND_SEED_FREE_MARGIN_MB`: unset / hints/kt-lend at the launcher's defaults, 1, 512 (lib/kt-lend-auto.sh: a shipped hint for the GPU model and count seeds the setup's rank files, with that much less free memory, instead of the calibration launch; tools/lend-hint-export.py writes one)
 - `KT_FAST_PINNED`: 0 / 0
 - `KT_PREFILL_LEND_RESIDENT`: hc_ / hc_
 

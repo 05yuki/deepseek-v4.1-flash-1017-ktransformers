@@ -334,7 +334,16 @@ if [[ "$KT_PREFILL_LEND" == 1 ]]; then
   export KT_PREFILL_PLAN_COST_PRIOR="${KT_PREFILL_PLAN_COST_PRIOR:-2600,$plan_row,280,820}"
   source "$here/lib/kt-lend-auto.sh"
   export KT_PREFILL_LEND_KV_CAP="${KT_PREFILL_LEND_KV_CAP:-$max_total_tokens}"
-  # the first launch of a setup calibrates the chunk once (one more server start)
+  # the shipped hints (hints/kt-lend/, one a GPU model and count) stand in for the first launch's
+  # calibration only at the defaults they were measured with
+  # (the placement is compared, not its variable: lib/kt-kv-hot-default.sh exports the default's path)
+  if [[ -z "${SGLANG_CONTEXT_LENGTH:-}${SGLANG_MAX_TOTAL_TOKENS:-}${SGLANG_MEM_FRACTION:-}${KT_GPU_EXPERTS:-}" \
+        && -z "${SGLANG_SWA_PREFIX_TAILS:-}${DSV41_LEND_MAX_CHUNK:-}${KT_TP:-}" \
+        && "$placement" == "$here/placements/dsv41-expert-placement-hot64.json" ]]; then
+    export KT_LEND_SEED_DIR="${KT_LEND_SEED_DIR:-$here/hints/kt-lend}"
+  fi
+  # the first launch of a setup calibrates the chunk once (one more server start), unless a shipped
+  # hint fits this GPU model and count
   kt_lend_auto "$0" SGLANG_CHUNKED_PREFILL_SIZE "$port" "$model" "$context_length" "$max_total_tokens" \
     "$mem_fraction" "${gpus[*]}" "$gpu_experts" "$placement" "${SGLANG_SWA_PREFIX_TAILS:-6}" || exit $?
   chunked_prefill="$KT_LEND_CHUNK"

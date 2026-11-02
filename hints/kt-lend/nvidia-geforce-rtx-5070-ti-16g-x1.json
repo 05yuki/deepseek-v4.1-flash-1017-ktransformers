@@ -1,0 +1,52 @@
+{
+ "gpu": "NVIDIA GeForce RTX 5070 Ti",
+ "vram_mib": 16303,
+ "gpus": 1,
+ "measured": {
+  "date": "2026-11-02",
+  "recipe": "2026-11-02-1317",
+  "note": "EPYC 7452 x2, calibrated 2026-11-02, served a 35K prompt"
+ },
+ "ranks": [
+  {
+   "chunk": 16384,
+   "current_chunk": 16384,
+   "rows_seen": 12288,
+   "alloc_per_row": 279949,
+   "pf_delta_mb": 6544,
+   "free_at_prefill_mb": 8143,
+   "peak_growth_mb": 3926,
+   "margin_mb": 256,
+   "bytes_per_token": 335019,
+   "scratch_chunk_mb": 0,
+   "seq_seen": 35000,
+   "full_tokens": 1048576,
+   "points": {
+    "17": {
+     "seq": 65536,
+     "per_row": 324608,
+     "free": 9051045888,
+     "rows": 16384
+    },
+    "20": {
+     "seq": 933888,
+     "per_row": 394496,
+     "free": 8333819904,
+     "rows": 16384
+    },
+    "14": {
+     "seq": 12288,
+     "per_row": 345259,
+     "free": 8983937024,
+     "rows": 12288
+    },
+    "16": {
+     "seq": 35000,
+     "per_row": 394581,
+     "free": 8568700928,
+     "rows": 12288
+    }
+   }
+  }
+ ]
+}

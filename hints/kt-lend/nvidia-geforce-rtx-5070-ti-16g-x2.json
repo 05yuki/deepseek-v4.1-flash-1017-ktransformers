@@ -1,0 +1,128 @@
+{
+ "gpu": "NVIDIA GeForce RTX 5070 Ti",
+ "vram_mib": 16303,
+ "gpus": 2,
+ "measured": {
+  "date": "2026-11-02",
+  "recipe": "2026-11-01-1946",
+  "note": "EPYC 7452 x2, calibrated 2026-11-01, served prompts to 540K"
+ },
+ "ranks": [
+  {
+   "chunk": 27648,
+   "current_chunk": 27648,
+   "rows_seen": 18432,
+   "alloc_per_row": 246934,
+   "pf_delta_mb": 3562,
+   "free_at_prefill_mb": 9279,
+   "peak_growth_mb": 5794,
+   "margin_mb": 256,
+   "bytes_per_token": 329614,
+   "scratch_chunk_mb": 0,
+   "seq_seen": 35000,
+   "full_tokens": 1048576,
+   "points": {
+    "17": {
+     "seq": 65536,
+     "per_row": 340992,
+     "free": 10219094016,
+     "rows": 16384
+    },
+    "20": {
+     "seq": 540672,
+     "per_row": 335104,
+     "free": 9692708864,
+     "rows": 16384
+    },
+    "16": {
+     "seq": 35000,
+     "per_row": 459890,
+     "free": 9910812672,
+     "rows": 18432
+    },
+    "13": {
+     "seq": 4609,
+     "per_row": 671598,
+     "free": 9969532928,
+     "rows": 4609
+    },
+    "18": {
+     "seq": 131072,
+     "per_row": 329081,
+     "free": 9684320256,
+     "rows": 19456
+    },
+    "15": {
+     "seq": 16384,
+     "per_row": 502400,
+     "free": 9818537984,
+     "rows": 16384
+    },
+    "14": {
+     "seq": 12288,
+     "per_row": 363520,
+     "free": 10131013632,
+     "rows": 12288
+    }
+   }
+  },
+  {
+   "chunk": 27648,
+   "current_chunk": 27648,
+   "rows_seen": 18432,
+   "alloc_per_row": 245056,
+   "pf_delta_mb": 3562,
+   "free_at_prefill_mb": 9443,
+   "peak_growth_mb": 5658,
+   "margin_mb": 256,
+   "bytes_per_token": 321877,
+   "scratch_chunk_mb": 0,
+   "seq_seen": 35000,
+   "full_tokens": 1048576,
+   "points": {
+    "17": {
+     "seq": 65536,
+     "per_row": 340992,
+     "free": 10308550656,
+     "rows": 16384
+    },
+    "20": {
+     "seq": 540672,
+     "per_row": 335104,
+     "free": 9782165504,
+     "rows": 16384
+    },
+    "16": {
+     "seq": 35000,
+     "per_row": 459662,
+     "free": 10048503808,
+     "rows": 18432
+    },
+    "13": {
+     "seq": 4609,
+     "per_row": 669778,
+     "free": 10086252544,
+     "rows": 4609
+    },
+    "18": {
+     "seq": 131072,
+     "per_row": 329081,
+     "free": 9826205696,
+     "rows": 19456
+    },
+    "15": {
+     "seq": 16384,
+     "per_row": 503040,
+     "free": 9935257600,
+     "rows": 16384
+    },
+    "14": {
+     "seq": 12288,
+     "per_row": 359936,
+     "free": 10220470272,
+     "rows": 12288
+    }
+   }
+  }
+ ]
+}
