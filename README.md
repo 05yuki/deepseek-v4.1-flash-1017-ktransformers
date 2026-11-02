@@ -128,6 +128,12 @@ pages on the GPU. If the server runs out of memory at launch, a shorter context
   - `vm.min_free_kbytes = 8388608`. Without it, the CUDA JIT can hit a node-local OOM
     while the experts fill the nodes.
   - Swap off.
+- **In a container.** The host settings above are set on the host. The recipe was tested in
+  Docker on plain Ubuntu 24.04 and 26.04 images with the NVIDIA Container Toolkit, run as
+  `docker run --gpus all --network host --shm-size 32g --ulimit memlock=-1 --cap-add SYS_NICE`.
+  `--cap-add SYS_NICE` is required: Docker's default seccomp profile refuses NUMA memory-policy
+  calls such as `set_mempolicy` without it. With a prebuilt archive, the image needs only git,
+  curl, ca-certificates, gcc/g++, `libnuma1`, `libgomp1` and uv.
 
 ## What setup.sh does
 
