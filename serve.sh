@@ -34,6 +34,8 @@ port="${SGLANG_PORT:-8080}"
 log_root="$here/logs"
 alias_name="${SGLANG_SERVED_NAME:-$(basename "$model")}"
 [[ -x "$python" ]] || { echo "run ./setup.sh first (.venv missing)" >&2; exit 3; }
+# the venv first on PATH: the helpers in lib/ run python3, and a machine may have no other
+export PATH="$venv/bin:$PATH"
 [[ -f "$source_dir/sglang/srt/layers/engram.py" ]] || { echo "run ./setup.sh first (patched SGLang missing)" >&2; exit 3; }
 [[ -f "$adapter_dir/librow_store.so" ]] || { echo "run ./setup.sh first (engram-adapter/librow_store.so missing)" >&2; exit 3; }
 # the tier setup.sh applied (an empty marker, from before tiers, is the full tree)
@@ -374,7 +376,7 @@ if [[ -x "$here/build/cuda-home/bin/nvcc" ]]; then
   source "$here/lib/cuda-home.sh"
   [[ -z "$(cuda_home_unusable "$CUDA_HOME")" ]] || export CUDA_HOME="$here/build/cuda-home"
 fi
-export PATH="$CUDA_HOME/bin:$venv/bin:$PATH"
+export PATH="$CUDA_HOME/bin:$PATH"
 # compiled-kernel caches kept in this checkout: another checkout's torch builds
 # do not match, and two of them sharing a directory wait on each other's locks
 export SGLANG_CACHE_DIR="${SGLANG_CACHE_DIR:-$here/.cache/sglang}"

@@ -261,6 +261,8 @@ EOF
 }
 
 kt_lend_auto() {
+  # without python3 every hint read fails and the calibration would end at chunk 2048 unnoticed
+  command -v python3 >/dev/null || { echo "kt-lend: python3 is not on PATH" >&2; return 5; }
   _kt_lend_auto_core "$@" || return $?
   [[ -n "${!2:-}" ]] || _kt_lend_kv_guard
 }
