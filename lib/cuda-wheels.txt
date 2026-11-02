@@ -1,0 +1,9 @@
+# A CUDA 13.1 toolkit from NVIDIA's pip wheels, installed by lib/cuda-home.sh into build/cuda-wheels (not
+# into the venv: torch's cuda-toolkit[cudart] pins the venv's nvidia-cuda-runtime to 13.0.96, and nvcc, its
+# crt headers and cicc must all be of one minor version for cccl's header check and for glibc 2.43). The
+# kernels compiled with it run on the venv's 13.0 runtime, as they do with a system 13.1 toolkit.
+nvidia-cuda-nvcc==13.1.115
+nvidia-cuda-crt==13.1.115
+nvidia-nvvm==13.1.115
+nvidia-cuda-runtime==13.1.80
+nvidia-cuda-cccl==13.3.4.3.1

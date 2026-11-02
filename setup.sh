@@ -19,9 +19,9 @@
 # some of them, comma-separated (e.g. fp8-decode,engram-row-prefetch), or none; default all. A feature's
 # prerequisites (patches/sglang-tier1/requires.txt) must be picked too.
 # Needs: git, a C/C++ compiler, the CUDA toolkit (CUDA_HOME, default /usr/local/cuda;
-# built and run here with 13.1; without one the venv's own wheels serve as CUDA_HOME through
-# lib/cuda-home.sh, enough for the run-time JITs and the small builds but not for kt-kernel's
-# CMake build), libnuma and hwloc headers (Debian/Ubuntu: libnuma-dev libhwloc-dev), and either
+# built and run here with 13.1; without one, NVIDIA's toolkit wheels are installed under build/
+# and serve as CUDA_HOME through lib/cuda-home.sh, enough for the run-time JITs and the small
+# builds but not for kt-kernel's CMake build), libnuma and hwloc headers (Debian/Ubuntu: libnuma-dev libhwloc-dev), and either
 # uv or python3.12. Re-running skips the finished steps.
 # PREBUILT=<archive or directory from tools/prebuilt-pack.sh>: installs its kt-kernel wheel (every CPU
 # variant), MMQ extension (one file a GPU arch), kv-vmm, engram row store and hwloc instead of building
@@ -157,15 +157,30 @@ if [[ ! -f .venv/.requirements-done ]] || [[ requirements.txt -nt .venv/.require
   fi
   touch .venv/.requirements-done
 fi
-# no toolkit on this machine: the venv's own (nvidia-cuda-nvcc and its neighbours under nvidia/cu13,
-# pinned by requirements.txt) builds the small pieces and serves the runtime JITs; kt-kernel's CMake
+# no toolkit on this machine: NVIDIA's toolkit wheels (lib/cuda-wheels.txt, into build/cuda-wheels,
+# assembled as build/cuda-home) build the small pieces and serve the runtime JITs; kt-kernel's CMake
 # build still wants a system toolkit (use PREBUILT= without one)
-if [[ ! -x "$CUDA_HOME/bin/nvcc" ]]; then
+# A system toolkit is used when it is CUDA 13 (torch's cu130 build refuses another major). Without
+# one, or with a 12.x one, NVIDIA's toolkit wheels (lib/cuda-wheels.txt, 1.3 GB) go under build/ and
+# serve as CUDA_HOME: nothing outside this directory changes. CUDA_WHEELS=0 forbids that download.
+sys_nvcc=""
+[[ -x "$CUDA_HOME/bin/nvcc" ]] && sys_nvcc="$("$CUDA_HOME/bin/nvcc" --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1)"
+if [[ -n "$sys_nvcc" && "$sys_nvcc" != 13.* ]]; then
+  echo "the system toolkit at $CUDA_HOME is CUDA $sys_nvcc; the pinned torch is built with CUDA 13, so it is not used"
+fi
+if [[ -z "$sys_nvcc" || "$sys_nvcc" != 13.* ]]; then
+  if [[ "${CUDA_WHEELS:-1}" == 0 ]]; then
+    echo "no CUDA 13 toolkit under CUDA_HOME ($CUDA_HOME) and CUDA_WHEELS=0: install one (13.x) or allow the wheels" >&2
+    exit 2
+  fi
   source "$here/lib/cuda-home.sh"
-  pip_cuda="$(cuda_home_from_venv "$here/.venv" "$here/build/cuda-home")"
+  pip_cuda="$(cuda_home_from_wheels "$py" "$here/build")"
   if [[ -n "$pip_cuda" ]]; then
     export CUDA_HOME="$pip_cuda"
-    echo "no nvcc under the system CUDA_HOME: using the venv's $("$pip_cuda/bin/nvcc" --version | tail -1 | sed 's/.*cuda_//; s/,.*//') (build/cuda-home)"
+    echo "CUDA toolkit: NVIDIA's wheels, $("$pip_cuda/bin/nvcc" --version | tail -1 | sed 's/.*cuda_//; s/,.*//'), under build/cuda-home (lib/cuda-wheels.txt)"
+  else
+    echo "no CUDA 13 toolkit under CUDA_HOME and the toolkit wheels could not be installed (lib/cuda-wheels.txt)" >&2
+    exit 2
   fi
 fi
 # the patched SGLang tree (serve.sh also puts it first on PYTHONPATH)

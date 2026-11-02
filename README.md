@@ -112,10 +112,12 @@ pages on the GPU. If the server runs out of memory at launch, a shorter context
     inference, so a 1 TB NVMe drive is the practical choice.
 - **Software.** Linux, bash 4.4 or newer, the CUDA toolkit (built and run with 13.1), git,
   gcc/g++, the libnuma and hwloc headers (`libnuma-dev libhwloc-dev`), and `uv` or Python 3.12.
-  Without a system toolkit, the venv's own (the `nvidia-cuda-nvcc` wheel and its neighbours,
-  CUDA 13.1, pinned in `requirements.txt`) serves the kernels compiled at run time; a prebuilt
+  A system toolkit is used when it is CUDA 13.x (the pinned torch is built with CUDA 13).
+  Without one, setup.sh downloads NVIDIA's toolkit wheels (CUDA 13.1, pinned in
+  `lib/cuda-wheels.txt`, 1.3 GB) into `build/` and the kernels compiled at run time use those;
+  nothing outside the checkout changes, and `CUDA_WHEELS=0` forbids the download. A prebuilt
   archive (`PREBUILT=`, below) takes the place of the builds, so then only gcc/g++, `libnuma1`
-  and `libgomp1` are needed. A system toolkit, if there is one, must be CUDA 13.x.
+  and `libgomp1` are needed.
   The Python packages are pinned in `requirements.txt` (torch 2.14.1 + cu130): the tested
   venv's `pip freeze`, kept whole so that a build repeats it, measurement tools included.
 - **Host settings.** Set these as root, persistently:
@@ -167,7 +169,7 @@ Python versions and every file's SHA-256; setup.sh checks them all. Nothing is b
 the FlashInfer CUTLASS MoE of the MMQ-off path is not built. The kernels SGLang compiles at run time
 (DeepGEMM's indexer logits, FlashInfer's sparse attention, TileLang's mHC, sgl-kernel's and Triton's
 small kernels) are built on the first launch, about nine minutes on an RTX 5070 Ti, with the system
-toolkit or, without one, the venv's own assembled by `lib/cuda-home.sh` into `build/cuda-home`.
+toolkit or, without one, the pip wheels' toolkit assembled by `lib/cuda-home.sh` into `build/cuda-home`.
 The archive is for the pinned torch (`requirements.txt`) and Python 3.12. Only archives built by
 this repository's CI or its maintainers are published; please do not send binaries.
 

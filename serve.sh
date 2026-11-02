@@ -359,12 +359,12 @@ case "$cap" in 9.0|10.0|10.3|12.0|12.1) arch_a="${cap}a" ;; esac
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-$cap+PTX}"
 export FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-$arch_a}"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
-# no toolkit on this machine: the venv's own (the nvidia-cuda-nvcc wheel and its neighbours under
-# nvidia/cu13, pinned by requirements.txt) serves the runtime JITs (DeepGEMM, FlashInfer, TileLang)
-if [[ ! -x "$CUDA_HOME/bin/nvcc" ]]; then
-  source "$here/lib/cuda-home.sh"
-  pip_cuda="$(cuda_home_from_venv "$venv" "$here/build/cuda-home")"
-  [[ -n "$pip_cuda" ]] && export CUDA_HOME="$pip_cuda"
+# no toolkit on this machine: the one setup.sh assembled from NVIDIA's wheels (lib/cuda-home.sh,
+# build/cuda-home) serves the runtime JITs (DeepGEMM, FlashInfer, TileLang, sgl-kernel)
+if [[ -x "$here/build/cuda-home/bin/nvcc" ]]; then
+  sys_nvcc=""
+  [[ -x "$CUDA_HOME/bin/nvcc" ]] && sys_nvcc="$("$CUDA_HOME/bin/nvcc" --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1)"
+  [[ "$sys_nvcc" == 13.* ]] || export CUDA_HOME="$here/build/cuda-home"
 fi
 export PATH="$CUDA_HOME/bin:$venv/bin:$PATH"
 # compiled-kernel caches kept in this checkout: another checkout's torch builds
