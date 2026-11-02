@@ -174,10 +174,10 @@ small kernels) are built on the first launch, about nine minutes on an RTX 5070 
 toolkit or, without one, the pip wheels' toolkit assembled by `lib/cuda-home.sh` into `build/cuda-home`.
 The archive is for the pinned torch (`requirements.txt`) and Python 3.12. The archive for a tag is
 on that tag's [release page](https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers/releases),
-with its SHA-256 beside it; the first is `prebuilt-2026-11-02-1417.tar.gz` (34 MB). From the next tag
-on, GitHub Actions builds the archive (`.github/workflows/prebuilt.yml`, Ubuntu 24.04, no GPU) and
-attaches it to a draft release that a maintainer publishes. Only archives built by this repository's
-CI or its maintainers are published; please do not send binaries.
+with its SHA-256 beside it (34 MB). GitHub Actions builds it from the tag
+(`.github/workflows/prebuilt.yml`, Ubuntu 24.04, no GPU), so it runs on glibc 2.39 and later, and a
+maintainer publishes the release. Only archives built by this repository's CI or its maintainers
+are published; please do not send binaries.
 
 ## What serve.sh does
 
