@@ -125,7 +125,11 @@ os="$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME"), kernel $(uname -r)"
 sw="$("$py" -c 'import platform, torch, flashinfer
 print("Python %s, torch %s (CUDA %s), FlashInfer %s" % (platform.python_version(), torch.__version__, torch.version.cuda, flashinfer.__version__))' 2>/dev/null || echo unknown)"
 # the toolkit the server used: the system's, else the pip wheels' under build/cuda-home (lib/cuda-home.sh), else none
+source "$here/lib/cuda-home.sh"
 nvcc_bin="${CUDA_HOME:-/usr/local/cuda}/bin/nvcc"
+if [[ -x "$here/build/cuda-home/bin/nvcc" && -n "$(cuda_home_unusable "${CUDA_HOME:-/usr/local/cuda}")" ]]; then
+  nvcc_bin="$here/build/cuda-home/bin/nvcc"
+fi
 [[ -x "$nvcc_bin" ]] || nvcc_bin="$here/build/cuda-home/bin/nvcc"
 [[ -x "$nvcc_bin" ]] || nvcc_bin="$(command -v nvcc || true)"
 nvcc="$( { [[ -n "$nvcc_bin" ]] && "$nvcc_bin" --version; } 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1 || true)"

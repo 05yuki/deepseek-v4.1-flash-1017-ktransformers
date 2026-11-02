@@ -113,7 +113,9 @@ pages on the GPU. If the server runs out of memory at launch, a shorter context
 - **Software.** Linux, bash 4.4 or newer, the CUDA toolkit (built and run with 13.1), git,
   gcc/g++, the libnuma and hwloc headers (`libnuma-dev libhwloc-dev`), and `uv` or Python 3.12.
   A system toolkit is used when it is CUDA 13.x (the pinned torch is built with CUDA 13).
-  Without one, setup.sh downloads NVIDIA's toolkit wheels (CUDA 13.1, pinned in
+  With glibc 2.42 or later it must also be 13.2 or newer, or a 13.1 updated since: older
+  headers declare `rsqrt` differently from glibc and every DeepGEMM kernel build fails.
+  Otherwise setup.sh downloads NVIDIA's toolkit wheels (CUDA 13.2, pinned in
   `lib/cuda-wheels.txt`, 1.3 GB) into `build/` and the kernels compiled at run time use those;
   nothing outside the checkout changes, and `CUDA_WHEELS=0` forbids the download. A prebuilt
   archive (`PREBUILT=`, below) takes the place of the builds, so then only gcc/g++, `libnuma1`
