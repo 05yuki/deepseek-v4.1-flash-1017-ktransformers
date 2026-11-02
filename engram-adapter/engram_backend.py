@@ -45,15 +45,15 @@ class Work(C.Structure):
 
 
 def _find_cudart() -> C.CDLL:
-    candidates = []
-    try:
-        import nvidia.cuda_runtime  # type: ignore
-
-        candidates += [
-            str(p) for p in Path(nvidia.cuda_runtime.__file__).parent.glob("lib/libcudart.so*")
-        ]
-    except Exception:
-        pass
+    # torch has the CUDA runtime loaded already: dlopen by soname finds that copy, whatever
+    # its path (no toolkit needed; the CUDA 13 pip wheels keep it under nvidia/cu13/lib)
+    candidates = ["libcudart.so.13", "libcudart.so.12"]
+    for mod in ("nvidia.cu13", "nvidia.cuda_runtime"):
+        try:
+            m = __import__(mod, fromlist=["__file__"])
+            candidates += [str(p) for p in Path(m.__path__[0]).glob("lib/libcudart.so*")]
+        except Exception:
+            pass
     cuda_home = os.environ.get("CUDA_HOME") or "/usr/local/cuda"
     candidates += [str(p) for p in Path(cuda_home).glob("targets/x86_64-linux/lib/libcudart.so*")]
     candidates += [str(p) for p in Path(cuda_home).glob("lib64/libcudart.so*")]

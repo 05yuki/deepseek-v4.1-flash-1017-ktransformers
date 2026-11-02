@@ -248,6 +248,12 @@ export KT_GPU_STREAM_W16="${KT_GPU_STREAM_W16:-1}"
 # tier-1 stream-mmq: the streamed groups' MXFP4 bytes go to llama.cpp's MMQ (int8 mma, the weights exact)
 # instead of a bf16 copy and the bf16 CUTLASS MoE
 has stream-mmq && export KT_GPU_STREAM_MMQ="${KT_GPU_STREAM_MMQ:-1}"
+# setup.sh with PREBUILT=: the MMQ extension built for this GPU's arch is imported from prebuilt/mmq
+# (nothing compiled), and kt-kernel's hwloc comes from prebuilt/lib
+if [[ -d "$here/prebuilt/mmq" ]]; then
+  export KT_GGUF_MOE_MMQ_PREBUILT="${KT_GGUF_MOE_MMQ_PREBUILT:-$here/prebuilt/mmq}"
+  export LD_LIBRARY_PATH="$here/prebuilt/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 export KT_GPU_STREAM_PREFILL="${KT_GPU_STREAM_PREFILL:-512}"
 export KT_GPU_STREAM_GROUP="${KT_GPU_STREAM_GROUP:-4}"
 # A forward of up to 1,024 rows leaves 64 (one GPU) or 32 (more) of a layer's 96 streamed groups to the
@@ -353,6 +359,13 @@ case "$cap" in 9.0|10.0|10.3|12.0|12.1) arch_a="${cap}a" ;; esac
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-$cap+PTX}"
 export FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-$arch_a}"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+# no toolkit on this machine: the venv's own (the nvidia-cuda-nvcc wheel and its neighbours under
+# nvidia/cu13, pinned by requirements.txt) serves the runtime JITs (DeepGEMM, FlashInfer, TileLang)
+if [[ ! -x "$CUDA_HOME/bin/nvcc" ]]; then
+  source "$here/lib/cuda-home.sh"
+  pip_cuda="$(cuda_home_from_venv "$venv" "$here/build/cuda-home")"
+  [[ -n "$pip_cuda" ]] && export CUDA_HOME="$pip_cuda"
+fi
 export PATH="$CUDA_HOME/bin:$venv/bin:$PATH"
 # compiled-kernel caches kept in this checkout: another checkout's torch builds
 # do not match, and two of them sharing a directory wait on each other's locks

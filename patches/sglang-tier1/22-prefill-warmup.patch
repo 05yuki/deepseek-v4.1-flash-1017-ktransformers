@@ -1,4 +1,4 @@
-From c11eca3b797aa390b594bd8996c4677fe25fb777 Mon Sep 17 00:00:00 2001
+From 9647dac4ecbac60fe3310ce27198b06676c958f7 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 2 Nov 2026 10:09:56 +0900
 Subject: [PATCH] warmup: prefill_lengths, one fresh prompt a length before the

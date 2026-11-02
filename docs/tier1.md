@@ -549,6 +549,7 @@ Switches (code / serve.sh):
 
 - `KT_GPU_STREAM_MMQ`: 0 / 1 (needs `KT_GPU_STREAM_ZEROCOPY=1` and `KT_GPU_STREAM_W16=1`, the defaults)
 - `KT_GPU_STREAM_MMQ_ROUTES`: 8192 (a group's routes through the kernels at a time)
+- `KT_GGUF_MOE_MMQ_PREBUILT`: unset / `prebuilt/mmq` when setup.sh installed a prebuilt archive (a built `kt_gguf_moe_mmq_<arch>.so` is imported from there, nothing compiled)
 
 Prerequisites: `stream-prefill`.
 

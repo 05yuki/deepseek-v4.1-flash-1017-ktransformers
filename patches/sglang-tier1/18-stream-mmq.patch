@@ -1,4 +1,4 @@
-From 765ae035f32440cfa33b8ea04bf091b2fe6b70f1 Mon Sep 17 00:00:00 2001
+From 02d774f3fadcc6d544a7e5b0ce4132e115036030 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Wed, 28 Oct 2026 16:00:40 +0900
 Subject: [PATCH] stream-mmq: the streamed experts through llama.cpp's MMQ, the
@@ -39,10 +39,16 @@ instance) and checks every file against patches/llama-mmq.sha256, so the extensi
 
 Prerequisites: stream-prefill.
 
+KT_GGUF_MOE_MMQ_PREBUILT=<dir>: a built kt_gguf_moe_mmq_<arch>.so is
+imported from there (one file a GPU arch, built by `python
+kt_gguf_moe_mmq.py` with KT_GGUF_MOE_MMQ_ARCH on a machine with the
+toolkit) and nothing is compiled; without one for this arch the JIT build
+runs as before.
+
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
 ---
- .../sglang/srt/layers/moe/kt_gguf_moe_mmq.py  | 105 ++++++
+ .../sglang/srt/layers/moe/kt_gguf_moe_mmq.py  | 128 +++++++
  .../srt/layers/moe/kt_gguf_moe_mmq/SOURCES    |  50 +++
  .../moe/kt_gguf_moe_mmq/kt_gguf_moe_mmq.cu    | 284 ++++++++++++++++
  .../kt_gguf_moe_mmq/kt_gguf_moe_mmq_bind.cpp  |  16 +
@@ -53,7 +59,7 @@ Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
  .../llama_mmq/quantize_mmq_q8_1.cu            | 311 ++++++++++++++++++
  .../kt_gguf_moe_mmq/llama_mmq/sgl_llama_mmq.h | 112 +++++++
  .../srt/layers/moe/kt_stream_prefill.py       | 162 ++++++++-
- 11 files changed, 1618 insertions(+), 3 deletions(-)
+ 11 files changed, 1641 insertions(+), 3 deletions(-)
  create mode 100644 python/sglang/srt/layers/moe/kt_gguf_moe_mmq.py
  create mode 100644 python/sglang/srt/layers/moe/kt_gguf_moe_mmq/SOURCES
  create mode 100644 python/sglang/srt/layers/moe/kt_gguf_moe_mmq/kt_gguf_moe_mmq.cu
@@ -67,10 +73,10 @@ Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
 
 diff --git a/python/sglang/srt/layers/moe/kt_gguf_moe_mmq.py b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq.py
 new file mode 100644
-index 00000000..0e93edf7
+index 00000000..1b3e22dc
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq.py
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,128 @@
 +"""llama.cpp's int8-mma matmul on raw GGUF blocks (MMQ) as a small torch extension next to sgl-kernel (which it
 +does not replace): MUL_MAT_ID for the GGUF experts (Q2_0, Q8_0, IQ2_XXS, IQ2_XS, IQ1_S, IQ1_M) and the MXFP4 checkpoint's streamed
 +experts (MXFP4, regrouped into ggml blocks by kt_stream_prefill.py), and the plain MUL_MAT for the dense layers'
@@ -111,6 +117,10 @@ index 00000000..0e93edf7
 +
 +ARCH = os.environ.get("KT_GGUF_MOE_MMQ_ARCH") or _arch()
 +_ext = None
++# KT_GGUF_MOE_MMQ_PREBUILT=<dir>: a built kt_gguf_moe_mmq_<arch>.so is imported from there (one file an
++# arch, built by `python kt_gguf_moe_mmq.py` with KT_GGUF_MOE_MMQ_ARCH on a machine with the toolkit) and
++# nothing is compiled; without one for this arch the JIT build below runs as before
++PREBUILT = os.environ.get("KT_GGUF_MOE_MMQ_PREBUILT", "")
 +
 +FLAGS = [
 +    "-O3", "-DNDEBUG", "-use_fast_math", "--expt-relaxed-constexpr", "--expt-extended-lambda",
@@ -121,8 +131,27 @@ index 00000000..0e93edf7
 +]
 +
 +
++def _prebuilt():
++    """The prebuilt extension module for this arch, or None."""
++    if not PREBUILT:
++        return None
++    name = f"kt_gguf_moe_mmq_{ARCH}"
++    so = Path(PREBUILT) / f"{name}.so"
++    if not so.is_file():
++        return None
++    import importlib.util
++    from importlib.machinery import ExtensionFileLoader
++
++    spec = importlib.util.spec_from_file_location(name, str(so), loader=ExtensionFileLoader(name, str(so)))
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++
 +def _load():
 +    global _ext
++    if _ext is None:
++        _ext = _prebuilt()
 +    if _ext is None:
 +        from torch.utils.cpp_extension import load
 +
@@ -174,7 +203,7 @@ index 00000000..0e93edf7
 +
 +if __name__ == "__main__":
 +    m = _load()
-+    print("built", m.__file__, "tail Q2_0 K=640:", m.ggml_moe_mmq_tail_bytes(42, 640),
++    print("prebuilt" if PREBUILT and _prebuilt() is not None else "built", m.__file__, "tail Q2_0 K=640:", m.ggml_moe_mmq_tail_bytes(42, 640),
 +          "K=320:", m.ggml_moe_mmq_tail_bytes(42, 320), "K=2560:", m.ggml_moe_mmq_tail_bytes(42, 2560))
 diff --git a/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/SOURCES b/python/sglang/srt/layers/moe/kt_gguf_moe_mmq/SOURCES
 new file mode 100644

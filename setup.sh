@@ -19,8 +19,14 @@
 # some of them, comma-separated (e.g. fp8-decode,engram-row-prefetch), or none; default all. A feature's
 # prerequisites (patches/sglang-tier1/requires.txt) must be picked too.
 # Needs: git, a C/C++ compiler, the CUDA toolkit (CUDA_HOME, default /usr/local/cuda;
-# built and run here with 13.1), libnuma and hwloc headers (Debian/Ubuntu: libnuma-dev
-# libhwloc-dev), and either uv or python3.12. Re-running skips the finished steps.
+# built and run here with 13.1; without one the venv's own wheels serve as CUDA_HOME through
+# lib/cuda-home.sh, enough for the run-time JITs and the small builds but not for kt-kernel's
+# CMake build), libnuma and hwloc headers (Debian/Ubuntu: libnuma-dev libhwloc-dev), and either
+# uv or python3.12. Re-running skips the finished steps.
+# PREBUILT=<archive or directory from tools/prebuilt-pack.sh>: installs its kt-kernel wheel (every CPU
+# variant), MMQ extension (one file a GPU arch), kv-vmm, engram row store and hwloc instead of building
+# them; no compiler or CUDA toolkit is needed then (the FlashInfer CUTLASS MoE of the MMQ-off path is
+# not built either). Every file is checked against the archive's manifest.json.
 # Knobs: CUDA_HOME; KT_CUDA_ARCHS (default: the visible GPUs' compute capability);
 # CPUINFER_CPU_INSTRUCT (kt-kernel's CPU target, default NATIVE: this machine's ISA);
 # CMAKE_ARGS (extra CMake flags for kt-kernel, space separated); headers and libraries
@@ -151,15 +157,61 @@ if [[ ! -f .venv/.requirements-done ]] || [[ requirements.txt -nt .venv/.require
   fi
   touch .venv/.requirements-done
 fi
+# no toolkit on this machine: the venv's own (nvidia-cuda-nvcc and its neighbours under nvidia/cu13,
+# pinned by requirements.txt) builds the small pieces and serves the runtime JITs; kt-kernel's CMake
+# build still wants a system toolkit (use PREBUILT= without one)
+if [[ ! -x "$CUDA_HOME/bin/nvcc" ]]; then
+  source "$here/lib/cuda-home.sh"
+  pip_cuda="$(cuda_home_from_venv "$here/.venv" "$here/build/cuda-home")"
+  if [[ -n "$pip_cuda" ]]; then
+    export CUDA_HOME="$pip_cuda"
+    echo "no nvcc under the system CUDA_HOME: using the venv's $("$pip_cuda/bin/nvcc" --version | tail -1 | sed 's/.*cuda_//; s/,.*//') (build/cuda-home)"
+  fi
+fi
 # the patched SGLang tree (serve.sh also puts it first on PYTHONPATH)
 if ! "$py" -c "import sglang, sys; sys.exit(0 if sglang.__file__.startswith('$here/third_party/sglang') else 1)" 2>/dev/null; then
   # the Rust extensions (router, gRPC) are not used here and would need cargo
   SGLANG_BUILD_RUST_EXTS=none pip_install --no-deps -e third_party/sglang/python
 fi
 
+prebuilt=""
+if [[ -n "${PREBUILT:-}" ]]; then
+  step "prebuilt pieces from $PREBUILT"
+  if [[ -d "$PREBUILT" ]]; then
+    [[ "$(cd "$PREBUILT" && pwd)" == "$here/prebuilt" ]] || { rm -rf prebuilt; cp -a "$PREBUILT" prebuilt; }
+  else
+    rm -rf prebuilt build/prebuilt-unpack; mkdir -p build/prebuilt-unpack
+    tar -xzf "$PREBUILT" -C build/prebuilt-unpack
+    mv "$(ls -d build/prebuilt-unpack/*/ | head -1)" prebuilt; rmdir build/prebuilt-unpack
+  fi
+  "$py" - "$here/prebuilt" <<'PY'
+import hashlib, json, os, platform, sys
+d = sys.argv[1]; m = json.load(open(os.path.join(d, "manifest.json")))
+bad = [f for f, h in m["files"].items() if hashlib.sha256(open(os.path.join(d, f), "rb").read()).hexdigest() != h]
+if bad:
+    sys.exit("prebuilt files do not match manifest.json: " + ", ".join(bad))
+want = [l.split("==")[1].strip() for l in open("requirements.txt") if l.startswith("torch==")][0]
+if m["torch"] != want:
+    sys.exit(f"prebuilt is for torch {m['torch']}, requirements.txt pins {want}")
+if platform.python_version().rsplit(".", 1)[0] != m["python"].rsplit(".", 1)[0]:
+    sys.exit(f"prebuilt is for Python {m['python']}, this is {platform.python_version()}")
+print(f"recipe {m['recipe']}, torch {m['torch']}, CUDA {m['cuda']}, GPU archs {' '.join(m['gpu_archs'])}, "
+      f"{len(m['files'])} files verified")
+PY
+  prebuilt="$here/prebuilt"
+fi
+
 step "kt-kernel (CPU experts)"
 site="$("$py" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-if ! built_as build/.kt-kernel-done "$kt_variant"; then
+if [[ -n "$prebuilt" ]]; then
+  kt_variant="prebuilt $(sha256sum "$prebuilt"/kt_kernel-*.whl | cut -c1-12)"
+fi
+if [[ -n "$prebuilt" ]] && ! built_as build/.kt-kernel-done "$kt_variant"; then
+  echo "the archive's wheel: $(basename "$prebuilt"/kt_kernel-*.whl) (every CPU variant, picked at import)"
+  pip_install --no-deps "$prebuilt"/kt_kernel-*.whl
+  "$py" patches/kt-kernel-load-prefetch.py "$site"
+  echo "$kt_variant" > build/.kt-kernel-done
+elif ! built_as build/.kt-kernel-done "$kt_variant"; then
   if [[ -z "${KT_CUDA_ARCHS:-}" ]] && command -v nvidia-smi >/dev/null; then
     KT_CUDA_ARCHS="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d . | sort -u | paste -sd';')"
   fi
@@ -179,7 +231,7 @@ fi
 # compile on the first long prompt, while the expert arenas fill the NUMA nodes, and a node-local OOM
 # kills the scheduler before the build finishes; so it is built here, once per FlashInfer version and
 # GPU arch, into the cache serve.sh uses.
-if (( TIER >= 1 )) && [[ " ${features[*]} " == *" stream-prefill "* ]] && command -v nvidia-smi >/dev/null; then
+if (( TIER >= 1 )) && [[ " ${features[*]} " == *" stream-prefill "* ]] && [[ -z "$prebuilt" ]] && command -v nvidia-smi >/dev/null; then
   cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1)"
   fi_backend="${cap/./}"
   case "$cap" in 9.0|10.0|10.3|12.0|12.1) fi_arch="${cap}a" ;; *) fi_arch="$cap" ;; esac
@@ -192,7 +244,15 @@ fi
 
 # The streamed prefill's MMQ (tier-1 stream-mmq): llama.cpp's kernels as a torch extension, built here once for
 # the GPU's arch into the cache serve.sh uses, not inside the server on the first long prompt
-if (( TIER >= 1 )) && [[ " ${features[*]} " == *" stream-mmq "* ]] && command -v nvidia-smi >/dev/null; then
+mmq_arch=""
+if [[ -n "$prebuilt" ]] && command -v nvidia-smi >/dev/null; then
+  cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1)"
+  case "$cap" in 9.0|10.0|10.3|12.0|12.1) mmq_arch="${cap/./}a" ;; *) mmq_arch="${cap/./}" ;; esac
+fi
+if (( TIER >= 1 )) && [[ " ${features[*]} " == *" stream-mmq "* ]] && [[ -n "$mmq_arch" && -f "$prebuilt/mmq/kt_gguf_moe_mmq_$mmq_arch.so" ]]; then
+  step "MMQ kernels for the streamed prefill: prebuilt/mmq/kt_gguf_moe_mmq_$mmq_arch.so"
+elif (( TIER >= 1 )) && [[ " ${features[*]} " == *" stream-mmq "* ]] && command -v nvidia-smi >/dev/null; then
+  [[ -n "$prebuilt" ]] && echo "the archive has no MMQ build for sm $cap ($mmq_arch); building it needs the CUDA toolkit"
   step "MMQ kernels for the streamed prefill (kt_gguf_moe_mmq)"
   TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$here/.cache/torch_extensions}" MAX_JOBS="${MAX_JOBS:-16}" \
   PATH="$CUDA_HOME/bin:$here/.venv/bin:$PATH" PYTHONPATH="$here/third_party/sglang/python" \
@@ -200,12 +260,17 @@ if (( TIER >= 1 )) && [[ " ${features[*]} " == *" stream-mmq "* ]] && command -v
 fi
 
 step "engram row store (engram-adapter/librow_store.so)"
-if [[ ! -f engram-adapter/librow_store.so || engram-adapter/row_store.cpp -nt engram-adapter/librow_store.so ]]; then
+if [[ -n "$prebuilt" ]]; then
+  cp "$prebuilt/lib/librow_store.so" engram-adapter/librow_store.so
+elif [[ ! -f engram-adapter/librow_store.so || engram-adapter/row_store.cpp -nt engram-adapter/librow_store.so ]]; then
   g++ -O2 -std=c++17 -shared -fPIC -pthread engram-adapter/row_store.cpp -o engram-adapter/librow_store.so
 fi
 
 step "kv-vmm (build/libkv_vmm.so)"
-if [[ ! -f build/libkv_vmm.so || kv-vmm/kv_vmm.c -nt build/libkv_vmm.so ]]; then
+if [[ -n "$prebuilt" ]]; then
+  cp "$prebuilt/lib/libkv_vmm.so" build/libkv_vmm.so
+elif [[ ! -f build/libkv_vmm.so || kv-vmm/kv_vmm.c -nt build/libkv_vmm.so ]]; then
+  # the driver API: the toolkit's stub, or the driver's own library where there is no toolkit
   gcc -O2 -Wall -shared -fPIC kv-vmm/kv_vmm.c -I"$CUDA_HOME/include" -L"$CUDA_HOME/lib64/stubs" -lcuda -o build/libkv_vmm.so
 fi
 # the KV pool module looks for the library beside itself first
