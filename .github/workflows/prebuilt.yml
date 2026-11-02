@@ -1,0 +1,102 @@
+name: prebuilt archive
+
+# Builds the prebuilt archive (tools/prebuilt-pack.sh) on GitHub's Ubuntu 24.04 runners, no GPU:
+# the kt-kernel wheel with every CPU variant and the two small libraries in one job, the MMQ
+# extension in one job a GPU arch, then the manifest and the archive. On a tag it is attached to a
+# draft release of that tag, which a maintainer publishes; an existing published release is never
+# changed. On workflow_dispatch the archive is a workflow artifact only.
+on:
+  push:
+    tags:
+      - "20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9]"
+  workflow_dispatch:
+
+env:
+  CUDA_HOME: /usr/local/cuda-13.1
+  MAX_JOBS: "4"
+
+jobs:
+  wheel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/prebuilt-host
+      - name: kt-kernel wheel (six CPU variants), hwloc, kv-vmm, row store
+        run: PREBUILT_STEPS="wheel libs" tools/prebuilt-pack.sh build/pieces
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-libs
+          path: build/pieces
+          if-no-files-found: error
+
+  mmq:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ["89", "90a", "100a", "120a"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/prebuilt-host
+      - name: MMQ extension for sm ${{ matrix.arch }}
+        run: PREBUILT_STEPS=mmq PREBUILT_GPU_ARCHS="${{ matrix.arch }}" tools/prebuilt-pack.sh build/pieces
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mmq-${{ matrix.arch }}
+          path: build/pieces/mmq
+          if-no-files-found: error
+
+  archive:
+    needs: [wheel, mmq]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: name
+        id: name
+        run: echo "tag=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-libs
+          path: build/prebuilt-${{ steps.name.outputs.tag }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mmq-*
+          merge-multiple: true
+          path: build/prebuilt-${{ steps.name.outputs.tag }}/mmq
+      - name: manifest and archive
+        run: |
+          PREBUILT_STEPS=manifest tools/prebuilt-pack.sh "build/prebuilt-${{ steps.name.outputs.tag }}"
+          ls -l build/prebuilt-*.tar.gz*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-${{ steps.name.outputs.tag }}
+          path: |
+            build/prebuilt-*.tar.gz
+            build/prebuilt-*.tar.gz.sha256
+          if-no-files-found: error
+      - name: attach to a draft release of the tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd build
+          if draft="$(gh release view "$TAG" --json isDraft -q .isDraft 2>/dev/null)"; then
+            if [[ "$draft" != true ]]; then
+              echo "release $TAG is published; not changed (the archive is this run's artifact)"; exit 0
+            fi
+          else
+            gh release create "$TAG" --draft --verify-tag --title "$TAG" \
+              --notes "Prebuilt archive for recipe $TAG, built by GitHub Actions (prebuilt.yml). Notes to come."
+          fi
+          gh release upload "$TAG" --clobber prebuilt-"$TAG".tar.gz prebuilt-"$TAG".tar.gz.sha256

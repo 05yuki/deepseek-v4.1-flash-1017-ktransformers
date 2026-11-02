@@ -27,6 +27,7 @@
 # variant), MMQ extension (one file a GPU arch), kv-vmm, engram row store and hwloc instead of building
 # them; no compiler or CUDA toolkit is needed then (the FlashInfer CUTLASS MoE of the MMQ-off path is
 # not built either). Every file is checked against the archive's manifest.json.
+# PREPARE_ONLY=1 stops after the trees, the venv and the toolkit choice (for tools/prebuilt-pack.sh).
 # Knobs: CUDA_HOME; KT_CUDA_ARCHS (default: the visible GPUs' compute capability);
 # CPUINFER_CPU_INSTRUCT (kt-kernel's CPU target, default NATIVE: this machine's ISA);
 # CMAKE_ARGS (extra CMake flags for kt-kernel, space separated); headers and libraries
@@ -187,6 +188,12 @@ fi
 if ! "$py" -c "import sglang, sys; sys.exit(0 if sglang.__file__.startswith('$here/third_party/sglang') else 1)" 2>/dev/null; then
   # the Rust extensions (router, gRPC) are not used here and would need cargo
   SGLANG_BUILD_RUST_EXTS=none pip_install --no-deps -e third_party/sglang/python
+fi
+
+# PREPARE_ONLY=1: the trees, the venv and the toolkit choice, no build (tools/prebuilt-pack.sh builds
+# from here; .github/workflows/prebuilt.yml)
+if [[ "${PREPARE_ONLY:-0}" == 1 ]]; then
+  echo; echo "PREPARE_ONLY=1: trees and venv ready, nothing built"; exit 0
 fi
 
 prebuilt=""
