@@ -88,6 +88,28 @@ class Client:
             "meta": meta, "response": final}
 
 
+def server_diagnostics(info):
+    # Server info can contain API/admin keys and other private configuration.
+    # Save only known diagnostic fields, never arbitrary nested configuration.
+    fields = (
+        "version", "model_path", "served_model_name", "context_length", "dtype",
+        "quantization", "kv_cache_dtype", "tp_size", "max_running_requests",
+        "max_queued_requests", "max_total_tokens", "max_total_num_tokens",
+        "chunked_prefill_size", "max_prefill_tokens", "page_size", "swa_full_tokens_ratio",
+        "disable_radix_cache", "enable_hierarchical_cache", "hicache_write_policy",
+        "hicache_ratio", "hicache_size", "hicache_io_backend", "hicache_mem_layout",
+    )
+
+    def select(config):
+        return {key: config[key] for key in fields if key in config
+                and isinstance(config[key], (str, int, float, bool, type(None)))}
+
+    result = select(info)
+    if isinstance(info.get("server_args"), dict):
+        result["server_args"] = select(info["server_args"])
+    return result
+
+
 def answer(text):
     text = text.rsplit("</think>", 1)[-1].strip()
     if text.startswith("```") and text.endswith("```"):
@@ -309,7 +331,7 @@ def main():
     client = Client(args.url, args.api_key)
     try:
         info = client.query("/get_server_info")
-        (args.output/"server.json").write_text(json.dumps(info,indent=2)+"\n")
+        (args.output/"server.json").write_text(json.dumps(server_diagnostics(info),indent=2)+"\n")
         if args.fixtures:
             fixtures = json.loads(args.fixtures.read_text())
         else:

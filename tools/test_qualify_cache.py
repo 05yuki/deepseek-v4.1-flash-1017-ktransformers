@@ -1,9 +1,12 @@
 """CPU-only checks for reproducible histories and qualification failure detection."""
+import copy
+import hashlib
 import importlib.util
 import io
 import itertools
 import json
 from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -46,6 +49,40 @@ class HistoriesTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             q.check_facts(r,{"fixed_in":"new"})
         q.check_facts(r,{"fixed_in":"old"})
+
+
+class ArtifactsTest(unittest.TestCase):
+    def test_diagnostics_allowlist_excludes_unknown_and_nested_configuration(self):
+        info = {"context_length": 1048576, "api_key": "server-secret",
+            "admin_api_key": "admin-secret", "future_credential": "future-secret",
+            "dtype": {"secret": "nested-secret"},
+            "server_args": {"max_running_requests": 4, "api_key": "nested-api-secret",
+                "admin_api_key": "nested-admin-secret", "storage": {"password": "password-secret"}},
+            "internal_states": [{"api_key": "worker-secret"}]}
+        original = copy.deepcopy(info)
+        self.assertEqual(q.server_diagnostics(info), {
+            "context_length": 1048576, "server_args": {"max_running_requests": 4}})
+        self.assertEqual(info, original)
+
+    def test_prepare_artifacts_do_not_contain_client_or_server_credentials(self):
+        secrets = ("client-secret", "server-secret", "admin-secret", "future-secret")
+        info = {"context_length": 1048576, "max_running_requests": 4,
+            "api_key": secrets[1], "admin_api_key": secrets[2], "future_credential": secrets[3]}
+        item = {"ids": [1, 2, 3], "sha256": hashlib.sha256(json.dumps([1, 2, 3]).encode()).hexdigest()}
+        fixtures = {"sessions": [item], "updated": item, "timed": [item], "pressure": item}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, output = root/"fixtures.json", root/"output"
+            source.write_text(json.dumps(fixtures))
+            with patch("sys.argv", ["qualify-cache.py", "--prepare-only",
+                    "--fixtures", str(source), "--output", str(output), "--api-key", secrets[0]]), \
+                 patch.object(q.Client, "query", return_value=info):
+                q.main()
+            self.assertEqual(json.loads((output/"server.json").read_text()), {
+                "context_length": 1048576, "max_running_requests": 4})
+            for artifact in output.iterdir():
+                for secret in secrets:
+                    self.assertNotIn(secret, artifact.read_text(), artifact.name)
 
 
 class StreamTest(unittest.TestCase):

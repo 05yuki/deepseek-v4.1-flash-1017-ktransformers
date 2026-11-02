@@ -453,13 +453,14 @@ with a synthetic tool-call/result exchange; generated calls are never executed. 
 is enabled by default. `--flush-cache` additionally tests cache clearing after decode,
 followed by that short tool exchange. It clears the server's entire prefix cache.
 
-The output directory contains fixtures and their hashes, server configuration, complete
-responses, token-arrival times, cache-hit details and a summary. First-token latency and
-first-to-last-token decode throughput are reported separately. Wrong or stale facts,
+The output directory contains fixtures and their hashes, allowlisted serving configuration,
+complete responses, token-arrival times, cache-hit details and a summary. First-token latency
+and first-to-last-token decode throughput are reported separately. Wrong or stale facts,
 retractions, incomplete streams and non-overlapping concurrent generations fail the run.
 `--require-host-hit` additionally requires observed host-cache reuse; omit it for a
 device-only control. These synthetic checks qualify the exercised cache paths, not general
 model quality or arbitrary workloads. API authentication uses `SGLANG_API_KEY` when set.
+Server snapshots omit credentials and arbitrary nested configuration.
 
 CPU-only checks for the generator and response validation:
 
