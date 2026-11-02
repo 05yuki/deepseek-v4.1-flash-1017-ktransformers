@@ -1,0 +1,62 @@
+From c11eca3b797aa390b594bd8996c4677fe25fb777 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Mon, 2 Nov 2026 10:09:56 +0900
+Subject: [PATCH] warmup: prefill_lengths, one fresh prompt a length before the
+ server reports ready
+
+--warmups prefill_lengths runs one fresh random prompt of each length in
+SGLANG_WARMUP_PREFILL_LENGTHS (comma separated) before "The server is
+fired up", with the custom warmups.
+
+cuModuleLoadData synchronizes the context: the first launch of a Triton
+kernel variant (Triton specializes on the row count's divisibility by 16,
+and the mHC kernels pick tiles by row count) loads its cubin and waits for
+every stream to drain, as does a CUDA kernel loaded lazily at its first
+launch. A streamed hybrid prefill keeps a deep queue (PCIe expert copies,
+the MoE GEMMs, the engram row lookups as host callbacks), so the first
+request of a launch paid those drains inside its forward: on one RTX 5070
+Ti a 1,024-token prompt took 6.1 s instead of 4.4 s, and the first
+35,000-token prompt 37.4 s instead of 33.3 s (6.9 s in one load of the
+mix-stats kernel's 32-row tile, behind a 12,288-row chunk's engram
+lookup). The cubins are in Triton's cache; the load itself takes no time
+with an idle GPU.
+
+With 1024,12288: a first 1,024-token prompt 4.39 s, a first 35,000-token
+prompt 33.49 s (the second 33.34 s); the server is ready 20 s later.
+---
+ python/sglang/srt/entrypoints/warmup.py | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/python/sglang/srt/entrypoints/warmup.py b/python/sglang/srt/entrypoints/warmup.py
+index 2608621f..df5510e3 100644
+--- a/python/sglang/srt/entrypoints/warmup.py
++++ b/python/sglang/srt/entrypoints/warmup.py
+@@ -159,3 +159,28 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
+             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
+ 
+         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
++
++
++@warmup("prefill_lengths")
++async def prefill_lengths(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
++    """One fresh prompt of each length in SGLANG_WARMUP_PREFILL_LENGTHS (comma
++    separated), before the server reports ready: the first prefill of a
++    launch loads every kernel variant its row count selects and allocates the
++    staging a streamed prefill keeps, which otherwise lands on the first
++    request (seconds on a hybrid CPU/GPU MoE)."""
++    import os
++
++    lengths = [
++        int(x) for x in os.environ.get("SGLANG_WARMUP_PREFILL_LENGTHS", "").split(",") if x.strip()
++    ]
++    rng = np.random.default_rng(0)
++    for size in lengths:
++        logger.info("Warmup prefill of %d tokens", size)
++        generate_req_input = GenerateReqInput(
++            input_ids=rng.integers(1000, 2**16, size=[size]).tolist(),
++            sampling_params={"max_new_tokens": 1, "temperature": 0.0},
++        )
++        if disaggregation_mode != "null":
++            generate_req_input.bootstrap_room = 0
++            generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
++        await tokenizer_manager.generate_request(generate_req_input, None).__anext__()

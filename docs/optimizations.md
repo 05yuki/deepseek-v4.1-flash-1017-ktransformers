@@ -28,6 +28,7 @@ read 75 GB/s of the 118 GB/s the socket streams, 83 GB/s after the decode reads.
 
 | change | before → after | release |
 |---|---|---|
+| One warmup prompt a length before the server is ready (`--warmups prefill_lengths`, `SGLANG_WARMUP_PREFILL_LENGTHS`): the first launch of each kernel variant drains the GPU queue (`cuModuleLoadData` synchronizes), which the first request of a launch paid | first 1K prompt 6.1 → 4.4 s, first 35K 37.4 → 33.5 s | 11-02 |
 | Engram rows read through a 16-thread I/O pool instead of two serial `pread`s per miss (`engram-adapter`) | a fetch 4 → 1 ms; decode +8% | earlier |
 | The dense FP8 GEMMs at one row: split-K tiling instead of Triton's default (`SGLANG_FP8_SKINNY`) | 38 → 8.7 ms a token; decode +40% | earlier |
 | (both together) | 11-12 → 18 tok/s | earlier |

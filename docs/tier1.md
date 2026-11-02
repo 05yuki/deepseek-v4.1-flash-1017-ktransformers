@@ -7,6 +7,7 @@ was applied.
 
 A patch with no prerequisites applies alone on tier 0. A patch with prerequisites applies on tier 0
 plus those patches (`patches/sglang-tier1/requires.txt`, checked by `setup.sh`). Combinations that
+
 apply: each patch alone, all of them, and all of them but any one (with what needs it); other
 combinations may need `git apply -3`. Served and checked end to end: all of them, none, and each
 set measured in [Effect of each patch](#effect-of-each-patch).
@@ -38,6 +39,7 @@ the code" are on as soon as the patch is applied.
 | 19 | [`19-cpu-gpu-overlap.patch`](#19-cpu-gpu-overlap) | +190 / -2 | `loading`, `placement`, `prefill-lend`, `stream-prefill` |
 | 20 | [`20-expert-cache.patch`](#20-expert-cache) | +200 / -3 | `loading`, `placement`, `prefill-lend`, `stream-prefill`, `kv-vmm`, `kv-lend-plan`, `hot-lend`, `stream-mmq` |
 | 21 | [`21-hicache.patch`](#21-hicache) | +47 / -3 | `kv-vmm`, `prefill-lend`, `kv-lend-plan` |
+| 22 | [`22-prefill-warmup.patch`](#22-prefill-warmup) | +25 / -0 | none |
 
 ## Effect of each patch
 
@@ -705,3 +707,23 @@ Files (under `python/sglang/`):
 
 - `srt/layers/moe/kt_kv_prefill_lend.py`
 - `srt/mem_cache/memory_pool_host.py`
+
+## 22 prefill-warmup
+
+`--warmups prefill_lengths` runs one fresh random prompt of each length in
+`SGLANG_WARMUP_PREFILL_LENGTHS` (comma separated) before the server reports ready, with SGLang's
+custom warmups. `serve.sh` sets `1024,12288`; an empty value skips it.
+
+`cuModuleLoadData` synchronizes the context. The first launch of a Triton kernel variant (Triton
+specializes on whether the row count divides by 16, and the mHC kernels pick tiles by row count)
+loads its cubin from Triton's cache and waits for every stream to drain, and a CUDA kernel loaded
+lazily at its first launch does the same. A streamed prefill keeps a deep queue (the PCIe expert
+copies, the MoE GEMMs, the engram row lookups as host callbacks), so the first request of a launch
+paid those drains inside its forward: on one RTX 5070 Ti a 1,024-token prompt took 6.1 s instead
+of 4.4 s, and the first 35,000-token prompt 37.4 s instead of 33.3 s, 6.9 s of it in one load of
+the mix-stats kernel's 32-row tile behind a 12,288-row chunk's engram lookup. With the two warmup
+prompts the first 1,024-token prompt takes 4.4 s and the first 35,000-token prompt 33.5 s (the
+second 33.3 s); the server is ready 20 s later. `CUDA_MODULE_LOADING=EAGER` is not an alternative:
+every kernel resident at load left no memory for the KV pool.
+
+- `SGLANG_WARMUP_PREFILL_LENGTHS`: unset / `1024,12288`

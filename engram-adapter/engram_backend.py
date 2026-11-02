@@ -264,6 +264,7 @@ def install(module):
         if WARM and mode != "ram" and budget:
             _STORES.append((self._store, self.row_start, end, layer_id))
         self._staging, self._works = {}, {}
+        self._retired = []  # (event, staging, works) a grown staging set left behind, freed once the stream passes
 
         # The loader must see the parameter names but never allocate the tables.
         self.weight = torch.nn.Parameter(torch.empty(0, dtype=torch.float8_e4m3fn), requires_grad=False)
@@ -301,11 +302,17 @@ def install(module):
             have = self._staging.get(key)
             if have is None or have[0].numel() < capacity:
                 if have is not None:
-                    # host callbacks still queued hold the old Work and pinned rows
-                    torch.cuda.current_stream().synchronize()
+                    # host callbacks still queued hold the old Work and pinned rows:
+                    # they stay referenced until the stream passes this point (a
+                    # synchronize here waited for the lookups queued ahead, the
+                    # first chunk of a launch idling the GPU for seconds)
                     old = have[0].data_ptr()
+                    done = torch.cuda.Event()
+                    done.record()
+                    self._retired.append((done, have, {k: v for k, v in self._works.items() if v.ids == old}))
                     self._works = {k: v for k, v in self._works.items() if v.ids != old}
                     del self._staging[key], have
+                self._retired = [r for r in self._retired if not r[0].query()]
                 from contextlib import nullcontext
 
                 region = nullcontext()

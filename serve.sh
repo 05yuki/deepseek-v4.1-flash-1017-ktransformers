@@ -286,6 +286,11 @@ if grep -q '\[never\]' /sys/kernel/mm/transparent_hugepage/shmem_enabled 2>/dev/
   echo "         echo advise | sudo tee /sys/kernel/mm/transparent_hugepage/shmem_enabled" >&2
 fi
 [[ "${SGLANG_SWA_BOUNDED_REPLAY:-0}" == "1" ]] && extra_args+=(--enable-decoder-swa-bounded-replay)
+# before the server reports ready, one fresh prompt of each length: the first streamed prefill of a
+# launch otherwise pays its kernel loads and staging on the first request (SGLANG_WARMUP_PREFILL_LENGTHS=
+# to skip)
+export SGLANG_WARMUP_PREFILL_LENGTHS="${SGLANG_WARMUP_PREFILL_LENGTHS-1024,12288}"
+[[ -n "$SGLANG_WARMUP_PREFILL_LENGTHS" ]] && extra_args+=(--warmups prefill_lengths)
 
 # --- engram from disk ---------------------------------------------------------
 export DSV41_ENGRAM_DIR="$engram_dir"
