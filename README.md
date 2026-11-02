@@ -112,6 +112,10 @@ pages on the GPU. If the server runs out of memory at launch, a shorter context
     inference, so a 1 TB NVMe drive is the practical choice.
 - **Software.** Linux, bash 4.4 or newer, the CUDA toolkit (built and run with 13.1), git,
   gcc/g++, the libnuma and hwloc headers (`libnuma-dev libhwloc-dev`), and `uv` or Python 3.12.
+  Without a system toolkit, the venv's own (the `nvidia-cuda-nvcc` wheel and its neighbours,
+  CUDA 13.1, pinned in `requirements.txt`) serves the kernels compiled at run time; a prebuilt
+  archive (`PREBUILT=`, below) takes the place of the builds, so then only gcc/g++, `libnuma1`
+  and `libgomp1` are needed. A system toolkit, if there is one, must be CUDA 13.x.
   The Python packages are pinned in `requirements.txt` (torch 2.14.1 + cu130): the tested
   venv's `pip freeze`, kept whole so that a build repeats it, measurement tools included.
 - **Host settings.** Set these as root, persistently:
@@ -151,6 +155,21 @@ rebuilds kt-kernel. `serve.sh` reads the tier and leaves out what needs tier 1. 
 is applied; one that does not fit stops the setup with nothing applied. If the libnuma or hwloc headers live outside the
 system paths, pass them in through `CPLUS_INCLUDE_PATH` and `LIBRARY_PATH`. CMake
 flags go in `CMAKE_ARGS`.
+
+### Prebuilt pieces
+
+`PREBUILT=<archive> ./setup.sh` installs the pieces setup.sh otherwise compiles, from an archive
+made by `tools/prebuilt-pack.sh` on a machine that has the toolkit: kt-kernel with its six CPU
+variants (AVX2, AVX-512 base / VNNI / VBMI / BF16, AMX; one is picked at import), the streamed
+prefill's MMQ extension for GPU archs sm89, sm90, sm100 and sm120, kv-vmm, the engram row store
+and hwloc. The archive's `manifest.json` names the recipe, the pinned trees, the torch, CUDA and
+Python versions and every file's SHA-256; setup.sh checks them all. Nothing is built at setup, and
+the FlashInfer CUTLASS MoE of the MMQ-off path is not built. The kernels SGLang compiles at run time
+(DeepGEMM's indexer logits, FlashInfer's sparse attention, TileLang's mHC, sgl-kernel's and Triton's
+small kernels) are built on the first launch, about nine minutes on an RTX 5070 Ti, with the system
+toolkit or, without one, the venv's own assembled by `lib/cuda-home.sh` into `build/cuda-home`.
+The archive is for the pinned torch (`requirements.txt`) and Python 3.12. Only archives built by
+this repository's CI or its maintainers are published; please do not send binaries.
 
 ## What serve.sh does
 

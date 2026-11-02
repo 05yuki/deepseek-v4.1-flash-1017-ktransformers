@@ -124,7 +124,12 @@ ram="$(awk '/MemTotal/ {printf "%.0f", $2 / 1048576}' /proc/meminfo)"
 os="$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME"), kernel $(uname -r)"
 sw="$("$py" -c 'import platform, torch, flashinfer
 print("Python %s, torch %s (CUDA %s), FlashInfer %s" % (platform.python_version(), torch.__version__, torch.version.cuda, flashinfer.__version__))' 2>/dev/null || echo unknown)"
-nvcc="$( { "${CUDA_HOME:-/usr/local/cuda}/bin/nvcc" --version 2>/dev/null || nvcc --version 2>/dev/null; } | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1)"
+# the toolkit the server used: the system's, else the venv's own (lib/cuda-home.sh), else none
+nvcc_bin="${CUDA_HOME:-/usr/local/cuda}/bin/nvcc"
+[[ -x "$nvcc_bin" ]] || nvcc_bin="$here/build/cuda-home/bin/nvcc"
+[[ -x "$nvcc_bin" ]] || nvcc_bin="$(command -v nvcc || true)"
+nvcc="$( { [[ -n "$nvcc_bin" ]] && "$nvcc_bin" --version; } 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1 || true)"
+[[ "$nvcc_bin" == "$here/build/cuda-home/bin/nvcc" && -n "$nvcc" ]] && nvcc="$nvcc (the venv's)"
 recipe="$(git -C "$here" describe --tags --always --dirty 2>/dev/null || echo "not a git checkout")"
 sglang="$(sed -n 's/^SGLANG_COMMIT=\([0-9a-f]\{8\}\).*/\1/p' "$here/setup.sh")"
 index_sha="$(sha256sum "$MODEL/model.safetensors.index.json" 2>/dev/null | cut -c1-12)"
