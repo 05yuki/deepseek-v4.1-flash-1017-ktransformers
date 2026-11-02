@@ -137,8 +137,11 @@ step "Python environment (.venv)"
 if [[ ! -x .venv/bin/python ]]; then
   if command -v uv >/dev/null; then
     uv venv --python 3.12 --seed .venv
-  else
+  elif command -v python3.12 >/dev/null; then
     python3.12 -m venv .venv
+  else
+    echo "neither uv nor python3.12 is on PATH: install uv (https://docs.astral.sh/uv/, it fetches Python 3.12) or Python 3.12" >&2
+    exit 2
   fi
 fi
 py="$here/.venv/bin/python"
