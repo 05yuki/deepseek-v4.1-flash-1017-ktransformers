@@ -170,8 +170,10 @@ the FlashInfer CUTLASS MoE of the MMQ-off path is not built. The kernels SGLang 
 (DeepGEMM's indexer logits, FlashInfer's sparse attention, TileLang's mHC, sgl-kernel's and Triton's
 small kernels) are built on the first launch, about nine minutes on an RTX 5070 Ti, with the system
 toolkit or, without one, the pip wheels' toolkit assembled by `lib/cuda-home.sh` into `build/cuda-home`.
-The archive is for the pinned torch (`requirements.txt`) and Python 3.12. Only archives built by
-this repository's CI or its maintainers are published; please do not send binaries.
+The archive is for the pinned torch (`requirements.txt`) and Python 3.12. The archive for a tag is
+on that tag's [release page](https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers/releases),
+with its SHA-256 beside it; the first is `prebuilt-2026-11-02-1417.tar.gz` (34 MB). Only archives
+built by this repository's CI or its maintainers are published; please do not send binaries.
 
 ## What serve.sh does
 

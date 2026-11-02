@@ -85,5 +85,5 @@ print(json.dumps({k: v for k, v in json.load(open(os.path.join(out, "manifest.js
 EOF
 tarball="$out.tar.gz"
 tar -C "$(dirname "$out")" -czf "$tarball" "$(basename "$out")"
-sha256sum "$tarball" | tee "$tarball.sha256"
+(cd "$(dirname "$tarball")" && sha256sum "$(basename "$tarball")" | tee "$(basename "$tarball").sha256")
 echo "packed $tarball"
