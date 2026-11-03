@@ -40,6 +40,7 @@ the code" are on as soon as the patch is applied.
 | 20 | [`20-expert-cache.patch`](#20-expert-cache) | +200 / -3 | `loading`, `placement`, `prefill-lend`, `stream-prefill`, `kv-vmm`, `kv-lend-plan`, `hot-lend`, `stream-mmq` |
 | 21 | [`21-hicache.patch`](#21-hicache) | +47 / -3 | `kv-vmm`, `prefill-lend`, `kv-lend-plan` |
 | 22 | [`22-prefill-warmup.patch`](#22-prefill-warmup) | +25 / -0 | none |
+| 23 | [`23-swa-checkpoint-tail.patch`](#23-swa-checkpoint-tail) | +16 / -2 | none |
 
 ## Effect of each patch
 
@@ -729,3 +730,24 @@ second 33.3 s); the server is ready 20 s later. `CUDA_MODULE_LOADING=EAGER` is n
 every kernel resident at load left no memory for the KV pool.
 
 - `SGLANG_WARMUP_PREFILL_LENGTHS`: unset / `1024,12288`
+
+## 23 swa-checkpoint-tail
+
+A prompt sent again after its first request has answered is read from the prefix cache up to the
+end of the prompt, as after a request that ended inside its prefill.
+
+V4.1 runs with decoder SWA bounded replay, so a prefix match stops a sliding window (128 tokens)
+short of the prompt's end, and the match needs live SWA in the window before that point. When
+SGLang puts a running request's prefix in the tree (at the end of its prefill), it first frees the
+SWA slots out of the window, measured from the prompt's end. That freed the window the later match
+needs, and the match fell back to the previous chunk boundary. This patch starts the free one
+window earlier; a checkpoint keeps one more page of SWA.
+
+On two RTX 5070 Ti, a 32,625-token prompt sent again after a request that generated 2 to 512
+tokens read 16,384 tokens from the cache before (16,241 computed again) and 32,256 with the patch
+(369). Prompts of 33K, 65K and 131K tokens after 4,096 generated tokens took 4.8-10.6 s the second
+time before, against 2.7 s. Four sessions of 786K, 131K, 65K and 33K tokens, each answered and
+then sent again together, computed 263-369 tokens again a session, against 3,079-16,241 before.
+`tools/qualify.sh` gives the same NLL, decode, 35K prefill and cached 35K time as without it.
+
+- no switch (`SGLANG_FEATURES` without `swa-checkpoint-tail` leaves it out)

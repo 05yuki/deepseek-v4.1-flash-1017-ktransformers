@@ -1,0 +1,73 @@
+From ef268a9337eb70b0d694b37b6b3034cf51e5cd1a Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Tue, 3 Nov 2026 11:00:40 +0900
+Subject: [PATCH] swa-checkpoint-tail: keep the window a later match ends on
+ when a running request is checkpointed
+
+With decoder SWA bounded replay (on for DeepSeek-V4.1), a prefix match stops
+swa_reprefill_tail_tokens (the sliding window, 128) short of the key's end, so a
+32,625-token prompt matches at most 32,256 tokens, and that match needs live SWA
+in the window before 32,256. When a request is checkpointed into the tree before
+it finishes (the end of its prefill, a streaming session's advance), the out-of-
+window SWA slots are freed first, measured from the key's end: everything below
+32,256 went, the match at 32,256 had no live window, and it fell back to the
+previous chunk boundary. A request that finishes inside its prefill is not freed
+first, so its prompt matched in full; one that decoded even 2 tokens did not.
+
+The free now starts swa_reprefill_tail_tokens earlier, so the window the match
+ends on stays live: one more page of SWA a checkpoint.
+
+Checked on 2x RTX 5070 Ti, the full recipe, HiCache on and off: a 32,625-token
+prompt, then the same prompt again after generating 2 to 512 tokens. Before:
+16,384 tokens from the cache (16,241 recomputed) for every length, with or
+without HiCache; with SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=0 and
+with this change: 32,256 (369 recomputed). 33K/65K/131K prompts after 4,096
+generated tokens: 4.8-10.6 s for the first replay before, against 2.7 s.
+Four sessions of 786K, 131K, 65K and 33K tokens, each answered once and then
+replayed together: 263-369 tokens recomputed a session, against 3,079-16,241
+before. tools/qualify.sh passes on 2 GPUs (NLL 0.7211, decode 51.9 tok/s, 35K
+prefill 21.6 s, the cached 35K again 1.9 s) and 1 GPU (0.7172, 33.1 tok/s,
+33.4 s, 2.0 s), as without the change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
+---
+ .../srt/mem_cache/unified_radix_cache.py       | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
+index 8a758c90..bda03f86 100644
+--- a/python/sglang/srt/mem_cache/unified_radix_cache.py
++++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
+@@ -1339,7 +1339,14 @@ class UnifiedRadixCache(BasePrefixCache):
+             # The insert stops at page_floor(len(radix_key)), and a bigram key is
+             # one shorter than the tokens it spans, so measure the key.
+             for comp in self._components_tuple:
+-                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
++                # A later match of this key stops swa_reprefill_tail_tokens short of its
++                # end; keep the window before that point live too, or the match falls
++                # back to the previous checkpoint.
++                comp.free_out_of_window_slots(
++                    req,
++                    len(radix_key) - 1 - self.swa_reprefill_tail_tokens(req),
++                    insert_params,
++                )
+ 
+         if effective_cache_len <= 0:
+             for comp in self._components_tuple:
+@@ -1497,7 +1504,14 @@ class UnifiedRadixCache(BasePrefixCache):
+         )
+         if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+             for comp in self._components_tuple:
+-                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
++                # A later match of this key stops swa_reprefill_tail_tokens short of its
++                # end; keep the window before that point live too, or the match falls
++                # back to the previous checkpoint.
++                comp.free_out_of_window_slots(
++                    req,
++                    len(radix_key) - 1 - self.swa_reprefill_tail_tokens(req),
++                    insert_params,
++                )
+ 
+         for comp in self._components_tuple:
+             comp.cleanup_after_caching_req(
