@@ -53,3 +53,37 @@ Neither change touches a plain chat without tools.
 
 The 1017 model card recommends `temperature` 1.0 and `top_p` 1.0. The earlier card
 recommended `top_p` "0.95 or 1.0", and its evaluations used 0.95.
+
+## How the recipe runs the FP8 step
+
+1017's reference inference code quantizes the attention output `o` to FP8 and back
+before the bf16 `wo_a` projection:
+
+```python
+act_quant(o, fp8_block_size, scale_fmt, scale_dtype, True)  # blocks of 32, power-of-two scales
+```
+
+The earlier release did not have this step; 1017's weights were made with it.
+
+- `patches/dsv4_o_fp8_qdq.py`: an in-place Triton kernel, bit-exact against the
+  checkpoint's own tilelang `act_quant` (`tools/dsv4-o-fp8-qdq-test.py`). GPUs older
+  than sm89 get an fp32 emulation of the e4m3 rounding, also bit-exact
+  (`tools/e4m3-emulation-test.py`).
+- Tier 0 (`patches/sglang-tier0/01-o-fp8-qdq.patch`) includes it, behind `SGLANG_DSV4_O_FP8_QDQ_BLOCK`.
+  `tools/o-fp8-qdq-block.sh` (sourced by `serve.sh`) reads the block size from the
+  checkpoint's own `inference/model.py`. The step therefore turns on for 1017 (block
+  32) and stays off for the earlier release.
+- `patches/sglang-dsv4-o-fp8-qdq.py` installs the same step in another SGLang tree on
+  its own. It applies to SGLang main at `3edea93c` unmodified.
+
+It works the same at any tensor-parallel size. Its 32-value blocks lie inside a head
+(512 values), so splitting heads across GPUs never cuts a block.
+
+## What needs no server change
+
+- The tokenizer and `config.json` are identical.
+- The reference indexer's `owns_k` fix does not apply to SGLang's port.
+- The encoding changes only affect tool calls.
+- The card's sampling is `temperature` 1.0, `top_p` 1.0. These are already SGLang's
+  defaults for a request that sets neither, since the checkpoint has no
+  `generation_config.json`.
