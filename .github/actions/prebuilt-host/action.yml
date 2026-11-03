@@ -1,12 +1,21 @@
 name: prebuilt host
 description: >
-  A build host for tools/prebuilt-pack.sh on an Ubuntu 24.04 runner (4 vCPU, 145 GB disk): CUDA 13.1's
+  A build host for tools/prebuilt-pack.sh on an Ubuntu 24.04 runner (4 vCPU; the free disk varies, so it is cleared below 40 GB): CUDA 13.1's
   compiler, cudart, driver stub and cuBLAS headers from NVIDIA's apt repository, libnuma and hwloc
   headers, Python 3.12 with uv, then `PREPARE_ONLY=1 ./setup.sh` (the pinned trees with the patches
   and the venv with the pinned torch; nothing built).
 runs:
   using: composite
   steps:
+    - name: room on the disk (only when the runner has less than 40 GB free)
+      shell: bash
+      run: |
+        df -h / | tail -1
+        free_gb=$(df -BG --output=avail / | tail -1 | tr -dc 0-9)
+        if (( free_gb < 40 )); then
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h / | tail -1
+        fi
     - name: CUDA 13.1 toolkit (compiler, cudart, driver stub, cuBLAS headers), libnuma, hwloc
       shell: bash
       run: |
