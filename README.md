@@ -11,9 +11,14 @@ to 1M tokens.
 
 This repository is everything needed: patches against two public upstream commits, a
 setup script that builds them, a launcher that reads the machine it runs on, and tests.
-It is a snapshot against those commits as of November 2026 (SGLang main at `3edea93c`,
-KTransformers `95009ea`, torch 2.14.1 with CUDA 13 wheels, FlashInfer 0.7.2, CUDA toolkit
-13.1); later upstream versions are not tracked.
+Each tag pins those commits: SGLang main at `3edea93c` and KTransformers `95009ea` today, with
+torch 2.14.1 on CUDA 13 wheels, FlashInfer 0.7.2 and CUDA toolkit 13.1.
+The recipe follows SGLang main.
+Every few weeks the patches move to a newer commit, are measured again, and go out under a new tag.
+The SGLang patches are the commits of branch `dsv41-1017-main` of
+[05yuki/sglang-upstream](https://github.com/05yuki/sglang-upstream/tree/dsv41-1017-main), exported
+one file a commit ([docs/patches.md](docs/patches.md)).
+A patch that SGLang merges is dropped at the next move.
 
 ```
 hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir /models/dsv41-1017
