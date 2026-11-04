@@ -8,3 +8,5 @@ stream-mmq: stream-prefill
 cpu-gpu-overlap: loading placement prefill-lend stream-prefill
 expert-cache: loading placement prefill-lend stream-prefill kv-vmm kv-lend-plan hot-lend stream-mmq
 hicache: kv-vmm prefill-lend kv-lend-plan
+rope-tables: wo-a-fp8 vision-on-demand kv-vmm prefill-lend
+embed-on-host: wo-a-fp8 vision-on-demand kv-vmm prefill-lend rope-tables

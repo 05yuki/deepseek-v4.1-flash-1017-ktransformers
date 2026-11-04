@@ -169,6 +169,12 @@ export SGLANG_DSV4_WO_A_FP8_NATIVE="${SGLANG_DSV4_WO_A_FP8_NATIVE:-1}"
 # images are encoded; the prefill plan gives a request with images that much less room
 # (0: resident)
 export SGLANG_DSV4_VISION_ON_DEMAND="${SGLANG_DSV4_VISION_ON_DEMAND:-1}"
+# the RoPE tables (two of 256 MiB at 1M positions) have GPU memory under the rows the served
+# context reaches, mapped as it grows; the freed memory goes to the hot experts (0: whole)
+export SGLANG_DSV4_ROPE_LAZY="${SGLANG_DSV4_ROPE_LAZY:-1}"
+# the token embedding (1.3 GB, split across the GPUs) is read from pinned host memory, a row
+# a token; the freed memory goes to the hot experts (0: on the GPU)
+export SGLANG_DSV4_EMBED_ON_HOST="${SGLANG_DSV4_EMBED_ON_HOST:-1}"
 # the Marlin MoE steps around its two GEMMs (SwiGLU, routing weights, top-k sum) in fp32
 # with one rounding each (0: the bf16 steps)
 export SGLANG_MARLIN_MOE_FP32_GLUE="${SGLANG_MARLIN_MOE_FP32_GLUE:-1}"
@@ -443,7 +449,7 @@ printf '%s\n' "GPUs ${CUDA_VISIBLE_DEVICES} (sm $cap), TP $tp on NUMA nodes $num
 printf '%s\n' "prefix cache: $( [[ "${radix_args[0]:-}" == --disable-radix-cache ]] && echo off || { [[ "${radix_args[0]:-}" == --enable-hierarchical-cache ]] && echo "on, HiCache in host memory (ratio ${DSV41_HICACHE_RATIO:-2})" || echo "on, GPU only"; })"
 printf '%s\n' "patch tier $tier; context $context_length; attention output FP8 before wo_a: block ${SGLANG_DSV4_O_FP8_QDQ_BLOCK:-0}; KV layout ${SGLANG_DSV4_KV_LAYOUT:-v4}"
 (( tier >= 1 )) && printf '%s\n' "tier-1 features: $( [[ -f "$features_file" ]] && tr '\n' ' ' < "$features_file" || echo all)"
-(( tier >= 1 )) && printf '%s\n' "wo_a native FP8: $SGLANG_DSV4_WO_A_FP8_NATIVE; vision tower on demand: $SGLANG_DSV4_VISION_ON_DEMAND; MXFP4 MoE fp32: $SGLANG_MXFP4_MOE_FP32; Marlin MoE fp32 glue: $SGLANG_MARLIN_MOE_FP32_GLUE; CPU scale codes: $KT_MXFP4_SCALE_CODES; hot lend spare floor: ${KT_KV_HOT_SPARE_FLOOR_MB:-off} MiB; dynamic hot slots: ${KT_KV_HOT_DYNAMIC_SLOTS:-0}, resident rows too: ${KT_KV_HOT_DYNAMIC_RESIDENT:-0}; shared expert after submit: ${KT_SHARED_AFTER_SUBMIT:-0}; packed hand-off: ${KT_HANDOFF_PACK:-0}; short-prompt CPU share: ${KT_STREAM_CPU_SHORT:-off}"
+(( tier >= 1 )) && printf '%s\n' "wo_a native FP8: $SGLANG_DSV4_WO_A_FP8_NATIVE; vision tower on demand: $SGLANG_DSV4_VISION_ON_DEMAND; RoPE tables as the context grows: $SGLANG_DSV4_ROPE_LAZY; token embedding on host: $SGLANG_DSV4_EMBED_ON_HOST; MXFP4 MoE fp32: $SGLANG_MXFP4_MOE_FP32; Marlin MoE fp32 glue: $SGLANG_MARLIN_MOE_FP32_GLUE; CPU scale codes: $KT_MXFP4_SCALE_CODES; hot lend spare floor: ${KT_KV_HOT_SPARE_FLOOR_MB:-off} MiB; dynamic hot slots: ${KT_KV_HOT_DYNAMIC_SLOTS:-0}, resident rows too: ${KT_KV_HOT_DYNAMIC_RESIDENT:-0}; shared expert after submit: ${KT_SHARED_AFTER_SUBMIT:-0}; packed hand-off: ${KT_HANDOFF_PACK:-0}; short-prompt CPU share: ${KT_STREAM_CPU_SHORT:-off}"
 printf '%s\n' "Run directory: $run_dir"
 ln -sfn "$run_dir" "$log_root/$log_name/current"
 if [[ "$mode" == "--background" ]]; then

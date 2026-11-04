@@ -41,6 +41,8 @@ the code" are on as soon as the patch is applied.
 | 21 | [`21-hicache.patch`](#21-hicache) | +47 / -3 | `kv-vmm`, `prefill-lend`, `kv-lend-plan` |
 | 22 | [`22-prefill-warmup.patch`](#22-prefill-warmup) | +25 / -0 | none |
 | 23 | [`23-swa-checkpoint-tail.patch`](#23-swa-checkpoint-tail) | +16 / -2 | none |
+| 24 | [`24-rope-tables.patch`](#24-rope-tables) | +160 / -8 | `wo-a-fp8`, `vision-on-demand`, `kv-vmm`, `prefill-lend` |
+| 25 | [`25-embed-on-host.patch`](#25-embed-on-host) | +88 / -0 | `wo-a-fp8`, `vision-on-demand`, `kv-vmm`, `prefill-lend`, `rope-tables` |
 
 ## Effect of each patch
 
@@ -751,3 +753,49 @@ then sent again together, computed 263-369 tokens again a session, against 3,079
 `tools/qualify.sh` gives the same NLL, decode, 35K prefill and cached 35K time as without it.
 
 - no switch (`SGLANG_FEATURES` without `swa-checkpoint-tail` leaves it out)
+
+## 24 rope-tables
+
+The RoPE tables take GPU memory only under the positions the served context reaches, and the
+copy nothing reads is not built; the memory goes to the hot experts.
+
+Each attention layer reads one of two complex64 `freqs_cis` tables (the plain base and the
+compressed YaRN base), each built for `max_position_embeddings`: 256 MiB each at 1M positions,
+whatever context is served. Each layer also built `rotary_emb`, whose fp32 cos/sin cache holds the
+same angles again (512 MiB); on CUDA nothing reads it, so it is not built there. With the switch on,
+each `freqs_cis` table moves after loading to a `kv-vmm` range of the same size whose 2 MiB chunks
+are mapped only for the rows a forward can reach (the first 65,536, then the batch's longest
+sequence plus 16,384), filled from a pinned host copy. Kernels, views and CUDA graphs keep their
+addresses. A growth takes 6-32 ms; at 1M the tables are whole again.
+
+Measured with `embed-on-host`; see there.
+
+- `SGLANG_DSV4_ROPE_LAZY`: 0 / 1 (`rotary_emb` is not built on CUDA either way)
+- `SGLANG_DSV4_ROPE_LAZY_VERIFY`: 0 / 0 (1 compares the mapped rows with the host copy after each
+  growth)
+
+## 25 embed-on-host
+
+The token embedding is read from pinned host memory, one row a decode token; its GPU memory (1.32
+GB on one GPU, half on each of two) goes to the hot experts.
+
+After loading, next to the vision tower's offload, the table moves to pinned host memory, and the
+embedding becomes a Triton gather that reads the rows through UVA. The values are copies, rows
+outside a GPU's vocabulary shard are zero as before, and the all-reduce is unchanged.
+
+`tools/qualify.sh` on the machine in the README, against the full stack without the two patches
+(same day):
+
+| GPUs | patches | hot slots | decode median | 35K first | 35K second | NLL minus ref |
+|---|---|---|---|---|---|---|
+| 1 | without | 61 | 33.3 | 34.15 s | 34.09 s | +0.0026 |
+| 1 | `rotary_emb` not built, `embed-on-host` | 162 | 36.9 | 29.83 s | 29.55 s | +0.0013 |
+| 1 | both | 189 | 37.9 | 29.88 s | 30.05 s | -0.0020 |
+| 2 | without | 661 | 51.5 | 22.38 s | 21.18 s | +0.0002 |
+| 2 | `rotary_emb` not built, `embed-on-host` | 780 | 52.8 | 22.43 s | 21.10 s | +0.0004 |
+| 2 | both | 835 | 53.9 | 22.65 s | 21.17 s | +0.0046 |
+
+On one GPU the 35K prefill is faster too; the prompt runs as two chunks of 18,432 tokens with and
+without the patches.
+
+- `SGLANG_DSV4_EMBED_ON_HOST`: 0 / 1

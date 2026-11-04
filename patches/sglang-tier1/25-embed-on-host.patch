@@ -1,0 +1,134 @@
+From 4a2a92788b4dec251e55f177506df39237504d82 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Wed, 4 Nov 2026 10:31:24 +0900
+Subject: [PATCH] embed-on-host: read the token embedding from pinned host
+ memory
+
+The token embedding is read one row a decode token and a prompt's rows a prefill, yet its
+table (129,280 x 4,096 bf16: 1.32 GB on one GPU, half on each of two) sat in VRAM for the
+whole run. With SGLANG_DSV4_EMBED_ON_HOST=1 the table moves to pinned host memory after
+loading, next to the vision tower's offload, and _embed_local_shard becomes a Triton gather
+that reads the rows through UVA. The values are copies, out-of-shard rows are zero as
+before, and the all-reduce is unchanged; the host pointer does not move, so the decode
+graph captures it.
+
+Checked on RTX 5070 Ti, one and two GPUs: tools/qualify.sh passes; the freed memory goes
+to the hot experts (one GPU, with rope-tables: 61 -> 189 slots, decode 33.3 -> 38 tok/s).
+---
+ python/sglang/srt/layers/host_embedding.py | 73 ++++++++++++++++++++++
+ python/sglang/srt/models/deepseek_v4.py    | 15 +++++
+ 2 files changed, 88 insertions(+)
+ create mode 100644 python/sglang/srt/layers/host_embedding.py
+
+diff --git a/python/sglang/srt/layers/host_embedding.py b/python/sglang/srt/layers/host_embedding.py
+new file mode 100644
+index 00000000..099bc00d
+--- /dev/null
++++ b/python/sglang/srt/layers/host_embedding.py
+@@ -0,0 +1,73 @@
++"""A VocabParallelEmbedding whose table lives in pinned host memory.
++
++The token embedding is read one row a decode token and a prompt's rows a prefill: the GPU
++reads the rows straight from pinned host memory (UVA) with a small Triton gather, so the
++table's VRAM goes to what needs it. Values are copied, not computed: the output equals the
++GPU table's. Out-of-shard rows are zero, as _embed_local_shard gives, and the caller's
++all-reduce is unchanged. Graph capture works: the host pointer does not move.
++"""
++import types
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _gather_rows_from_host_kernel(
++    weight_ptr,
++    ids_ptr,
++    output_ptr,
++    embedding_dim,
++    vocab_start,
++    vocab_end,
++    BLOCK_D: tl.constexpr,
++):
++    row = tl.program_id(0)
++    idx = tl.load(ids_ptr + row).to(tl.int64)
++    in_range = (idx >= vocab_start) & (idx < vocab_end)
++    local = tl.where(in_range, idx - vocab_start, 0)
++    offs = tl.arange(0, BLOCK_D)
++    mask = offs < embedding_dim
++    w = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
++    vals = tl.load(w + local * embedding_dim + offs, mask=mask, other=0.0)
++    tl.store(
++        output_ptr + row.to(tl.int64) * embedding_dim + offs,
++        tl.where(in_range, vals, 0.0),
++        mask=mask,
++    )
++
++
++def _host_embed_local_shard(self, input_: torch.Tensor) -> torch.Tensor:
++    ids = input_.reshape(-1)
++    out = torch.empty(
++        (*input_.shape, self.embedding_dim), dtype=torch.bfloat16, device=input_.device
++    )
++    if ids.numel():
++        _gather_rows_from_host_kernel[(ids.numel(),)](
++            self.weight.data_ptr(),
++            ids,
++            out,
++            self.embedding_dim,
++            self.shard_indices.org_vocab_start_index,
++            self.shard_indices.org_vocab_end_index,
++            BLOCK_D=triton.next_power_of_2(self.embedding_dim),
++        )
++    if self.output_dtype is not None:
++        out = out.to(self.output_dtype)
++    return out
++
++
++def move_embedding_to_host(embed) -> int:
++    """The embedding table to pinned host memory, its GPU storage freed. Returns the bytes
++    moved (0 when the table is not a bf16 CUDA tensor)."""
++    w = embed.weight
++    if not w.is_cuda or w.dtype != torch.bfloat16 or w.numel() == 0:
++        return 0
++    host = torch.empty(w.shape, dtype=w.dtype, pin_memory=True)
++    host.copy_(w.data)
++    torch.cuda.synchronize()
++    w.data = host
++    embed._embed_local_shard = types.MethodType(_host_embed_local_shard, embed)
++    torch.cuda.empty_cache()
++    return host.numel() * host.element_size()
+diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+index 6ae8db4c..0a9a603b 100644
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -600,6 +600,20 @@ def _vision_offload(model) -> None:
+         pass
+ 
+ 
++def _embed_offload(model) -> None:
++    """SGLANG_DSV4_EMBED_ON_HOST=1: the token embedding read from pinned host memory
++    (layers/host_embedding.py); its VRAM (1.32 GB on one GPU, half that on two) is freed."""
++    if os.environ.get("SGLANG_DSV4_EMBED_ON_HOST", "0") != "1":
++        return
++    embed = getattr(getattr(model, "model", None), "embed_tokens", None)
++    if embed is None or not hasattr(embed, "shard_indices"):
++        return
++    from sglang.srt.layers.host_embedding import move_embedding_to_host
++
++    nbytes = move_embedding_to_host(embed)
++    logger.info("token embedding on host: %.1f MiB moved to pinned host memory", nbytes / 2**20)
++
++
+ def _rope_lazy(model) -> None:
+     """SGLANG_DSV4_ROPE_LAZY=1: the freqs_cis tables mapped as the context grows
+     (layers/lazy_rope_table.py); 0.54 GB a GPU at 1M until a context needs them."""
+@@ -5369,6 +5383,7 @@ class DeepseekV4ForCausalLM(nn.Module):
+     def post_load_weights(self, is_nextn=False, weight_names=None):
+         if not is_nextn:
+             _vision_offload(self)
++            _embed_offload(self)
+             _rope_lazy(self)
+             _setup_wo_a_native(self)
+         if self.wo_a_fp8:
