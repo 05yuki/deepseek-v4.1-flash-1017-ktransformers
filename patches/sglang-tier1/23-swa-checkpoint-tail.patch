@@ -1,4 +1,4 @@
-From ef268a9337eb70b0d694b37b6b3034cf51e5cd1a Mon Sep 17 00:00:00 2001
+From de204f6f60aa1dcb3800830e4c25627688b5ef28 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Tue, 3 Nov 2026 11:00:40 +0900
 Subject: [PATCH] swa-checkpoint-tail: keep the window a later match ends on
@@ -36,10 +36,10 @@ Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
  1 file changed, 16 insertions(+), 2 deletions(-)
 
 diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
-index 8a758c90..bda03f86 100644
+index 39ef5f96..193e39c3 100644
 --- a/python/sglang/srt/mem_cache/unified_radix_cache.py
 +++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
-@@ -1339,7 +1339,14 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -1466,7 +1466,14 @@ class UnifiedRadixCache(BasePrefixCache):
              # The insert stops at page_floor(len(radix_key)), and a bigram key is
              # one shorter than the tokens it spans, so measure the key.
              for comp in self._components_tuple:
@@ -55,7 +55,7 @@ index 8a758c90..bda03f86 100644
  
          if effective_cache_len <= 0:
              for comp in self._components_tuple:
-@@ -1497,7 +1504,14 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -1625,7 +1632,14 @@ class UnifiedRadixCache(BasePrefixCache):
          )
          if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
              for comp in self._components_tuple:

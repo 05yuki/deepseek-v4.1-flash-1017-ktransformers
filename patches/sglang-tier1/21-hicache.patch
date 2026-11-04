@@ -1,4 +1,4 @@
-From 00ca843c7967472d154286b1fffc515eca1816d4 Mon Sep 17 00:00:00 2001
+From d12ace208c1e590e5f3f75d53980cb198bbbdc72 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Sun, 1 Nov 2026 10:16:27 +0900
 Subject: [PATCH] hicache: the prefix cache's copy in host memory with the

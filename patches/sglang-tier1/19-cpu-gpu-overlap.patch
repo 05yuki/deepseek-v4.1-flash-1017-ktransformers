@@ -1,4 +1,4 @@
-From b743ec0c4e2893b4b0f98df8c75e3e84866a5d36 Mon Sep 17 00:00:00 2001
+From c34daf0d51062ec4b48272f4c03d402ebadc1c0f Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Thu, 29 Oct 2026 21:20:02 +0900
 Subject: [PATCH] cpu-gpu-overlap: the shared expert forks after the CPU
@@ -43,7 +43,7 @@ Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
  create mode 100644 python/sglang/srt/layers/moe/kt_handoff_pack.py
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 76d911dc..aed354bd 100644
+index 4e26649c..e0ccb123 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -7,6 +7,7 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
@@ -57,7 +57,7 @@ index 76d911dc..aed354bd 100644
 @@ -14,6 +15,11 @@ from typing import TYPE_CHECKING, Optional
  import torch
  
- from sglang.srt.arg_groups.overrides import model_config_of
+ from sglang.srt.arg_groups.model_override_base import model_config_of
 +from sglang.srt.layers.moe.kt_handoff_pack import (
 +    PACK as _KT_HANDOFF_PACK,
 +    SHARED_AFTER_SUBMIT as _KT_SHARED_AFTER_SUBMIT,
@@ -245,7 +245,7 @@ index 00000000..f49aaac5
 +    )
 +    return True
 diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
-index 4d1f460d..5dace6f2 100644
+index ff1aad39..89d0f26c 100644
 --- a/python/sglang/srt/models/deepseek_v2.py
 +++ b/python/sglang/srt/models/deepseek_v2.py
 @@ -120,6 +120,9 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -258,7 +258,7 @@ index 4d1f460d..5dace6f2 100644
  from sglang.srt.layers.moe.token_dispatcher.base import (
      BaseDispatcher,
      CombineInput,
-@@ -1159,7 +1162,18 @@ class DeepseekV2MoE(nn.Module):
+@@ -1196,7 +1199,18 @@ class DeepseekV2MoE(nn.Module):
              if use_flashinfer_trtllm_bypass
              else self._maybe_quant_moe_input_once(hidden_states)
          )
@@ -278,7 +278,7 @@ index 4d1f460d..5dace6f2 100644
          should_quant_routed_input_mxfp8 = (
              not use_flashinfer_trtllm_bypass
              and pre_quant_input is None
-@@ -1255,6 +1269,13 @@ class DeepseekV2MoE(nn.Module):
+@@ -1295,6 +1309,13 @@ class DeepseekV2MoE(nn.Module):
  
          # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
          # Only the quant-once fp8 pair is shared with it; the routed MXFP8 pre-quant is not.

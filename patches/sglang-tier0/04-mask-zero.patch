@@ -1,4 +1,4 @@
-From 092d84ce47fec57dfda7e2fecf3501d8788050ea Mon Sep 17 00:00:00 2001
+From f7ec99cac5a85534443b97e2d92ab3eb4c62d023 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:33 +0900
 Subject: [PATCH] kt: keep CPU-routed experts out of the Marlin MoE
@@ -18,7 +18,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  1 file changed, 17 insertions(+), 1 deletion(-)
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 8032a783..70e35a42 100644
+index f19de827..cb37ef6a 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -115,6 +115,9 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T

@@ -1,4 +1,4 @@
-From 4a2a92788b4dec251e55f177506df39237504d82 Mon Sep 17 00:00:00 2001
+From 11671b905285b7d7e9e60217ffc1da0a2f445127 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Wed, 4 Nov 2026 10:31:24 +0900
 Subject: [PATCH] embed-on-host: read the token embedding from pinned host
@@ -100,10 +100,10 @@ index 00000000..099bc00d
 +    torch.cuda.empty_cache()
 +    return host.numel() * host.element_size()
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 6ae8db4c..0a9a603b 100644
+index 5cb3dc77..a404e1f4 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -600,6 +600,20 @@ def _vision_offload(model) -> None:
+@@ -602,6 +602,20 @@ def _vision_offload(model) -> None:
          pass
  
  
@@ -124,7 +124,7 @@ index 6ae8db4c..0a9a603b 100644
  def _rope_lazy(model) -> None:
      """SGLANG_DSV4_ROPE_LAZY=1: the freqs_cis tables mapped as the context grows
      (layers/lazy_rope_table.py); 0.54 GB a GPU at 1M until a context needs them."""
-@@ -5369,6 +5383,7 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -5411,6 +5425,7 @@ class DeepseekV4ForCausalLM(nn.Module):
      def post_load_weights(self, is_nextn=False, weight_names=None):
          if not is_nextn:
              _vision_offload(self)

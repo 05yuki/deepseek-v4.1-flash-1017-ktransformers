@@ -1,4 +1,4 @@
-From 88e2199af4d0265477e5527db6484cb08fe12dcd Mon Sep 17 00:00:00 2001
+From 333ab6afd1b6a8cf3ec3b2cadd8d2e2b8b06be14 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] stream-prefill: stream the CPU experts to the GPU for long
@@ -53,13 +53,13 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  create mode 100644 python/sglang/srt/layers/moe/kt_stream_prefill.py
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 0c17adfe..4cbfea4f 100644
+index 9363f0e9..f4d1b094 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Optional
  import torch
  
- from sglang.srt.arg_groups.overrides import model_config_of
+ from sglang.srt.arg_groups.model_override_base import model_config_of
 +from sglang.srt.layers.moe.kt_stream_prefill import stream_prefill_for
  from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
  from sglang.srt.runtime_context import (

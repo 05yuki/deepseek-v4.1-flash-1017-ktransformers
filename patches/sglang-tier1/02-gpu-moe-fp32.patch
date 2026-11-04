@@ -1,4 +1,4 @@
-From fef7a853fc67d92dd6cfd001c3c4391426c48cd2 Mon Sep 17 00:00:00 2001
+From c317a0d9699d4decb4ed8951501c59c15b0391bd Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:34 +0900
 Subject: [PATCH] gpu-moe-fp32: GPU MXFP4 experts in the checkpoint's layout,
@@ -518,7 +518,7 @@ index 00000000..49b33e4a
 +        out.index_add_(0, tok, y * topk_weights[tok, slot].double()[:, None])
 +    return out
 diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
-index 404661e0..ddd7595b 100644
+index d4ffa9e9..4db7b0fd 100644
 --- a/python/sglang/srt/layers/quantization/fp8.py
 +++ b/python/sglang/srt/layers/quantization/fp8.py
 @@ -5,6 +5,7 @@
@@ -529,7 +529,7 @@ index 404661e0..ddd7595b 100644
  from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
  
  import torch
-@@ -456,9 +457,13 @@ class Fp8Config(QuantizationConfig):
+@@ -457,9 +458,13 @@ class Fp8Config(QuantizationConfig):
  
              if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
                  from sglang.srt.layers.quantization.mxfp4_marlin_moe import (

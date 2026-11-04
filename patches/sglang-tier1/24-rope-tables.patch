@@ -1,4 +1,4 @@
-From 7fa8a400f7435e44f9061da1c15b6adbc58d08d7 Mon Sep 17 00:00:00 2001
+From d5689407ddafcf004d8a1e1d6fa3c2d0086eeac4 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Wed, 4 Nov 2026 10:31:24 +0900
 Subject: [PATCH] rope-tables: map the RoPE tables as the context grows, and
@@ -162,10 +162,10 @@ index 00000000..3272c976
 +    torch.cuda.empty_cache()
 +    return freed
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 63a0188e..69cedfd3 100644
+index 7e849d8b..a27e0aea 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -1886,6 +1886,10 @@ class ModelRunner:
+@@ -1920,6 +1920,10 @@ class ModelRunner:
              from sglang.srt.layers.moe import kt_lend
  
              kt_lend.before_forward(forward_batch)
@@ -177,10 +177,10 @@ index 63a0188e..69cedfd3 100644
              if self.enable_elastic_ep:
                  output = self._maybe_rebalance_after_rank_fault(
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index f3686828..6ae8db4c 100644
+index e60ee72f..5cb3dc77 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -600,6 +600,19 @@ def _vision_offload(model) -> None:
+@@ -602,6 +602,19 @@ def _vision_offload(model) -> None:
          pass
  
  
@@ -200,7 +200,7 @@ index f3686828..6ae8db4c 100644
  @contextmanager
  def _vision_on_gpu(model):
      """Around an image batch: the tower's parameters back on the GPU, freed after."""
-@@ -1599,14 +1612,21 @@ class MQALayer(MqaAttentionBase):
+@@ -1601,14 +1614,21 @@ class MQALayer(MqaAttentionBase):
          if self.compress_ratio:
              active_rope_scaling = dict(self.rope_scaling or {})
              active_rope_scaling["rope_type"] = "deepseek_yarn"
@@ -230,7 +230,7 @@ index f3686828..6ae8db4c 100644
          )
  
          if _is_npu:
-@@ -5349,6 +5369,7 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -5391,6 +5411,7 @@ class DeepseekV4ForCausalLM(nn.Module):
      def post_load_weights(self, is_nextn=False, weight_names=None):
          if not is_nextn:
              _vision_offload(self)

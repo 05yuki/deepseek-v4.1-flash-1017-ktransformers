@@ -1,4 +1,4 @@
-From 8d582340b02bfd97c78e70a19258a7be8b4013ff Mon Sep 17 00:00:00 2001
+From a862e96f1ecaf1644eac84ed18d8808781f5a5d7 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] hot-lend: more hot experts in the KV pool's free pages
@@ -81,10 +81,10 @@ Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
  4 files changed, 736 insertions(+), 34 deletions(-)
 
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-index 40d89d80..d131eaec 100644
+index d27675f8..2fbd057d 100644
 --- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 +++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-@@ -1306,6 +1306,13 @@ class FusedMoE(torch.nn.Module):
+@@ -1336,6 +1336,13 @@ class FusedMoE(torch.nn.Module):
          ):
              if self.quant_method.num_gpu_experts != -1:
                  if expert_id >= self.quant_method.num_gpu_experts:
@@ -99,7 +99,7 @@ index 40d89d80..d131eaec 100644
  
          self._weight_loader_impl(
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 4cbfea4f..76d911dc 100644
+index f4d1b094..4e26649c 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -308,6 +308,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):

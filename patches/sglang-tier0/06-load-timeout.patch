@@ -1,4 +1,4 @@
-From c00174472f088dd57bc520fca858464c44f0553f Mon Sep 17 00:00:00 2001
+From e43747831aaa737ed7df69e0f4ec3adc3a1f356f Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:33 +0900
 Subject: [PATCH] model-loader: make the unbalanced load barrier timeout
@@ -16,7 +16,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  1 file changed, 3 insertions(+), 1 deletion(-)
 
 diff --git a/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py b/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
-index 1210e458..29bfcfd9 100644
+index 634ea822..1390153c 100644
 --- a/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
 +++ b/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
 @@ -53,7 +53,9 @@ logger = logging.getLogger(__name__)

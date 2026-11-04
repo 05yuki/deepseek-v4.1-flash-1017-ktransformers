@@ -1,4 +1,4 @@
-From b89e272b5f85438ca9b8a2c9fba37248a26a8314 Mon Sep 17 00:00:00 2001
+From 0823e5ae3a0b8485a116a97492502209258b6467 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:32 +0900
 Subject: [PATCH] kt: pass the GPU expert mask kt-kernel's inference API takes
@@ -15,7 +15,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  1 file changed, 6 insertions(+), 1 deletion(-)
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index bb4d54d7..53226bb8 100644
+index 43147cf6..caaeb3c6 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -216,13 +216,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):

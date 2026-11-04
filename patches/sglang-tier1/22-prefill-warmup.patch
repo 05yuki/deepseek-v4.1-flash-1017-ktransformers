@@ -1,4 +1,4 @@
-From 9647dac4ecbac60fe3310ce27198b06676c958f7 Mon Sep 17 00:00:00 2001
+From e365d5955568b8b7cc5f11c867f989b9f712819f Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 2 Nov 2026 10:09:56 +0900
 Subject: [PATCH] warmup: prefill_lengths, one fresh prompt a length before the
@@ -28,7 +28,7 @@ prompt 33.49 s (the second 33.34 s); the server is ready 20 s later.
  1 file changed, 25 insertions(+)
 
 diff --git a/python/sglang/srt/entrypoints/warmup.py b/python/sglang/srt/entrypoints/warmup.py
-index 2608621f..df5510e3 100644
+index e1257150..daf62253 100644
 --- a/python/sglang/srt/entrypoints/warmup.py
 +++ b/python/sglang/srt/entrypoints/warmup.py
 @@ -159,3 +159,28 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM

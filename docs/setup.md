@@ -2,7 +2,7 @@
 
 ## What setup.sh does
 
-1. Clones sgl-project/sglang at `3edea93c` on its main branch and applies the SGLang patches
+1. Clones sgl-project/sglang at `58484246` on its main branch and applies the SGLang patches
    up to `TIER` (default 2), each tier on top of the ones below it:
 
    | `TIER` | patch | what it adds |

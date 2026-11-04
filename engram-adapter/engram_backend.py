@@ -216,9 +216,14 @@ def install(module):
 
     module.EngramHasher.__init__ = init_hasher
 
-    def init(self, num_embeddings, dim, layer_id, column_bounds=None):
+    def init(self, num_embeddings, dim, layer_id, column_bounds=None, *, mxfp4=False):
         torch.nn.Module.__init__(self)
         assert dim == DIM, dim
+        # SGLang main since #47935 keeps a checkpoint's MXFP4 table packed; the row store reads
+        # the fp8 rows of the 1017 checkpoint only
+        if mxfp4:
+            raise ValueError("engram adapter: MXFP4 Engram tables are not supported, fp8 only")
+        self.mxfp4, self.row_bytes = False, dim
         par = module.get_parallel()
         self.dim, self.tp_size = dim, par.tp_size
         rank = par.tp_rank
