@@ -1,4 +1,4 @@
-From de204f6f60aa1dcb3800830e4c25627688b5ef28 Mon Sep 17 00:00:00 2001
+From 75e3e8f0b6edeace4c0857c10479f14ffd869898 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Tue, 3 Nov 2026 11:00:40 +0900
 Subject: [PATCH] swa-checkpoint-tail: keep the window a later match ends on

@@ -1,4 +1,4 @@
-From 6fb7b4dc80bca0e3d044093f869ee3bdf8becb82 Mon Sep 17 00:00:00 2001
+From 2ec6741a7eb721b2bd601645718051e246d3430e Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 22:56:28 +0900
 Subject: [PATCH] fp8-decode: block-FP8 GEMV and split-K for decode-sized dense

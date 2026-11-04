@@ -1,4 +1,4 @@
-From cf9f56774b16bcfe0604be934f195932e201a766 Mon Sep 17 00:00:00 2001
+From ee11eefcc57c85b21e45e516d9a6468e412b2630 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] prefill-lend: lend the GPU-resident weights' memory to a
@@ -1724,7 +1724,7 @@ index 14101199..7e849d8b 100644
              if self.enable_elastic_ep:
                  output = self._maybe_rebalance_after_rank_fault(
 diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
-index 4146a420..18be2b35 100644
+index 2ec313af..5badce28 100644
 --- a/python/sglang/srt/model_loader/loader.py
 +++ b/python/sglang/srt/model_loader/loader.py
 @@ -319,6 +319,10 @@ def _initialize_model(
@@ -1738,7 +1738,7 @@ index 4146a420..18be2b35 100644
      return model
  
  
-@@ -1097,8 +1101,16 @@ class DefaultModelLoader(BaseModelLoader):
+@@ -1108,8 +1112,16 @@ class DefaultModelLoader(BaseModelLoader):
              # parameters onto device for processing and back off after.
              with device_loading_context(module, target_device):
                  quant_method.process_weights_after_loading(module)
@@ -1756,10 +1756,10 @@ index 4146a420..18be2b35 100644
      def restore_weights_before_loading(model, target_device):
          """Undo in-place quant packing so fresh weights can be loaded."""
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 28127387..e60ee72f 100644
+index db81aa5c..dc107fcc 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -1454,7 +1454,11 @@ class MqaAttentionBase(nn.Module):
+@@ -1565,7 +1565,11 @@ class MqaAttentionBase(nn.Module):
              assert not getattr(meta, "q_pad_captured", False), (
                  "the padded query buffer grew after a CUDA graph captured it"
              )
@@ -1772,7 +1772,7 @@ index 28127387..e60ee72f 100644
              if meta is not None:
                  try:
                      meta.q_pad_buffer = buf
-@@ -4396,6 +4400,10 @@ class DeepseekV4Model(nn.Module):
+@@ -4510,6 +4514,10 @@ class DeepseekV4Model(nn.Module):
              if tail is not None and i == self.late_layer_start:
                  if self.tail_writes_source_kv:
                      source = self.layers[i]

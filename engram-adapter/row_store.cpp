@@ -28,6 +28,8 @@
 #include <mutex>
 #include <string>
 #include <sys/mman.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -35,8 +37,8 @@ namespace {
 
 constexpr uint64_t kDim = 256;       // fp8 e4m3 bytes per row
 constexpr uint64_t kScales = 8;      // e8m0 bytes per row (block 32)
-constexpr uint64_t kRow = kDim + kScales;
-constexpr uint64_t kSlotBytes = kRow + sizeof(uint64_t);
+// the largest row a store may hold (FP8: 256 + 8; IQ4_NL: 144, no scales); each store has its own sizes
+constexpr uint64_t kMaxRow = kDim + kScales;
 constexpr size_t kPage = 4096;
 constexpr int kLockShards = 256;
 
@@ -50,6 +52,8 @@ struct Store {
   int fd = -1;
   std::string path;
   uint64_t rows = 0, weight_offset = 0, scale_offset = 0, slots = 0;
+  // bytes of a row's values and of its scales (FP8 rows: 256 + 8; IQ4_NL rows: 144 + 0)
+  uint64_t wbytes = kDim, sbytes = kScales, row_bytes = kDim + kScales;
   uint64_t row_lo = 0, row_hi = 0;
   uint8_t *cache = nullptr;
   uint64_t *keys = nullptr;
@@ -91,7 +95,28 @@ struct Store {
   std::atomic<uint64_t> warm_rows{0}, warm_ns{0};
 };
 
+// DSV41_ENGRAM_IO_CPUS ("a,b,c-d"): the CPUs the engram reads run on. Unset (the
+// default): not pinned. Pinned to the expert cache's readers' CPUs, or to the
+// other second hardware threads of the cores computing the experts, the decode
+// was a few percent slower on some texts than unpinned (dual EPYC 7452, 10-27).
+void pin_io_thread() {
+  const char *e = getenv("DSV41_ENGRAM_IO_CPUS");
+  if (!e || !*e) return;
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  for (const char *p = e; *p;) {
+    char *end;
+    long a = std::strtol(p, &end, 10), b = a;
+    if (end == p) break;
+    if (*end == '-') b = std::strtol(end + 1, &end, 10);
+    for (long c = a; c <= b && c < CPU_SETSIZE; c++) CPU_SET(c, &set);
+    p = *end == ',' ? end + 1 : end;
+  }
+  if (CPU_COUNT(&set)) pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+}
+
 void io_worker(Store *s) {
+  pin_io_thread();
   for (;;) {
     std::function<void()> job;
     {
@@ -172,12 +197,13 @@ bool read_bytes(Store *s, uint64_t offset, uint8_t *out, size_t length) {
 }
 
 bool read_row(Store *s, uint64_t id, uint8_t *row) {
-  if (!read_bytes(s, s->weight_offset + id * kDim, row, kDim)) return false;
+  if (!read_bytes(s, s->weight_offset + id * s->wbytes, row, s->wbytes)) return false;
+  if (!s->sbytes) return true;
   if (s->scales_ram) {
-    std::memcpy(row + kDim, s->scales_ram + (id - s->row_lo) * kScales, kScales);
+    std::memcpy(row + s->wbytes, s->scales_ram + (id - s->row_lo) * s->sbytes, s->sbytes);
     return true;
   }
-  return read_bytes(s, s->scale_offset + id * kScales, row + kDim, kScales);
+  return read_bytes(s, s->scale_offset + id * s->sbytes, row + s->wbytes, s->sbytes);
 }
 
 void scales_free(Store *s) {
@@ -191,9 +217,9 @@ void scales_free(Store *s) {
 void scales_load(Store *s, const char *path) {
   scales_free(s);
   const char *e = getenv("DSV41_ENGRAM_SCALES_RAM");
-  if (s->resident || (e && std::strcmp(e, "0") == 0) || s->row_hi <= s->row_lo) return;
+  if (s->resident || !s->sbytes || (e && std::strcmp(e, "0") == 0) || s->row_hi <= s->row_lo) return;
   const auto t0 = std::chrono::steady_clock::now();
-  const size_t size = (s->row_hi - s->row_lo) * kScales;
+  const size_t size = (s->row_hi - s->row_lo) * s->sbytes;
   void *m = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (m == MAP_FAILED) {
     std::fprintf(stderr, "row_store: scales in RAM: allocation failed errno=%d\n", errno);
@@ -201,7 +227,7 @@ void scales_load(Store *s, const char *path) {
   }
   madvise(m, size, MADV_HUGEPAGE);
   int fd = open(path, O_RDONLY | O_CLOEXEC);
-  const uint64_t base = s->scale_offset + s->row_lo * kScales;
+  const uint64_t base = s->scale_offset + s->row_lo * s->sbytes;
   size_t done = 0;
   while (fd >= 0 && done < size) {
     const size_t n = std::min<size_t>(size - done, size_t(64) << 20);
@@ -235,11 +261,12 @@ bool cache_has(Store *s, uint64_t id) {
 void cache_put(Store *s, uint64_t id, const uint8_t *row) {
   const uint64_t slot = id % s->slots;
   std::lock_guard<std::mutex> guard(s->locks[slot % kLockShards]);
-  std::memcpy(s->cache + slot * kRow, row, kRow);
+  std::memcpy(s->cache + slot * s->row_bytes, row, s->row_bytes);
   s->keys[slot] = id + 1;
 }
 
 void warm_loop(Store *s) {
+  pin_io_thread();
   int n = 16;
   if (const char *e = getenv("DSV41_ENGRAM_WARM_THREADS")) n = std::atoi(e);
   n = std::max(1, std::min(n, 64));
@@ -269,7 +296,8 @@ void warm_loop(Store *s) {
     const auto t0 = std::chrono::steady_clock::now();
     std::atomic<size_t> next{0};
     auto work = [&] {
-      uint8_t row[kRow];
+      pin_io_thread();
+      uint8_t row[kMaxRow];
       for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < ids.size();) {
         const int64_t id = ids[i];
         if (id < int64_t(s->row_lo) || id >= int64_t(s->row_hi) || cache_has(s, uint64_t(id))) continue;
@@ -313,9 +341,17 @@ extern "C" void row_store_warm(Store *s, const int64_t *ids, uint64_t count) {
   s->warm.cv.notify_one();
 }
 
-extern "C" Store *row_store_open(const char *path, uint64_t rows, uint64_t woff,
-                                 uint64_t soff, uint64_t budget, int resident_mode) {
+extern "C" Store *row_store_open_fmt(const char *path, uint64_t rows, uint64_t woff, uint64_t soff,
+                                     uint64_t budget, int resident_mode, uint64_t wbytes, uint64_t sbytes) {
+  if (!wbytes || wbytes + sbytes > kMaxRow) {
+    std::fprintf(stderr, "row_store_open: row of %llu + %llu bytes not supported\n",
+                 (unsigned long long)wbytes, (unsigned long long)sbytes);
+    return nullptr;
+  }
   auto *s = new Store;
+  s->wbytes = wbytes;
+  s->sbytes = sbytes;
+  s->row_bytes = wbytes + sbytes;
   s->fd = open(path, O_RDONLY | O_CLOEXEC | (resident_mode ? 0 : O_DIRECT));
   if (s->fd < 0) {
     std::fprintf(stderr, "row_store_open: open(%s) failed errno=%d\n", path, errno);
@@ -324,7 +360,7 @@ extern "C" Store *row_store_open(const char *path, uint64_t rows, uint64_t woff,
   }
   struct stat st;
   if (fstat(s->fd, &st) || woff > uint64_t(st.st_size) || soff > uint64_t(st.st_size) ||
-      rows > (uint64_t(st.st_size) - woff) / kDim || rows > (uint64_t(st.st_size) - soff) / kScales) {
+      rows > (uint64_t(st.st_size) - woff) / wbytes || (sbytes && rows > (uint64_t(st.st_size) - soff) / sbytes)) {
     std::fprintf(stderr, "row_store_open: table extent invalid for %s\n", path);
     close(s->fd);
     delete s;
@@ -355,13 +391,13 @@ extern "C" Store *row_store_open(const char *path, uint64_t rows, uint64_t woff,
   s->scale_offset = soff;
   s->row_lo = 0;
   s->row_hi = rows;
-  s->slots = budget / kSlotBytes;
+  s->slots = budget / (s->row_bytes + sizeof(uint64_t));
   if (s->slots) {
-    void *c = mmap(nullptr, s->slots * kRow, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *c = mmap(nullptr, s->slots * s->row_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     void *k = mmap(nullptr, s->slots * sizeof(uint64_t), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (c == MAP_FAILED || k == MAP_FAILED) {
       std::fprintf(stderr, "row_store_open: cache allocation failed errno=%d\n", errno);
-      if (c != MAP_FAILED) munmap(c, s->slots * kRow);
+      if (c != MAP_FAILED) munmap(c, s->slots * s->row_bytes);
       if (k != MAP_FAILED) munmap(k, s->slots * sizeof(uint64_t));
       close(s->fd);
       delete s;
@@ -369,11 +405,16 @@ extern "C" Store *row_store_open(const char *path, uint64_t rows, uint64_t woff,
     }
     s->cache = static_cast<uint8_t *>(c);
     s->keys = static_cast<uint64_t *>(k);
-    madvise(s->cache, s->slots * kRow, MADV_HUGEPAGE);
+    madvise(s->cache, s->slots * s->row_bytes, MADV_HUGEPAGE);
   }
   if (!s->resident) io_start(s);
   g_stores.fetch_add(1);
   return s;
+}
+
+extern "C" Store *row_store_open(const char *path, uint64_t rows, uint64_t woff,
+                                 uint64_t soff, uint64_t budget, int resident_mode) {
+  return row_store_open_fmt(path, rows, woff, soff, budget, resident_mode, kDim, kScales);
 }
 
 extern "C" void row_store_lookup(void *opaque) {
@@ -382,22 +423,23 @@ extern "C" void row_store_lookup(void *opaque) {
   const auto t_call = std::chrono::steady_clock::now();
   // pass 1: cache hits and invalid ids are served in place; misses are
   // collected, then read concurrently, then inserted into the cache
-  struct Miss { uint64_t i; int64_t id; bool ok; uint8_t row[kRow]; };
+  struct Miss { uint64_t i; int64_t id; bool ok; uint8_t row[kMaxRow]; };
+  const uint64_t wb = s->wbytes, sb = s->sbytes;
   std::vector<Miss> misses;
   misses.reserve(work->count);
   for (uint64_t i = 0; i < work->count; ++i) {
     const int64_t id = work->ids[i];
-    uint8_t *w_out = work->weights + i * kDim;
-    uint8_t *s_out = work->scales + i * kScales;
+    uint8_t *w_out = work->weights + i * wb;
+    uint8_t *s_out = work->scales + i * sb;
     if (id < 0 || uint64_t(id) >= s->rows) {
-      std::memset(w_out, 0, kDim);
-      std::memset(s_out, 0, kScales);
+      std::memset(w_out, 0, wb);
+      if (sb) std::memset(s_out, 0, sb);
       s->errors.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
     if (uint64_t(id) < s->row_lo || uint64_t(id) >= s->row_hi) {
-      std::memset(w_out, 0, kDim);
-      std::memset(s_out, 0, kScales);
+      std::memset(w_out, 0, wb);
+      if (sb) std::memset(s_out, 0, sb);
       continue;
     }
     const uint64_t slot = s->slots ? uint64_t(id) % s->slots : 0;
@@ -405,8 +447,8 @@ extern "C" void row_store_lookup(void *opaque) {
     if (s->slots) {
       std::lock_guard<std::mutex> guard(s->locks[slot % kLockShards]);
       if (s->keys[slot] == uint64_t(id) + 1) {
-        std::memcpy(w_out, s->cache + slot * kRow, kDim);
-        std::memcpy(s_out, s->cache + slot * kRow + kDim, kScales);
+        std::memcpy(w_out, s->cache + slot * s->row_bytes, wb);
+        if (sb) std::memcpy(s_out, s->cache + slot * s->row_bytes + wb, sb);
         hit = true;
       }
     }
@@ -430,11 +472,11 @@ extern "C" void row_store_lookup(void *opaque) {
     s->miss_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_miss).count(),
                          std::memory_order_relaxed);
     for (auto &m : misses) {
-      uint8_t *w_out = work->weights + m.i * kDim;
-      uint8_t *s_out = work->scales + m.i * kScales;
+      uint8_t *w_out = work->weights + m.i * wb;
+      uint8_t *s_out = work->scales + m.i * sb;
       if (!m.ok) {
-        std::memset(w_out, 0, kDim);
-        std::memset(s_out, 0, kScales);
+        std::memset(w_out, 0, wb);
+        if (sb) std::memset(s_out, 0, sb);
         s->errors.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
@@ -442,11 +484,11 @@ extern "C" void row_store_lookup(void *opaque) {
       if (s->slots) {
         const uint64_t slot = uint64_t(m.id) % s->slots;
         std::lock_guard<std::mutex> guard(s->locks[slot % kLockShards]);
-        std::memcpy(s->cache + slot * kRow, m.row, kRow);
+        std::memcpy(s->cache + slot * s->row_bytes, m.row, s->row_bytes);
         s->keys[slot] = uint64_t(m.id) + 1;
       }
-      std::memcpy(w_out, m.row, kDim);
-      std::memcpy(s_out, m.row + kDim, kScales);
+      std::memcpy(w_out, m.row, wb);
+      if (sb) std::memcpy(s_out, m.row + wb, sb);
     }
   }
   s->calls.fetch_add(1, std::memory_order_relaxed);
@@ -459,7 +501,7 @@ extern "C" void row_store_stats(Store *s, uint64_t *out) {
   out[0] = s->hits.load();
   out[1] = s->misses.load();
   out[2] = s->reads.load();
-  out[3] = s->slots * kSlotBytes;
+  out[3] = s->slots * (s->row_bytes + sizeof(uint64_t));
   out[4] = s->errors.load();
   out[5] = s->slots;
   out[6] = s->calls.load();
@@ -488,7 +530,7 @@ extern "C" void row_store_close(Store *s) {
   scales_free(s);
   if (s->resident) munmap(s->resident, s->resident_size);
   if (s->slots) {
-    munmap(s->cache, s->slots * kRow);
+    munmap(s->cache, s->slots * s->row_bytes);
     munmap(s->keys, s->slots * sizeof(uint64_t));
   }
   if (s->fd >= 0) close(s->fd);

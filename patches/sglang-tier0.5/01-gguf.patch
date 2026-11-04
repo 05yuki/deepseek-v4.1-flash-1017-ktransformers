@@ -1,0 +1,3066 @@
+From 36a5d8fb9b1efb904b51aeb47e005224c56fba28 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Wed, 4 Nov 2026 20:43:41 +0900
+Subject: [PATCH] gguf: DeepSeek-V4.1 from a GGUF pack, the format on tier 0
+
+The pieces a GGUF pack needs that stand on tier 0 alone: the dense weights read
+from a "deepseek41" GGUF under the checkpoint's own names (KT_GGUF_V41_DENSE,
+kt_gguf_dense_v41), the GGUF wo_a (MMQ, dequant + GEMM, or one MoE-vector launch),
+the GGUF quant config next to expert_pack, the GPU hot experts as raw GGUF blocks
+(kt_gguf_hot, kt_gguf_moe_multi with llama.cpp's vec-dot headers copied from
+SGLang by setup.sh), the GGUF dequantizers, and the SM75 paths (Triton e4m3 and
+fp32 dots below SM80/89, bf16 kept with KT_SM75_BF16).
+
+Nothing here runs for the MXFP4 checkpoint: the loader, the hot method and the
+RoPE rows take a GGUF pack only (KT_GGUF_V41_DENSE, kt_config.method LLAMAFILE),
+the SM75 branches are capability checks. The RoPE rows past KT_ROPE_DEVICE_ROWS
+go to host memory only with tier 1's kv-vmm; without it the table stays on the
+GPU.
+---
+ .../ops/attention/dsv4/fp4_rope_fake_quant.py |  16 +-
+ .../triton_mla_kernels_decode_fused.py        |  73 +-
+ python/sglang/kernels/ops/gemm/bf16_fp32.py   |   7 +
+ .../layers/attention/deepseek_v4_backend.py   |   3 +-
+ python/sglang/srt/layers/kt_sm75_ops.py       | 136 +++
+ .../srt/layers/moe/fused_moe_triton/layer.py  |  14 +-
+ .../srt/layers/moe/kt_gguf_dense_v41.py       | 188 ++++
+ .../sglang/srt/layers/moe/kt_gguf_dequant.py  | 209 ++++
+ python/sglang/srt/layers/moe/kt_gguf_hot.py   | 330 ++++++
+ .../srt/layers/moe/kt_gguf_moe_multi.py       | 112 +++
+ .../moe/kt_gguf_moe_multi/ggml-common.h       |  99 +-
+ .../kt_gguf_moe_multi/kt_gguf_moe_multi.cu    | 951 ++++++++++++++++++
+ .../layers/moe/kt_gguf_moe_multi/vecdotq.cuh  |  60 +-
+ .../sglang/srt/layers/moe/kt_gguf_tables.py   |  22 +
+ python/sglang/srt/layers/quantization/gguf.py | 172 ++++
+ .../load_model_utils.py                       |   3 +-
+ python/sglang/srt/model_loader/loader.py      |  15 +-
+ python/sglang/srt/models/deepseek_v4.py       | 124 ++-
+ 18 files changed, 2464 insertions(+), 70 deletions(-)
+ create mode 100644 python/sglang/srt/layers/kt_sm75_ops.py
+ create mode 100644 python/sglang/srt/layers/moe/kt_gguf_dense_v41.py
+ create mode 100644 python/sglang/srt/layers/moe/kt_gguf_dequant.py
+ create mode 100644 python/sglang/srt/layers/moe/kt_gguf_hot.py
+ create mode 100644 python/sglang/srt/layers/moe/kt_gguf_moe_multi.py
+ create mode 100644 python/sglang/srt/layers/moe/kt_gguf_moe_multi/kt_gguf_moe_multi.cu
+ create mode 100644 python/sglang/srt/layers/moe/kt_gguf_tables.py
+
+diff --git a/python/sglang/kernels/ops/attention/dsv4/fp4_rope_fake_quant.py b/python/sglang/kernels/ops/attention/dsv4/fp4_rope_fake_quant.py
+index bc103d3d..a99875df 100644
+--- a/python/sglang/kernels/ops/attention/dsv4/fp4_rope_fake_quant.py
++++ b/python/sglang/kernels/ops/attention/dsv4/fp4_rope_fake_quant.py
+@@ -11,6 +11,20 @@ from triton.language.extra import libdevice
+ 
+ from sglang.kernels.ops.quantization.fp4_fake_quant import FP4_AMAX_FLOOR
+ 
++# Triton has no e4m3 type below SM89
++_PRE_SM89 = tl.constexpr(bool(torch.cuda.is_available() and torch.version.hip is None and torch.cuda.get_device_capability() < (8, 9)))
++
++
++@triton.jit
++def _round_e4m3(x):
++    """A positive float32 in [2^-9, 448] rounded to the nearest e4m3 value (ties to even), as a float32."""
++    if _PRE_SM89:
++        e = tl.maximum(((x.to(tl.int32, bitcast=True) >> 23) & 0xFF) - 127, -6)
++        q = ((e + 124) << 23).to(tl.float32, bitcast=True)  # 2^(e - 3), the e4m3 spacing at x
++        return tl.minimum(libdevice.rint(x / q) * q, 448.0)
++    else:
++        return x.to(tl.float8e4nv).to(tl.float32)
++
+ 
+ @triton.jit
+ def rope_tail_fake_quant_fp4_row(
+@@ -54,7 +68,7 @@ def rope_tail_fake_quant_fp4_row(
+     amax = tl.max(tl.abs(vb), axis=1)
+     if COMPRESSED_KV:
+         scale = tl.minimum(tl.maximum(amax * (1.0 / 6.0), 2.0**-9), 448.0)
+-        scale = scale.to(tl.float8e4nv).to(tl.float32)
++        scale = _round_e4m3(scale)
+         s = tl.div_rn(vb, scale[:, None])
+     else:
+         amax = tl.maximum(amax, AMAX_FLOOR) * (1.0 / 6.0)
+diff --git a/python/sglang/kernels/ops/attention/dsv4/triton_sparse_decode/triton_mla_kernels_decode_fused.py b/python/sglang/kernels/ops/attention/dsv4/triton_sparse_decode/triton_mla_kernels_decode_fused.py
+index c0a4f3bc..30fb97b8 100644
+--- a/python/sglang/kernels/ops/attention/dsv4/triton_sparse_decode/triton_mla_kernels_decode_fused.py
++++ b/python/sglang/kernels/ops/attention/dsv4/triton_sparse_decode/triton_mla_kernels_decode_fused.py
+@@ -23,6 +23,33 @@ from sglang.srt.utils.common import is_gfx942_supported
+ # gfx950/MI350 and CUDA store OCP e4m3fn (bias 7).
+ _KV_FP8_TY = tl.float8e4b8 if is_gfx942_supported() else tl.float8e4nv
+ 
++# below SM80 Triton has no FP8 type and no bf16 dot
++_PRE_SM80 = tl.constexpr(bool(torch.cuda.is_available() and torch.version.hip is None and torch.cuda.get_device_capability() < (8, 0)))
++
++
++@triton.jit
++def _kv_fp8(x_u8):
++    """e4m3 bytes as values: the FP8 type, or below SM80 float32 built from the bit fields (e4m3fn; no NaN bytes
++    are written)."""
++    if _PRE_SM80:
++        x = x_u8.to(tl.int32)
++        e = (x >> 3) & 0xF
++        m = x & 7
++        normal = (((x >> 7) << 31) | ((e + 120) << 23) | (m << 20)).to(tl.float32, bitcast=True)
++        sub = m.to(tl.float32) * 0.001953125
++        sub = tl.where((x >> 7) != 0, -sub, sub)
++        return tl.where(e == 0, sub, normal)
++    else:
++        return x_u8.to(_KV_FP8_TY, bitcast=True)
++
++
++@triton.jit
++def _kdot(a, b):
++    if _PRE_SM80:
++        return tl.dot(a.to(tl.float32), b.to(tl.float32), input_precision="ieee")
++    else:
++        return tl.dot(a, b)
++
+ 
+ def _bucket_total_tokens(total_tokens: int) -> int:
+     """Round total_tokens up to the nearest power of 2 for autotune key stability."""
+@@ -219,44 +246,44 @@ def _process_kv_block_aggressive(
+ 
+     qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
+ 
+-    nope_fp8_0 = nope_uint8_0.to(_KV_FP8_TY, bitcast=True)
++    nope_fp8_0 = _kv_fp8(nope_uint8_0)
+     kv_0 = (nope_fp8_0.to(tl.bfloat16) * scale_bf16_0[:, None]).to(tl.bfloat16)
+     kv_0 = tl.where(valid_2d, kv_0, 0.0)
+-    qk += tl.dot(q_0, tl.trans(kv_0)).to(tl.float32)
++    qk += _kdot(q_0, tl.trans(kv_0)).to(tl.float32)
+ 
+-    nope_fp8_1 = nope_uint8_1.to(_KV_FP8_TY, bitcast=True)
++    nope_fp8_1 = _kv_fp8(nope_uint8_1)
+     kv_1 = (nope_fp8_1.to(tl.bfloat16) * scale_bf16_1[:, None]).to(tl.bfloat16)
+     kv_1 = tl.where(valid_2d, kv_1, 0.0)
+-    qk += tl.dot(q_1, tl.trans(kv_1)).to(tl.float32)
++    qk += _kdot(q_1, tl.trans(kv_1)).to(tl.float32)
+ 
+-    nope_fp8_2 = nope_uint8_2.to(_KV_FP8_TY, bitcast=True)
++    nope_fp8_2 = _kv_fp8(nope_uint8_2)
+     kv_2 = (nope_fp8_2.to(tl.bfloat16) * scale_bf16_2[:, None]).to(tl.bfloat16)
+     kv_2 = tl.where(valid_2d, kv_2, 0.0)
+-    qk += tl.dot(q_2, tl.trans(kv_2)).to(tl.float32)
++    qk += _kdot(q_2, tl.trans(kv_2)).to(tl.float32)
+ 
+-    nope_fp8_3 = nope_uint8_3.to(_KV_FP8_TY, bitcast=True)
++    nope_fp8_3 = _kv_fp8(nope_uint8_3)
+     kv_3 = (nope_fp8_3.to(tl.bfloat16) * scale_bf16_3[:, None]).to(tl.bfloat16)
+     kv_3 = tl.where(valid_2d, kv_3, 0.0)
+-    qk += tl.dot(q_3, tl.trans(kv_3)).to(tl.float32)
++    qk += _kdot(q_3, tl.trans(kv_3)).to(tl.float32)
+ 
+-    nope_fp8_4 = nope_uint8_4.to(_KV_FP8_TY, bitcast=True)
++    nope_fp8_4 = _kv_fp8(nope_uint8_4)
+     kv_4 = (nope_fp8_4.to(tl.bfloat16) * scale_bf16_4[:, None]).to(tl.bfloat16)
+     kv_4 = tl.where(valid_2d, kv_4, 0.0)
+-    qk += tl.dot(q_4, tl.trans(kv_4)).to(tl.float32)
++    qk += _kdot(q_4, tl.trans(kv_4)).to(tl.float32)
+ 
+-    nope_fp8_5 = nope_uint8_5.to(_KV_FP8_TY, bitcast=True)
++    nope_fp8_5 = _kv_fp8(nope_uint8_5)
+     kv_5 = (nope_fp8_5.to(tl.bfloat16) * scale_bf16_5[:, None]).to(tl.bfloat16)
+     kv_5 = tl.where(valid_2d, kv_5, 0.0)
+-    qk += tl.dot(q_5, tl.trans(kv_5)).to(tl.float32)
++    qk += _kdot(q_5, tl.trans(kv_5)).to(tl.float32)
+ 
+-    nope_fp8_6 = nope_uint8_6.to(_KV_FP8_TY, bitcast=True)
++    nope_fp8_6 = _kv_fp8(nope_uint8_6)
+     kv_6 = (nope_fp8_6.to(tl.bfloat16) * scale_bf16_6[:, None]).to(tl.bfloat16)
+     kv_6 = tl.where(valid_2d, kv_6, 0.0)
+-    qk += tl.dot(q_6, tl.trans(kv_6)).to(tl.float32)
++    qk += _kdot(q_6, tl.trans(kv_6)).to(tl.float32)
+ 
+     kv_7 = (rope_lo | (rope_hi << 8)).to(tl.bfloat16, bitcast=True)
+     kv_7 = tl.where(valid_2d, kv_7, 0.0)
+-    qk += tl.dot(q_7, tl.trans(kv_7)).to(tl.float32)
++    qk += _kdot(q_7, tl.trans(kv_7)).to(tl.float32)
+ 
+     qk = qk * sm_scale
+     qk = tl.where(valid[None, :], qk, NEG_INF)
+@@ -268,14 +295,14 @@ def _process_kv_block_aggressive(
+     l_new = alpha * l_i + tl.sum(p, axis=1)
+     p_bf16 = p.to(tl.bfloat16)
+ 
+-    acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, kv_0).to(tl.float32)
+-    acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, kv_1).to(tl.float32)
+-    acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, kv_2).to(tl.float32)
+-    acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, kv_3).to(tl.float32)
+-    acc_4 = acc_4 * alpha[:, None] + tl.dot(p_bf16, kv_4).to(tl.float32)
+-    acc_5 = acc_5 * alpha[:, None] + tl.dot(p_bf16, kv_5).to(tl.float32)
+-    acc_6 = acc_6 * alpha[:, None] + tl.dot(p_bf16, kv_6).to(tl.float32)
+-    acc_7 = acc_7 * alpha[:, None] + tl.dot(p_bf16, kv_7).to(tl.float32)
++    acc_0 = acc_0 * alpha[:, None] + _kdot(p_bf16, kv_0).to(tl.float32)
++    acc_1 = acc_1 * alpha[:, None] + _kdot(p_bf16, kv_1).to(tl.float32)
++    acc_2 = acc_2 * alpha[:, None] + _kdot(p_bf16, kv_2).to(tl.float32)
++    acc_3 = acc_3 * alpha[:, None] + _kdot(p_bf16, kv_3).to(tl.float32)
++    acc_4 = acc_4 * alpha[:, None] + _kdot(p_bf16, kv_4).to(tl.float32)
++    acc_5 = acc_5 * alpha[:, None] + _kdot(p_bf16, kv_5).to(tl.float32)
++    acc_6 = acc_6 * alpha[:, None] + _kdot(p_bf16, kv_6).to(tl.float32)
++    acc_7 = acc_7 * alpha[:, None] + _kdot(p_bf16, kv_7).to(tl.float32)
+ 
+     return acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_new, l_new
+ 
+diff --git a/python/sglang/kernels/ops/gemm/bf16_fp32.py b/python/sglang/kernels/ops/gemm/bf16_fp32.py
+index 50f40afa..a832049b 100644
+--- a/python/sglang/kernels/ops/gemm/bf16_fp32.py
++++ b/python/sglang/kernels/ops/gemm/bf16_fp32.py
+@@ -134,12 +134,19 @@ def _linear_bf16_fp32_hpc(
+     )
+ 
+ 
++_PRE_SM80 = bool(torch.cuda.is_available() and torch.version.hip is None and torch.cuda.get_device_capability() < (8, 0))
++
++
+ def linear_bf16_fp32(
+     x: torch.Tensor,
+     y: torch.Tensor,
+     *,
+     hpc_kernel_min_m: Optional[int] = None,
+ ) -> torch.Tensor:
++    if _PRE_SM80:
++        # cuBLAS has no bf16-in / fp32-out GEMM below SM80: fp32 operands (bf16 values and their
++        # products are exact in fp32; only the order of the sums differs)
++        return torch.nn.functional.linear(x.float(), y.float())
+     if hpc_kernel_min_m is not None:
+         output = _linear_bf16_fp32_hpc(x, y, min_m=hpc_kernel_min_m)
+         if output is not None:
+diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+index ded2e685..d97de79c 100644
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -255,7 +255,8 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
+ def _use_sm89_sparse_attention() -> bool:
+     # Ada has BF16 tensor cores, but cannot run FlashMLA's SM90+ kernels.
+     # Match the runtime platform exactly; native SM90/SM100/SM120 paths stay intact.
+-    return _is_cuda and get_platform().device_capability == (8, 9)
++    # Turing too (the Triton kernels open FP8 and dot in fp32 there)
++    return _is_cuda and get_platform().device_capability in ((8, 9), (7, 5))
+ 
+ 
+ def _create_flashmla_metadata():
+diff --git a/python/sglang/srt/layers/kt_sm75_ops.py b/python/sglang/srt/layers/kt_sm75_ops.py
+new file mode 100644
+index 00000000..187a9665
+--- /dev/null
++++ b/python/sglang/srt/layers/kt_sm75_ops.py
+@@ -0,0 +1,136 @@
++"""sgl-kernel's CUDA ops that DeepSeek V4 GGUF serving calls, built for GPUs older than the sgl-kernel wheel's arches.
++
++The sgl-kernel wheel carries sm_80 and newer code only (no PTX), so on Turing (SM75) its ops fail with "no kernel
++image". The same sources (python/sglang/kernels/aot/csrc) are built here with torch's JIT loader for the GPU's own
++arch and registered as the sgl_kernel ops' CUDA kernels in their place; the Python call sites stay as they are.
++Nothing is built or registered on SM80 and newer.
++"""
++
++import logging
++import os
++import re
++from pathlib import Path
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++_AOT = Path(__file__).resolve().parents[2] / "kernels" / "aot"
++_SOURCES = (
++    "csrc/quantization/gguf/gguf_kernel.cu",
++    "csrc/elementwise/activation.cu",
++    "csrc/elementwise/pos_enc.cu",
++    "csrc/moe/moe_sum.cu",
++    "csrc/moe/moe_topk_sigmoid_kernels.cu",
++    "csrc/moe/moe_topk_softmax_kernels.cu",
++)
++_OPS = (
++    "silu_and_mul",
++    "gelu_and_mul",
++    "rotary_embedding",
++    "topk_softmax",
++    "topk_sigmoid",
++    "moe_sum",
++    "ggml_dequantize",
++    "ggml_mul_mat_vec_a8",
++    "ggml_mul_mat_a8",
++    "ggml_moe_a8",
++    "ggml_moe_a8_vec",
++)
++_BIND = """#include <torch/all.h>
++#include <torch/library.h>
++#include "sgl_kernel_ops.h"
++
++TORCH_LIBRARY_IMPL(sgl_kernel, CUDA, m) {
++%s
++}
++""" % "\n".join(f'  m.impl("{op}", &{op});' for op in _OPS)
++
++_loaded = False
++
++
++def needed() -> bool:
++    return (
++        torch.cuda.is_available()
++        and torch.version.hip is None
++        and torch.cuda.get_device_capability() < (8, 0)
++        and os.environ.get("KT_SM75_OPS", "1") == "1"
++    )
++
++
++def _load():
++    from torch.utils.cpp_extension import _get_build_directory, load
++
++    import sgl_kernel  # noqa: F401  (the op schemas this registers kernels for)
++
++    major, minor = torch.cuda.get_device_capability()
++    arch = f"{major}{minor}"
++    name = f"kt_sm75_ops_sm{arch}"
++    build = Path(_get_build_directory(name, verbose=False))
++    bind = build / "bind.cc"
++    if not bind.exists() or bind.read_text() != _BIND:
++        bind.write_text(_BIND)
++    try:
++        import flashinfer
++
++        fi_include = [str(Path(flashinfer.__file__).parent / "data" / "include")]
++    except Exception:
++        fi_include = []
++    sources = [str(bind)]
++    for s in _SOURCES:
++        if s.endswith("activation.cu"):
++            # the installed FlashInfer's act_and_mul_kernel takes its vector width as a third template argument and
++            # is bounded to 256 threads a block (sgl-kernel's wheel was built against one without either): a copy
++            # with the width the old kernel used and blocks of at most 256 (the kernel strides over the row)
++            text = re.sub(
++                r"flashinfer::activation::act_and_mul_kernel<c_type, (\w+)>",
++                r"flashinfer::activation::act_and_mul_kernel<c_type, \1, 16 / sizeof(c_type)>",
++                (_AOT / s).read_text(),
++            ).replace("std::min(d / vec_size, 1024U)", "std::min(d / vec_size, 256U)")
++            copy = build / "activation.cu"
++            if not copy.exists() or copy.read_text() != text:
++                copy.write_text(text)
++            sources.append(str(copy))
++        else:
++            sources.append(str(_AOT / s))
++    return load(
++        name=name,
++        sources=sources,
++        extra_include_paths=[
++            str(_AOT / "include"),
++            str(_AOT / "csrc"),
++            str(_AOT / "csrc" / "quantization" / "gguf"),
++            str(_AOT / "csrc" / "moe"),
++        ]
++        + fi_include,
++        extra_cflags=["-O3", "-std=c++20"],
++        extra_cuda_cflags=[
++            "-O3",
++            "-std=c++20",
++            f"-gencode=arch=compute_{arch},code=sm_{arch}",
++            "--expt-relaxed-constexpr",
++            "--expt-extended-lambda",
++            # as sgl-kernel's own build (its CMakeLists): the fp16 / bf16 dispatch, and the half / bf16 conversions
++            # torch's JIT turns off
++            "-DNDEBUG",
++            "-DFLASHINFER_ENABLE_F16",
++            "-DFLASHINFER_ENABLE_BF16",
++            "-U__CUDA_NO_HALF_OPERATORS__",
++            "-U__CUDA_NO_HALF_CONVERSIONS__",
++            "-U__CUDA_NO_HALF2_OPERATORS__",
++            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
++            "-U__CUDA_NO_BFLOAT16_OPERATORS__",
++        ],
++        is_python_module=False,  # the library only registers kernels for the sgl_kernel ops
++        verbose=os.environ.get("KT_SM75_OPS_VERBOSE") == "1",
++    )
++
++
++def load_if_needed() -> None:
++    """Build (once, cached in torch's extensions directory) and register the kernels when the GPU needs them."""
++    global _loaded
++    if _loaded or not needed():
++        return
++    _load()
++    _loaded = True
++    logger.info("sgl-kernel ops built for sm_%d%d: %s", *torch.cuda.get_device_capability(), ", ".join(_OPS))
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+index d27675f8..f39af794 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+@@ -537,7 +537,19 @@ class FusedMoE(torch.nn.Module):
+         server_args = get_server_args()
+         kt_config = create_kt_config_from_server_args(server_args, layer_id)
+         if kt_config is not None:
+-            if self.quant_method is not None:
++            import os
++
++            if (
++                (os.environ.get("KT_GGUF_DENSE") or os.environ.get("KT_GGUF_V41_DENSE"))
++                and kt_config.method == "LLAMAFILE"
++                and os.environ.get("KT_GGUF_HOT", "1") == "1"
++            ):
++                # the experts are a GGUF and so is the rest of the model: the
++                # hot slots hold raw GGUF blocks (kt_gguf_hot.py)
++                from sglang.srt.layers.moe.kt_gguf_hot import KTGGUFHotExpertsMethod
++
++                gpu_method = KTGGUFHotExpertsMethod(kt_config, self)
++            elif self.quant_method is not None:
+                 gpu_method = self.quant_method
+             elif quant_config is not None:
+                 gpu_method = quant_config.get_quant_method(self, prefix)
+diff --git a/python/sglang/srt/layers/moe/kt_gguf_dense_v41.py b/python/sglang/srt/layers/moe/kt_gguf_dense_v41.py
+new file mode 100644
+index 00000000..c5cd5f34
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/kt_gguf_dense_v41.py
+@@ -0,0 +1,188 @@
++"""Dense (non-expert) weights of a DeepSeek-V4.1 GGUF (llama.cpp arch "deepseek41") as the checkpoint's own
++tensor names, so DeepseekV4ForCausalLM.load_weights loads a GGUF the way it loads the safetensors checkpoint.
++
++The converter changed no values (every F32 / BF16 tensor is bit-identical to the
++checkpoint) and one shape: wo_a comes as [8, 1024, 4096] for [8192, 4096]. The pack's llama.cpp layout (2026-10-27
++and later) names engram_wkv engram_kv, keeps wo_a 2D, and folds engram_q and engram_k into the F32 engram_gate
++(q * k, exact), which is split back into a bf16 pair with exactly that product (_split_gate) and loaded as
++engram.q_weight / engram.k_weight; its vision router bias (exp_probs_b_vl) is skipped. Quantized tensors (Q5_K, Q8_0, ...)
++are dequantized to bf16 with gguf-py; F32 / BF16 are viewed. Not yielded: the routed experts
++(blk.N.ffn_*_exps, kt-kernel reads them from the same GGUF) and the engram tables (the engram adapter reads its
++rows itself). KT_GGUF_DENSE_THREADS=<n> dequantizes the big tensors in row blocks on n threads.
++
++With a model whose layers carry SGLang's GGUF linear method (quantization_config {"quant_method": "gguf",
++"modules_to_not_convert": [...]}), a quantized tensor whose layer has a .qweight parameter is yielded as its
++GGUF bytes (<name>.qweight, [rows, row bytes] uint8) and type (<name>.qweight_type), so it stays quantized on the
++GPU; everything else is dequantized as above.
++"""
++import glob
++import os
++import re
++from typing import Iterator, Tuple
++
++import numpy as np
++import torch
++
++import gguf.quants
++from gguf import GGUFReader
++
++_LAYER = {
++    "attn_norm": "attn_norm.weight",
++    "ffn_norm": "ffn_norm.weight",
++    "attn_q_a": "attn.wq_a.weight",
++    "attn_q_a_norm": "attn.q_norm.weight",
++    "attn_q_b": "attn.wq_b.weight",
++    "attn_kv": "attn.wkv.weight",
++    "attn_kv_a_norm": "attn.kv_norm.weight",
++    "attn_output_a": "attn.wo_a.weight",
++    "attn_output_b": "attn.wo_b.weight",
++    "attn_sinks": "attn.attn_sink",
++    "attn_compressor_kv": "attn.compressor.wkv.weight",
++    "attn_compressor_gate": "attn.compressor.wgate.weight",
++    "attn_compressor_norm": "attn.compressor.norm.weight",
++    "indexer.attn_q_b": "attn.indexer.wq_b.weight",
++    "indexer.attn_k": "attn.indexer.wk.weight",
++    "indexer.k_norm": "attn.indexer.k_norm.weight",
++    "indexer.proj": "attn.indexer.weights_proj.weight",
++    "ffn_gate_inp": "ffn.gate.weight",
++    "exp_probs_b": "ffn.gate.bias",
++    "ffn_gate_shexp": "ffn.shared_experts.w1.weight",
++    "ffn_down_shexp": "ffn.shared_experts.w2.weight",
++    "ffn_up_shexp": "ffn.shared_experts.w3.weight",
++    "hc_attn_base": "hc_attn_base",
++    "hc_attn_fn": "hc_attn_fn",
++    "hc_attn_scale": "hc_attn_scale",
++    "hc_ffn_base": "hc_ffn_base",
++    "hc_ffn_fn": "hc_ffn_fn",
++    "hc_ffn_scale": "hc_ffn_scale",
++    "engram_q": "engram.q_weight",
++    "engram_k": "engram.k_weight",
++    "engram_wkv": "engram.wkv.weight",
++    # the llama.cpp layout
++    "engram_kv": "engram.wkv.weight",
++    "engram_gate": "engram.gate",  # split into q_weight and k_weight (_split_gate)
++}
++_GLOBAL = {"token_embd": "embed.weight", "output": "head.weight", "output_norm": "norm.weight"}
++_SKIP = ("_exps", "engram_embd", "exp_probs_b_vl")
++
++
++def checkpoint_name(gguf_name: str):
++    """The checkpoint name of a GGUF tensor, or None for what this source does not serve."""
++    stem = re.sub(r"\.(weight|bias)$", "", gguf_name)
++    if stem in _GLOBAL:
++        return _GLOBAL[stem]
++    m = re.match(r"blk\.(\d+)\.(.+)$", stem)
++    if not m:
++        return None  # engram hash tables (engram_token_map / primes / offsets / multipliers): config, not weights
++    layer, key = int(m.group(1)), m.group(2)
++    if key.endswith(_SKIP):
++        return None
++    if key not in _LAYER:
++        raise KeyError(f"no checkpoint name for GGUF tensor {gguf_name}")
++    return f"layers.{layer}.{_LAYER[key]}"
++
++
++def _to_torch(t) -> torch.Tensor:
++    shape = tuple(int(x) for x in reversed(t.shape.tolist()))  # ggml order -> torch order
++    kind = t.tensor_type.name
++    raw = np.asarray(t.data)
++    if kind == "F32":
++        return torch.from_numpy(raw.view(np.float32).reshape(shape).copy())
++    if kind == "F16":
++        return torch.from_numpy(raw.view(np.float16).reshape(shape).copy()).to(torch.bfloat16)
++    if kind == "BF16":
++        return torch.from_numpy(raw.view(np.int16).reshape(shape).copy()).view(torch.bfloat16)
++    threads = int(os.environ.get("KT_GGUF_DENSE_THREADS", "8") or 1)
++    rows = raw.reshape(-1, raw.shape[-1])  # [..., row bytes]: blocks never cross a row
++    if threads > 1 and rows.shape[0] >= 4 * threads and raw.nbytes >= (32 << 20):
++        from concurrent.futures import ThreadPoolExecutor
++
++        parts = np.array_split(rows, 4 * threads, axis=0)
++        with ThreadPoolExecutor(max_workers=threads) as ex:
++            f = np.concatenate(list(ex.map(lambda r: gguf.quants.dequantize(r, t.tensor_type), parts)), axis=0)
++    else:
++        f = gguf.quants.dequantize(rows, t.tensor_type)
++    return torch.from_numpy(f.reshape(shape)).to(torch.bfloat16)
++
++
++_STACKED = ((".gate_proj.", ".gate_up_proj."), (".up_proj.", ".gate_up_proj."))
++
++
++def _quantized_params(model):
++    """Checkpoint name -> True for the tensors whose layer keeps GGUF bytes (has a .qweight)."""
++    if model is None:
++        return lambda name: False
++    params = {n for n, _ in model.named_parameters()}
++    remap = getattr(type(model), "remap_weight_name_to_dpsk_hf_format", None)
++    if remap is None:
++        return lambda name: False
++
++    def quantized(name):
++        if not name.endswith(".weight"):
++            return False
++        pname = remap(name)[: -len(".weight")] + ".qweight"
++        if pname in params:
++            return True
++        return any(a in pname and pname.replace(a, b) in params for a, b in _STACKED)
++
++    return quantized
++
++
++def _split_gate(g: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
++    """bf16 q, k with q * k == g exactly in fp32. g is a product of two bf16 values, so |g| = n * 2^E with n a product
++    of two integers below 256; any such pair of factors serves (the Engram gate multiplies q and k in fp32 first)."""
++    g = g.float().contiguous()
++    nz = g != 0
++    a = g.abs().masked_fill(~nz, 1.0)
++    _, e = torch.frexp(a)
++    n = torch.ldexp(a, 16 - e).round().long()  # 16-bit integer significand, exact: g has at most 16 significant bits
++    E = e - 16
++    tz = (n & -n).float().log2().long()  # strip the powers of two into the exponent
++    n, E = n >> tz, E + tz
++    d = torch.arange(1, 256, dtype=torch.long)
++    ok = (n.reshape(-1, 1) % d == 0) & (n.reshape(-1, 1) // d <= 255)
++    assert bool(ok.any(dim=1).all()), "engram_gate is not a product of two bf16 values"
++    qa = d[ok.float().argmax(dim=1)].reshape(n.shape)
++    kb = n // qa
++    q = (torch.ldexp(qa.float(), E) * torch.sign(g)).masked_fill(~nz, 0.0).to(torch.bfloat16)
++    k = kb.float().masked_fill(~nz, 1.0).to(torch.bfloat16)
++    assert torch.equal(q.float() * k.float(), g), "engram_gate split is not exact"
++    return q, k
++
++
++def gguf_v41_dense_weights(gguf_dir: str, model=None) -> Iterator[Tuple[str, torch.Tensor]]:
++    shards = sorted(glob.glob(os.path.join(gguf_dir, "*-000??-of-000??.gguf")))
++    if not shards:
++        raise FileNotFoundError(f"no GGUF shards (*-0000N-of-0000M.gguf) in {gguf_dir}")
++    quantized = _quantized_params(model)
++    for path in shards:
++        for t in GGUFReader(path).tensors:
++            name = checkpoint_name(t.name)
++            if name is None:
++                continue
++            if quantized(name):
++                base = name[: -len(".weight")]
++                if t.tensor_type.name in ("F32", "F16", "BF16"):
++                    # a GGUF linear whose weight the GGUF keeps unquantized: the bf16 matrix itself, typed BF16
++                    # (SGLang's GGUF method multiplies those directly)
++                    yield base + ".qweight_type", torch.tensor(30, dtype=torch.uint8)
++                    yield base + ".qweight", _to_torch(t).to(torch.bfloat16)
++                    continue
++                raw = torch.from_numpy(np.asarray(t.data).reshape(-1, np.asarray(t.data).shape[-1]).copy())
++                yield base + ".qweight_type", torch.tensor(int(t.tensor_type), dtype=torch.uint8)
++                yield base + ".qweight", raw
++                continue
++            w = _to_torch(t)
++            if name.endswith(".engram.gate"):
++                q, k = _split_gate(w)
++                yield name[: -len("gate")] + "q_weight", q
++                yield name[: -len("gate")] + "k_weight", k
++                continue
++            if name.endswith("attn.wo_a.weight") and w.dim() == 3:
++                w = w.reshape(-1, w.shape[-1])  # [8, 1024, 4096] -> [8192, 4096]
++            yield name, w
++    if model is not None:
++        # (runs once the loader has taken the last tensor) parameters nothing filled: a name map gap
++        left = [n for n, prm in model.named_parameters() if type(prm).__name__.endswith("UninitializedParameter")]
++        if left:
++            print(f"[kt-gguf-dense] {len(left)} parameters left uninitialized, e.g. {left[:8]}", flush=True)
+diff --git a/python/sglang/srt/layers/moe/kt_gguf_dequant.py b/python/sglang/srt/layers/moe/kt_gguf_dequant.py
+new file mode 100644
+index 00000000..f234a909
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/kt_gguf_dequant.py
+@@ -0,0 +1,209 @@
++"""GGUF block dequantization on the GPU (Triton): IQ2_S, IQ3_XXS, IQ3_S,
++IQ4_XS, IQ4_NL and Q2_0 blocks to bf16 rows, for streaming GGUF experts
++through the W16 prefill path.
++
++Block layouts follow ggml-common.h / dequantize_row_* in ggml-quants.c
++(vendored a94e6ff87) and the upstream Q2_0 (type 42, 64-wide, codes -1..2).
++One program handles one block of one expert; raw bytes are expert-major with
++a byte stride, the output is [n, rows, cols] bf16 with contiguous rows, and a
++block covers BLCK consecutive elements of the flattened expert matrix.
++"""
++import torch
++import triton
++import triton.language as tl
++
++from sglang.srt.layers.moe import kt_gguf_tables as T
++
++QK_K = 256
++
++GGML_IQ2_S = 22
++GGML_IQ3_XXS = 18
++GGML_IQ3_S = 21
++GGML_IQ4_XS = 23
++GGML_IQ4_NL = 20
++GGML_Q2_0 = 42
++
++# type id -> (block elements, block bytes)
++BLOCK_INFO = {
++    GGML_IQ2_S: (256, 82),
++    GGML_IQ3_XXS: (256, 98),
++    GGML_IQ3_S: (256, 110),
++    GGML_IQ4_XS: (256, 136),
++    GGML_IQ4_NL: (32, 18),
++    GGML_Q2_0: (64, 18),
++}
++
++_tables = {}
++
++
++def tables(device):
++    t = _tables.get(device)
++    if t is None:
++        u8 = torch.uint8
++        t = {
++            "iq2s": torch.tensor(T.IQ2S_GRID_BYTES, dtype=u8, device=device),
++            "iq3xxs": torch.tensor(T.IQ3XXS_GRID_BYTES, dtype=u8, device=device),
++            "iq3s": torch.tensor(T.IQ3S_GRID_BYTES, dtype=u8, device=device),
++            "ksigns": torch.tensor(T.KSIGNS_IQ2XS, dtype=u8, device=device),
++            "kvalues": torch.tensor(T.KVALUES_IQ4NL, dtype=torch.int8, device=device),
++        }
++        _tables[device] = t
++    return t
++
++
++@triton.jit
++def _d16(ptr):
++    # the block's fp16 scale at its first two bytes
++    return tl.load(ptr.to(tl.pointer_type(tl.float16))).to(tl.float32)
++
++
++@triton.jit
++def _iq2_s_kernel(raw_ptr, out_ptr, grid_ptr, raw_stride, out_stride, TYPE_SIZE: tl.constexpr):
++    e = tl.program_id(1)
++    b = tl.program_id(0)
++    base = raw_ptr + e * raw_stride + b * TYPE_SIZE
++    d = _d16(base)
++    j = tl.arange(0, 256)
++    ib32 = j // 32
++    l = (j % 32) // 8
++    jj = j % 8
++    qs = tl.load(base + 2 + ib32 * 4 + l).to(tl.int32)
++    sign = tl.load(base + 2 + 32 + ib32 * 4 + l).to(tl.int32)
++    qh = tl.load(base + 2 + 64 + ib32).to(tl.int32)
++    sc = tl.load(base + 2 + 72 + ib32).to(tl.int32)
++    idx = qs | ((qh << (8 - 2 * l)) & 0x300)
++    g = tl.load(grid_ptr + idx * 8 + jj).to(tl.float32)
++    nib = tl.where(l < 2, sc & 0xF, sc >> 4).to(tl.float32)
++    db = d * (0.5 + nib) * 0.25
++    neg = (sign & (tl.full([256], 1, tl.int32) << jj)) != 0
++    y = tl.where(neg, -db * g, db * g)
++    tl.store(out_ptr + e * out_stride + b * 256 + j, y.to(tl.bfloat16))
++
++
++@triton.jit
++def _iq3_xxs_kernel(raw_ptr, out_ptr, grid_ptr, ksigns_ptr, raw_stride, out_stride, TYPE_SIZE: tl.constexpr):
++    e = tl.program_id(1)
++    b = tl.program_id(0)
++    base = raw_ptr + e * raw_stride + b * TYPE_SIZE
++    d = _d16(base)
++    j = tl.arange(0, 256)
++    ib32 = j // 32
++    l = (j % 32) // 8
++    jj = j % 8
++    a0 = tl.load(base + 66 + ib32 * 4 + 0).to(tl.int32)
++    a1 = tl.load(base + 66 + ib32 * 4 + 1).to(tl.int32)
++    a2 = tl.load(base + 66 + ib32 * 4 + 2).to(tl.int32)
++    a3 = tl.load(base + 66 + ib32 * 4 + 3).to(tl.int32)
++    aux = a0 | (a1 << 8) | (a2 << 16) | (a3 << 24)
++    db = d * (0.5 + (a3 >> 4).to(tl.float32)) * 0.5
++    q3 = tl.load(base + 2 + ib32 * 8 + 2 * l + (jj // 4)).to(tl.int32)
++    g = tl.load(grid_ptr + q3 * 4 + (jj % 4)).to(tl.float32)
++    s = tl.load(ksigns_ptr + ((aux >> (7 * l)) & 127)).to(tl.int32)
++    neg = (s & (tl.full([256], 1, tl.int32) << jj)) != 0
++    y = tl.where(neg, -db * g, db * g)
++    tl.store(out_ptr + e * out_stride + b * 256 + j, y.to(tl.bfloat16))
++
++
++@triton.jit
++def _iq3_s_kernel(raw_ptr, out_ptr, grid_ptr, raw_stride, out_stride, TYPE_SIZE: tl.constexpr):
++    e = tl.program_id(1)
++    b = tl.program_id(0)
++    base = raw_ptr + e * raw_stride + b * TYPE_SIZE
++    d = _d16(base)
++    j = tl.arange(0, 256)
++    ib32 = j // 32
++    l = (j % 32) // 8
++    jj = j % 8
++    sub = jj // 4
++    qs = tl.load(base + 2 + ib32 * 8 + 2 * l + sub).to(tl.int32)
++    qh = tl.load(base + 66 + ib32).to(tl.int32)
++    idx = qs | ((qh << (8 - 2 * l - sub)) & 256)
++    g = tl.load(grid_ptr + idx * 4 + (jj % 4)).to(tl.float32)
++    sign = tl.load(base + 74 + ib32 * 4 + l).to(tl.int32)
++    sb = tl.load(base + 106 + ib32 // 2).to(tl.int32)
++    nib = tl.where((ib32 % 2) == 0, sb & 0xF, sb >> 4).to(tl.float32)
++    db = d * (1.0 + 2.0 * nib)
++    neg = (sign & (tl.full([256], 1, tl.int32) << jj)) != 0
++    y = tl.where(neg, -db * g, db * g)
++    tl.store(out_ptr + e * out_stride + b * 256 + j, y.to(tl.bfloat16))
++
++
++@triton.jit
++def _iq4_xs_kernel(raw_ptr, out_ptr, kvalues_ptr, raw_stride, out_stride, TYPE_SIZE: tl.constexpr):
++    e = tl.program_id(1)
++    b = tl.program_id(0)
++    base = raw_ptr + e * raw_stride + b * TYPE_SIZE
++    d = _d16(base)
++    j = tl.arange(0, 256)
++    ib = j // 32
++    jj = j % 32
++    q = tl.load(base + 8 + ib * 16 + (jj % 16)).to(tl.int32)
++    nib = tl.where(jj < 16, q & 0xF, q >> 4)
++    sl = tl.load(base + 4 + ib // 2).to(tl.int32)
++    sl = tl.where((ib % 2) == 0, sl & 0xF, sl >> 4)
++    sh = tl.load(base + 2).to(tl.int32) | (tl.load(base + 3).to(tl.int32) << 8)
++    ls = sl | (((sh >> (2 * ib)) & 3) << 4)
++    dl = d * (ls - 32).to(tl.float32)
++    v = tl.load(kvalues_ptr + nib).to(tl.float32)
++    tl.store(out_ptr + e * out_stride + b * 256 + j, (dl * v).to(tl.bfloat16))
++
++
++@triton.jit
++def _iq4_nl_kernel(raw_ptr, out_ptr, kvalues_ptr, raw_stride, out_stride, TYPE_SIZE: tl.constexpr):
++    # eight 32-wide blocks per program
++    e = tl.program_id(1)
++    b = tl.program_id(0)
++    j = tl.arange(0, 256)
++    bl = b * 8 + j // 32
++    jl = j % 32
++    base = raw_ptr + e * raw_stride + bl * TYPE_SIZE
++    d = tl.load(base.to(tl.pointer_type(tl.float16))).to(tl.float32)
++    q = tl.load(base + 2 + (jl % 16)).to(tl.int32)
++    nib = tl.where(jl < 16, q & 0xF, q >> 4)
++    v = tl.load(kvalues_ptr + nib).to(tl.float32)
++    tl.store(out_ptr + e * out_stride + b * 256 + j, (d * v).to(tl.bfloat16))
++
++
++@triton.jit
++def _q2_0_kernel(raw_ptr, out_ptr, raw_stride, out_stride, TYPE_SIZE: tl.constexpr):
++    # four 64-wide blocks per program
++    e = tl.program_id(1)
++    b = tl.program_id(0)
++    j = tl.arange(0, 256)
++    bl = b * 4 + j // 64
++    jl = j % 64
++    base = raw_ptr + e * raw_stride + bl * TYPE_SIZE
++    d = tl.load(base.to(tl.pointer_type(tl.float16))).to(tl.float32)
++    q = tl.load(base + 2 + jl // 4).to(tl.int32)
++    code = ((q >> (2 * (jl % 4))) & 3).to(tl.float32) - 1.0
++    tl.store(out_ptr + e * out_stride + b * 256 + j, (d * code).to(tl.bfloat16))
++
++
++def dequant_experts(raw: torch.Tensor, raw_stride: int, type_id: int, n: int, rows: int, cols: int,
++                    out: torch.Tensor) -> None:
++    """raw: uint8 device tensor, expert-major, raw_stride bytes per expert
++    (expert bytes = rows * cols / blck * type_size, padding allowed);
++    out: [n, rows, cols] bf16 with contiguous rows (out.stride(0) elements
++    between experts). Runs on the current stream."""
++    blck, tsize = BLOCK_INFO[type_id]
++    assert cols % blck == 0, (type_id, cols, blck)
++    assert out.stride(1) == cols and out.stride(2) == 1
++    assert raw_stride % 2 == 0
++    assert (rows * cols) % 256 == 0, (rows, cols)
++    # every kernel writes 256 elements per program
++    grid = (rows * cols // 256, n)
++    t = tables(out.device)
++    if type_id == GGML_IQ2_S:
++        _iq2_s_kernel[grid](raw, out, t["iq2s"], raw_stride, out.stride(0), TYPE_SIZE=tsize)
++    elif type_id == GGML_IQ3_XXS:
++        _iq3_xxs_kernel[grid](raw, out, t["iq3xxs"], t["ksigns"], raw_stride, out.stride(0), TYPE_SIZE=tsize)
++    elif type_id == GGML_IQ3_S:
++        _iq3_s_kernel[grid](raw, out, t["iq3s"], raw_stride, out.stride(0), TYPE_SIZE=tsize)
++    elif type_id == GGML_IQ4_XS:
++        _iq4_xs_kernel[grid](raw, out, t["kvalues"], raw_stride, out.stride(0), TYPE_SIZE=tsize)
++    elif type_id == GGML_IQ4_NL:
++        _iq4_nl_kernel[grid](raw, out, t["kvalues"], raw_stride, out.stride(0), TYPE_SIZE=tsize)
++    elif type_id == GGML_Q2_0:
++        _q2_0_kernel[grid](raw, out, raw_stride, out.stride(0), TYPE_SIZE=tsize)
++    else:
++        raise ValueError(f"no GPU dequantizer for ggml type {type_id}")
+diff --git a/python/sglang/srt/layers/moe/kt_gguf_hot.py b/python/sglang/srt/layers/moe/kt_gguf_hot.py
+new file mode 100644
+index 00000000..4a1df7d3
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/kt_gguf_hot.py
+@@ -0,0 +1,330 @@
++"""Hot GPU experts straight from a GGUF, for the KT hybrid (--kt-method
++LLAMAFILE with KT_GGUF_DENSE): the GPU slots 0..num_gpu_experts-1 hold this
++rank's TP slice of the expert's raw GGUF blocks, and decode runs SGLang's
++MMVQ MoE kernel (sgl_kernel.ggml_moe_a8_vec: int8 activations, every K-quant
++and i-quant type) on them; windows of up to 4 tokens (decode, MTP verify) run
++kt_gguf_moe_multi instead (same sums, one read per expert, CPU routes skipped);
++longer windows (an extend below the streamer threshold) run that kernel's
++per-route build (moe_a8_vec_routes: ggml's IQ3_S vec_dot, which sgl-kernel's
++lacks; KT_GGUF_MOE_ROUTES=0 goes back to ggml_moe_a8_vec and the Q2_0 window loop).
++Prefill above the streamer threshold never gets here.
++With KV-lent hot experts (KT_HOT_KV_LEND=1, kt_hot_kv_lend.py) the layer carries
++per-slot pointer tables (layer.kt_kv_ptr13 / kt_kv_ptr2, slots 0..E_gpu-1 point
++into w13_qweight / w2_qweight, the lent ones into free KV pages) and the window
++kernel and its per-route build read the weights through them; the hot cache
++gives sgl-kernel's ggml_moe_a8_vec (KT_GGUF_MOE_ROUTES=0) resident-only ids.
++
++Layout per layer (E_gpu = num_gpu_experts, N = intermediate per rank, K = hidden):
++  w13_qweight  uint8 [E_gpu, 2N, row_bytes(K, gate/up type)]   rows [gate; up]
++  w2_qweight   uint8 [E_gpu, K,  row_bytes(N, down type)]
++Gate and up must share a type (they do in every llama.cpp quantization).
++The down of the Q2_0 layers (type 42; sgl-kernel has no kernel for it) stays
++2-bit: kt_gguf_moe_multi has a Q2_0 dot product, and those layers run the window
++kernel at every length. KT_GGUF_Q2_NATIVE=0 repacks it losslessly into Q8_0
++instead (same fp16 d, codes -1..2 as int8, two 32-blocks per 64-block, 4x the
++bytes) for the sgl-kernel path.
++"""
++import os
++import time
++from typing import Dict, Tuple
++
++import numpy as np
++import torch
++from torch.nn import Parameter
++
++from sglang.srt.layers.moe import kt_gguf_moe_multi as _multi
++
++# KT_HOT_FUSED_COMBINE=1 (10-13): the route weighting and the sum over top_k as one Triton kernel instead of
++# out.mul_(w) + moe_sum (an elementwise and a 4 us reduce per layer); bit-identical by construction.
++FUSED_COMBINE = os.environ.get("KT_HOT_FUSED_COMBINE", "1") == "1"
++_combine_kernel = None
++
++
++def _combine_kernel_fn():
++    import triton
++    import triton.language as tl
++
++    @triton.jit
++    def _kt_combine_kernel(out_ptr, w_ptr, res_ptr, K, TOPK: tl.constexpr, BLOCK: tl.constexpr):
++        t = tl.program_id(0)
++        offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++        m = offs < K
++        acc = tl.zeros((BLOCK,), dtype=tl.float32)
++        for k in tl.static_range(TOPK):
++            o = tl.load(out_ptr + (t * TOPK + k) * K + offs, mask=m, other=0.0).to(tl.float32)
++            wk = tl.load(w_ptr + t * TOPK + k).to(tl.bfloat16).to(tl.float32)  # mul_ cast w to bf16 first
++            acc += (o * wk).to(tl.bfloat16).to(tl.float32)
++        tl.store(res_ptr + t * K + offs, acc.to(tl.bfloat16), mask=m)
++
++    return _kt_combine_kernel
++
++
++def _combine(out, w):
++    """out [T, top_k, K] bf16 (the routes' rows), w [T, top_k]: sum_k bf16(out * w) in fp32, rounded once."""
++    global _combine_kernel
++    if _combine_kernel is None:
++        _combine_kernel = _combine_kernel_fn()
++    T, top_k, K = out.shape
++    out = out.contiguous()
++    res = torch.empty((T, K), dtype=out.dtype, device=out.device)
++    _combine_kernel[(T, (K + 1023) // 1024)](out, w.contiguous(), res, K, TOPK=top_k, BLOCK=1024)
++    return res
++from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
++
++GGML_Q8_0 = 8
++GGML_Q2_0 = 42
++BLOCK_INFO = {  # ggml type -> (block elements, block bytes)
++    8: (32, 34), 10: (256, 84), 11: (256, 110), 12: (256, 144), 13: (256, 176), 14: (256, 210),
++    16: (256, 66), 19: (256, 50), 20: (32, 18), 21: (256, 110), 22: (256, 82), 23: (256, 136),
++    18: (256, 98), 42: (64, 18), 17: (256, 74), 29: (256, 56),
++}
++MMVQ_TYPES = {2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 30}
++
++
++def _log(msg):
++    print(f"[kt-gguf-hot {time.strftime('%H:%M:%S')}] {msg}", flush=True)
++
++
++def _row_bytes(cols: int, t: int) -> int:
++    blck, ts = BLOCK_INFO[t]
++    assert cols % blck == 0, (cols, t)
++    return cols // blck * ts
++
++
++def q2_0_to_q8_0(raw: torch.Tensor) -> torch.Tensor:
++    """[..., n_blocks*18] Q2_0 bytes -> [..., n_blocks*2*34] Q8_0 bytes, exact."""
++    shape = raw.shape[:-1]
++    b = raw.reshape(-1, 18).numpy()
++    n = b.shape[0]
++    d = b[:, :2]
++    qs = b[:, 2:]  # 16 bytes, 4 codes each
++    codes = np.stack([(qs >> (2 * s)) & 3 for s in range(4)], axis=2).reshape(n, 64).astype(np.int8) - 1
++    out = np.empty((n, 2, 34), dtype=np.uint8)
++    out[:, :, :2] = d[:, None, :]
++    out[:, 0, 2:] = codes[:, :32].view(np.uint8)
++    out[:, 1, 2:] = codes[:, 32:].view(np.uint8)
++    return torch.from_numpy(out.reshape(*shape, -1))
++
++
++class _GGUFExperts:
++    """One reader shared by all layers of a rank."""
++
++    def __init__(self, path: str):
++        from kt_kernel.utils.loader import GGUFLoader
++
++        self.loader = GGUFLoader(path)
++        cfg = self.loader.get_model_config()
++        self.E = int(cfg["num_experts"])
++        self.inter = int(cfg["moe_intermediate_size"])
++        self.K = int(cfg["hidden_size"])
++
++    def _raw(self, name: str) -> Tuple[torch.Tensor, int]:
++        """The tensor's bytes as a view over the file mapping (the loader's
++        accessor copies; an expert tensor is 1-2 GB)."""
++        import warnings
++
++        info = self.loader.tensor_info[name]
++        t = int(info["dtype"])
++        blck, ts = BLOCK_INFO[t]
++        n_bytes = int(info["n_elements"]) // blck * ts
++        mm = self.loader.file_data_map[self.loader.tensor_file_map[name]]
++        raw = np.frombuffer(mm, dtype=np.uint8, count=n_bytes, offset=int(info["offset"]))
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore")  # read-only buffer, only copied out
++            return torch.from_numpy(raw), t
++
++    def types(self, layer_idx: int) -> Tuple[int, int, int]:
++        return tuple(int(self.loader.get_ggml_type(f"blk.{layer_idx}.ffn_{p}_exps.weight")) for p in ("gate", "up", "down"))
++
++    def slice(self, layer_idx: int, proj: str, N: int, rank: int, experts: torch.Tensor) -> torch.Tensor:
++        """Raw bytes of this rank's TP part of the given logical experts: rows
++        [N*rank, N*(rank+1)) of gate/up, the matching K-columns (block-aligned)
++        of down. Returns uint8 [len(experts), rows, part_row_bytes]."""
++        data, t = self._raw(f"blk.{layer_idx}.ffn_{proj}_exps.weight")
++        blck, ts = BLOCK_INFO[t]
++        if proj != "down":
++            v = data.view(self.E, self.inter, (self.K // blck) * ts)[experts, N * rank:N * (rank + 1), :]
++        else:
++            v = data.view(self.E, self.K, self.inter // blck, ts)[experts, :, (N * rank) // blck:(N * (rank + 1)) // blck, :]
++            v = v.reshape(len(experts), self.K, -1)
++        return v.contiguous()
++
++
++_readers: Dict[str, _GGUFExperts] = {}
++
++
++def _reader(path: str) -> _GGUFExperts:
++    r = _readers.get(path)
++    if r is None:
++        r = _readers[path] = _GGUFExperts(path)
++    return r
++
++
++class KTGGUFHotExpertsMethod(FusedMoEMethodBase):
++    """GPU-expert method the KT wrapper wraps when the experts are a GGUF."""
++
++    # at streamed prefill sizes the wrapper skips this method and the GGUF
++    # streamer covers the hot slots too (its banks hold every expert); the
++    # MMVQ kernel is a decode kernel
++    streams_hot_experts = True
++
++    def __init__(self, kt_config, layer):
++        self.kt_config = kt_config
++        self.num_gpu_experts = kt_config.num_gpu_experts
++        self.reader = _reader(kt_config.weight_path)
++        self.rank, self.world = layer.moe_tp_rank, layer.moe_tp_size
++        # KT_GGUF_HOT_EP (on with more than one rank): whole experts on every rank, not a TP slice of each (a GGUF
++        # block of 256 values cannot be cut); kt_kv_hot_lend gives each rank its own experts' routes
++        self.ep = self.world > 1 and os.environ.get("KT_GGUF_HOT_EP", "1") == "1"
++        self.slice_rank = 0 if self.ep else self.rank
++        self.types = self.reader.types(kt_config.layer_idx)
++        if self.types[0] != self.types[1]:
++            raise RuntimeError(f"layer {kt_config.layer_idx}: gate {self.types[0]} and up {self.types[1]} differ")
++        self.type13 = self.types[0]
++        # Q2_0 downs stay 2-bit on the GPU: kt_gguf_moe_multi has a Q2_0 kernel
++        # (KT_GGUF_Q2_NATIVE=0 keeps the 4x Q8_0 repack for sgl-kernel's)
++        self.q2_native = os.environ.get("KT_GGUF_Q2_NATIVE", "1") == "1"
++        if self.types[2] == GGML_Q2_0:
++            self.type2 = GGML_Q2_0 if self.q2_native else GGML_Q8_0
++        else:
++            self.type2 = self.types[2]
++        for t in (self.type13, self.type2):
++            if t not in MMVQ_TYPES and not (t == GGML_Q2_0 and self.q2_native):
++                raise RuntimeError(f"layer {kt_config.layer_idx}: ggml type {t} has no MMVQ MoE kernel")
++        self.moe_runner_config = None
++
++    def create_weights(self, layer, num_experts, hidden_size, intermediate_size_per_partition, params_dtype,
++                       **extra_weight_attrs):
++        E, N, K = num_experts, intermediate_size_per_partition, hidden_size
++        if self.ep:
++            N = N * self.world
++        self.N, self.K = N, K
++        if (N if self.ep else N * self.world) != self.reader.inter or K != self.reader.K:
++            raise RuntimeError(f"GGUF experts {self.reader.inter}x{self.reader.K} vs layer {N}x{self.world} / {K}")
++        if E == 0:
++            return
++        dev = torch.device("cuda", torch.cuda.current_device())
++        # the loader never touches these (no checkpoint tensor maps here);
++        # process_weights_after_loading fills them from the GGUF
++        w13 = Parameter(torch.empty((E, 2 * N, _row_bytes(K, self.type13)), dtype=torch.uint8, device=dev), requires_grad=False)
++        w2 = Parameter(torch.empty((E, K, _row_bytes(N, self.type2)), dtype=torch.uint8, device=dev), requires_grad=False)
++        w13.weight_loader = w2.weight_loader = self._refuse_loader
++        layer.register_parameter("w13_qweight", w13)
++        layer.register_parameter("w2_qweight", w2)
++
++    @staticmethod
++    def _refuse_loader(param, loaded_weight, *a, **k):
++        raise RuntimeError("GGUF hot experts take no checkpoint expert tensors")
++
++    def process_weights_after_loading(self, layer) -> None:
++        E = layer.w13_qweight.shape[0] if hasattr(layer, "w13_qweight") else self.num_gpu_experts
++        if E == 0:
++            return
++        from sglang.srt.eplb.expert_location_dispatch import get_global_expert_location_metadata
++
++        meta = get_global_expert_location_metadata()
++        p2l = meta.physical_to_logical_map_cpu[self.kt_config.layer_idx][:E].to(torch.int64) if meta is not None else torch.arange(E)
++        self.fill_experts(layer, p2l)
++
++    def fill_experts(self, layer, p2l) -> None:
++        """The rows of the logical experts p2l (one a slot of layer.w13_qweight / w2_qweight) from the GGUF."""
++        E = int(p2l.numel())
++        t0 = time.time()
++        li, N = self.kt_config.layer_idx, self.N
++        gate = self.reader.slice(li, "gate", N, self.slice_rank, p2l)
++        up = self.reader.slice(li, "up", N, self.slice_rank, p2l)
++        layer.w13_qweight.data[:, :N].copy_(gate, non_blocking=False)
++        layer.w13_qweight.data[:, N:].copy_(up, non_blocking=False)
++        down = self.reader.slice(li, "down", N, self.slice_rank, p2l)
++        if self.types[2] == GGML_Q2_0 and self.type2 == GGML_Q8_0:
++            down = q2_0_to_q8_0(down)
++        assert tuple(down.shape) == tuple(layer.w2_qweight.shape), (down.shape, layer.w2_qweight.shape)
++        layer.w2_qweight.data.copy_(down)
++        if (li == 0 and E == self.num_gpu_experts) or os.environ.get("KT_GGUF_HOT_LOG") == "1":
++            mb = (layer.w13_qweight.numel() + layer.w2_qweight.numel()) / 1e6
++            _log(f"rank {self.rank}: layer {li} {E} hot experts from the GGUF, types {self.types} -> ({self.type13}, {self.type2}), "
++                 f"{mb:.0f} MB on the GPU, {time.time() - t0:.1f} s")
++
++    def create_moe_runner(self, layer, moe_runner_config):
++        self.moe_runner_config = moe_runner_config
++
++    def apply(self, layer, dispatch_output):
++        from sgl_kernel import ggml_moe_a8_vec, moe_sum, silu_and_mul
++
++        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
++
++        x = dispatch_output.hidden_states
++        topk_weights, topk_ids, _ = dispatch_output.topk_output
++        T, top_k = topk_ids.shape
++        # KV-lent slots: the weights through the per-slot pointer tables
++        p13 = getattr(layer, "kt_kv_ptr13", None)
++        if self.ep and self.rank != 0 and p13 is None and not layer.__dict__.get("kt_hot_slots", False):
++            # the resident experts are whole on every rank: rank 0 adds them (the slots come in a shadow layer)
++            return StandardCombineInput(hidden_states=torch.zeros_like(x))
++        tbl = p13 is not None
++        W13 = p13 if tbl else layer.w13_qweight
++        W2 = layer.kt_kv_ptr2 if tbl else layer.w2_qweight
++        if T <= _multi.MAX_TOKENS and _multi.enabled():
++            # decode / MTP verify window: CPU routes (-1) give zero rows, so their
++            # weights need no masking; the routes of one expert share one read
++            # of it (kt_gguf_moe_multi.py)
++            w = topk_weights
++            ids = topk_ids.to(torch.int32)
++            h = _multi.moe_a8_vec_multi(x, W13, ids, top_k, self.type13, 2 * self.N, T, tbl)
++            h = silu_and_mul(h)
++            out = _multi.moe_a8_vec_multi(h, W2, ids, 1, self.type2, self.K, T * top_k, tbl)
++        elif _multi.ROUTES and _multi.enabled():
++            # an extend below the streamer threshold: the per-route build of the
++            # same kernel (identical sums per route to the window above; ggml's
++            # IQ3_S, which sgl-kernel's ggml_moe_a8_vec decodes with the
++            # pre-release grid and scale), CPU routes give zero rows
++            w = topk_weights
++            ids = topk_ids.to(torch.int32)
++            h = _multi.moe_a8_vec_routes(x, W13, ids, top_k, self.type13, 2 * self.N, T, tbl)
++            h = silu_and_mul(h)
++            out = _multi.moe_a8_vec_routes(h, W2, ids, 1, self.type2, self.K, T * top_k, tbl)
++        elif GGML_Q2_0 in (self.type13, self.type2):
++            # sgl-kernel has no Q2_0 kernel: the window kernel, 4 tokens at a time
++            # (an expert holds at most 4 routes of a window because the router's
++            # top-k ids are distinct within a token)
++            w = topk_weights
++            M, outs = _multi.MAX_TOKENS, []
++            for c0 in range(0, T, M):
++                c1 = min(T, c0 + M)
++                ids = topk_ids[c0:c1].to(torch.int32)
++                h = _multi.moe_a8_vec_multi(x[c0:c1], W13, ids, top_k, self.type13, 2 * self.N, c1 - c0, tbl)
++                h = silu_and_mul(h)
++                outs.append(_multi.moe_a8_vec_multi(h, W2, ids, 1, self.type2, self.K, (c1 - c0) * top_k, tbl))
++            out = torch.cat(outs)
++        else:
++            # the wrapper masks CPU experts to -1 and this kernel indexes by id:
++            # route those to slot 0 with weight 0. It reads the ids as int32
++            # without checking (int64 ids give every other route the wrong expert).
++            # It addresses base + id * stride: with KV-lent slots the hot cache
++            # hands this path resident-only ids (kt_gguf_moe_multi.reads_table)
++            on_gpu = topk_ids >= 0
++            w = torch.where(on_gpu, topk_weights, torch.zeros_like(topk_weights))
++            ids = torch.where(on_gpu, topk_ids, torch.zeros_like(topk_ids)).to(torch.int32)
++            h = ggml_moe_a8_vec(x, layer.w13_qweight, ids, top_k, self.type13, 2 * self.N, T)
++            h = silu_and_mul(h)
++            out = ggml_moe_a8_vec(h, layer.w2_qweight, ids, 1, self.type2, self.K, T * top_k)
++        if os.environ.get("KT_GGUF_HOT_DEBUG") == "1" and T <= 4 and not torch.cuda.is_current_stream_capturing():
++            _dbg = globals().setdefault("_DBG", [0])
++            if _dbg[0] < 12:
++                _dbg[0] += 1
++                torch.cuda.synchronize()
++                _log(f"debug layer {getattr(layer, 'layer_id', '?')} T {T} tbl {tbl} ids {topk_ids.tolist()} "
++                     f"w {[round(v, 3) for v in topk_weights.float().flatten().tolist()]} "
++                     f"x nan {int(x.float().isnan().sum())} |x| {float(x.float().abs().max()):.3g} "
++                     f"W13 {tuple(W13.shape)} {W13.dtype} ptr {W13.data_ptr():#x} "
++                     f"w13[0] bytes sum {int(layer.w13_qweight[0].view(torch.uint8).sum())} "
++                     f"w2[0] bytes sum {int(layer.w2_qweight[0].view(torch.uint8).sum())} "
++                     f"out nan {int(out.float().isnan().sum())} |out| {float(out.float().abs().nan_to_num().max()):.3g}")
++        if FUSED_COMBINE and T <= 64:
++            # one kernel for the weighting and the sum over the routes (same roundings and order as
++            # out.mul_(w) in bf16 followed by moe_sum's fp32 accumulation: identical results)
++            return StandardCombineInput(hidden_states=_combine(out.view(T, top_k, self.K), w.view(T, top_k)))
++        out = out.reshape(T, top_k, self.K).mul_(w.view(T, top_k, 1).to(out.dtype))
++        result = torch.empty_like(x)
++        moe_sum(out, result)
++        return StandardCombineInput(hidden_states=result)
+diff --git a/python/sglang/srt/layers/moe/kt_gguf_moe_multi.py b/python/sglang/srt/layers/moe/kt_gguf_moe_multi.py
+new file mode 100644
+index 00000000..8f151139
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/kt_gguf_moe_multi.py
+@@ -0,0 +1,112 @@
++"""Multi-token GGUF MoE GEMV for the KT hot experts (kt_gguf_hot.py).
++
++`moe_a8_vec_multi(X, W, ids, top_k, type, rows, tokens)` has the signature of
++sgl_kernel.ggml_moe_a8_vec, but ids < 0 (experts on the CPU) produce zero rows
++instead of being computed, and the routes of one expert in the window share one
++read of its weights (kt_gguf_moe_multi/kt_gguf_moe_multi.cu).
++Windows of up to KT_GGUF_MOE_MAXM tokens (4); larger batches keep the
++original kernel. KT_GGUF_MOE_MMV_Y warps per block (2; sgl-kernel uses 1), KT_GGUF_MOE_RPW
++rows per warp (4; sgl-kernel 1).
++
++`moe_a8_vec_routes(...)` (same signature) is the per-route build of the same
++kernel (KT_PER_ROUTE=1): any number of tokens, one route per row block, zero rows
++for CPU routes; for an extend above the window the hot method uses it instead of
++sgl_kernel.ggml_moe_a8_vec, whose IQ3_S vec_dot still decodes the pre-release
++grid and scale (2x the error on the IQ3_S layers, tools/hot-numerics/).
++
++Built with torch's load_inline on first use (the TP ranks share the build
++directory; torch serializes the build with a file lock).
++
++With table=True, W is not the slot tensor but an int64 table on the device with
++one weight address per slot (the build's KT_PTR_TABLE=1): the KV-lent hot
++experts (kt_hot_kv_lend.py) live in borrowed KV pages, not at base + slot *
++stride. The table has a fixed address, so captured graphs stay valid while its
++entries change between steps; the sums are the same as the plain build's.
++
++dense_a8_vec(X, W, type) runs a dense GGUF linear ([rows, row_bytes]) as a
++one-expert MoE for windows of 2-4 tokens, so each weight row is read once for
++all of them (sgl-kernel's MMVQ runs one block per row and token). It uses its
++own build with KT_GGUF_DENSE_MMV_Y=4 warps per block and KT_GGUF_DENSE_RPW=1
++row per warp: on the Flash-Next GGUF's dense shards at 2 tokens, Q6_K 5120x2560
++22.8 -> 16.1 us, IQ4_XS 6144x2560 23.2 -> 16.0 us, Q6_K 2560x3072 14.3 -> 10.4 us,
++IQ4_NL 2560x320 5.1 -> 3.5 us, bit-identical (tools/bench_gguf_dense_multi.py);
++matrices of 512 rows or fewer stay on MMVQ (320-row ones were faster there).
++"""
++import os
++from pathlib import Path
++
++import torch
++
++MAX_TOKENS = int(os.environ.get("KT_GGUF_MOE_MAXM", "4"))
++MMV_Y = int(os.environ.get("KT_GGUF_MOE_MMV_Y", "2"))  # warps per block
++RPW = int(os.environ.get("KT_GGUF_MOE_RPW", "4"))  # output rows per warp
++DENSE = os.environ.get("KT_GGUF_DENSE_MULTI", "1") == "1"
++DENSE_MMV_Y = int(os.environ.get("KT_GGUF_DENSE_MMV_Y", "4"))
++DENSE_RPW = int(os.environ.get("KT_GGUF_DENSE_RPW", "1"))
++DENSE_MIN_ROWS = 513
++# KT_GGUF_MOE_ROUTES=0: extends above the window go back to sgl-kernel's ggml_moe_a8_vec
++ROUTES = os.environ.get("KT_GGUF_MOE_ROUTES", "1") == "1"
++# ggml types the kernel has a vec_dot for (dense layers use K-quants and IQ4)
++DENSE_TYPES = {2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 16, 18, 19, 20, 21, 22, 23}
++_exts = {}
++_zero_ids = {}
++
++
++def _load(mmv_y=None, rpw=None, per_route=False, table=False):
++    mmv_y = MMV_Y if mmv_y is None else mmv_y
++    rpw = RPW if rpw is None else rpw
++    key = (MAX_TOKENS, mmv_y, rpw, per_route, table)
++    if key not in _exts:
++        from torch.utils.cpp_extension import load_inline
++
++        d = Path(__file__).with_name("kt_gguf_moe_multi")
++        _exts[key] = load_inline(
++            f"kt_gguf_moe_multi_m{MAX_TOKENS}_y{mmv_y}_r{rpw}" + ("_routes" if per_route else "") + ("_ptr" if table else ""),
++            cpp_sources="torch::Tensor kt_moe_a8_vec_multi(torch::Tensor X, torch::Tensor W, torch::Tensor topk_ids,"
++                        " int64_t top_k, int64_t type, int64_t row, int64_t tokens);",
++            cuda_sources=(d / "kt_gguf_moe_multi.cu").read_text(),
++            functions=["kt_moe_a8_vec_multi"],
++            extra_cuda_cflags=["-O3", f"-I{d}", f"-DKT_MAXM={MAX_TOKENS}", f"-DKT_MMV_Y={mmv_y}", f"-DKT_RPW={rpw}",
++                               f"-DKT_PER_ROUTE={int(per_route)}", f"-DKT_PTR_TABLE={int(table)}"],
++            extra_include_paths=[str(d)],
++            verbose=False,
++        )
++    return _exts[key]
++
++
++def enabled() -> bool:
++    return os.environ.get("KT_GGUF_MOE_MULTI", "1") == "1"
++
++
++def moe_a8_vec_multi(X, W, ids, top_k, qtype, rows, tokens, table=False):
++    return _load(table=table).kt_moe_a8_vec_multi(X, W, ids, top_k, qtype, rows, tokens)
++
++
++def moe_a8_vec_routes(X, W, ids, top_k, qtype, rows, tokens, table=False):
++    """ggml_moe_a8_vec's contract at any token count: route p's rows from expert ids[p], zeros for ids < 0."""
++    return _load(per_route=True, table=table).kt_moe_a8_vec_multi(X, W, ids, top_k, qtype, rows, tokens)
++
++
++def reads_table(tokens: int) -> bool:
++    """Whether the hot method's kernel for a window of this many tokens reads
++    the slot weights through the pointer table (the window kernel and its
++    per-route build do; sgl-kernel's ggml_moe_a8_vec, the fallback with
++    KT_GGUF_MOE_ROUTES=0, does not and must never see a KV-lent slot id)."""
++    return enabled() and (tokens <= MAX_TOKENS or ROUTES)
++
++
++def dense_ok(x, qweight, qtype) -> bool:
++    return (DENSE and 2 <= x.shape[0] <= MAX_TOKENS and qtype in DENSE_TYPES and qweight.dim() == 2
++            and qweight.shape[0] >= DENSE_MIN_ROWS and qweight.dtype == torch.uint8 and qweight.is_contiguous())
++
++
++def dense_a8_vec(x, qweight, qtype):
++    """y = x @ W^T for a GGUF weight [rows, row_bytes], each row read once for all tokens."""
++    T = x.shape[0]
++    rows = qweight.shape[0]
++    ids = _zero_ids.get((x.device, T))
++    if ids is None:
++        ids = _zero_ids[(x.device, T)] = torch.zeros(T, dtype=torch.int32, device=x.device)
++    y = _load(DENSE_MMV_Y, DENSE_RPW).kt_moe_a8_vec_multi(x.contiguous(), qweight.view(1, rows, qweight.shape[1]), ids,
++                                                          1, qtype, rows, T)
++    return y.view(T, rows)
+diff --git a/python/sglang/srt/layers/moe/kt_gguf_moe_multi/ggml-common.h b/python/sglang/srt/layers/moe/kt_gguf_moe_multi/ggml-common.h
+index 7b825df5..a9f5f609 100644
+--- a/python/sglang/srt/layers/moe/kt_gguf_moe_multi/ggml-common.h
++++ b/python/sglang/srt/layers/moe/kt_gguf_moe_multi/ggml-common.h
+@@ -1,7 +1,3 @@
+-#pragma once
+-
+-#include "device_compat.cuh"
+-
+ // adapted from
+ // https://github.com/vllm-project/vllm/blob/4492e3a55428e161ca8db381edc28263e5da4c8d/csrc/quantization/gguf/ggml-common.h
+ // copied from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-common.h
+@@ -12,7 +8,10 @@
+ #define CUDA_DEQUANTIZE_BLOCK_SIZE 256
+ #define CUDA_QUANTIZE_BLOCK_SIZE 256
+ #define GGML_CUDA_DMMV_X 32
+-#define GGML_CUDA_MMV_Y 1
++#ifndef KT_MMV_Y
++#define KT_MMV_Y 1
++#endif
++#define GGML_CUDA_MMV_Y KT_MMV_Y
+ 
+ // Data Structures
+ // QK = number of values after dequantization
+@@ -596,6 +595,75 @@ static const __device__ uint32_t iq3xxs_grid[256] = {
+     0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04,
+ };
+ 
++// IQ3_S grid as ggml defines it (ggml-common.h iq3s_grid). iq3xs_grid below is an earlier
++// development table that sgl-kernel's IQ3_S code used by mistake (vec_dot ~1.8% off).
++static const __device__ uint32_t iq3s_grid[512] = {
++    0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
++    0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
++    0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01, 0x01010d05, 0x01010f03, 0x01010f09,
++    0x01010f0f, 0x01030101, 0x01030103, 0x01030105, 0x01030109, 0x01030301, 0x01030303, 0x0103030b,
++    0x01030501, 0x01030507, 0x0103050f, 0x01030703, 0x0103070b, 0x01030909, 0x01030d03, 0x01030d0b,
++    0x01030f05, 0x01050101, 0x01050103, 0x0105010b, 0x0105010f, 0x01050301, 0x01050307, 0x0105030d,
++    0x01050503, 0x0105050b, 0x01050701, 0x01050709, 0x01050905, 0x0105090b, 0x0105090f, 0x01050b03,
++    0x01050b07, 0x01050f01, 0x01050f07, 0x01070107, 0x01070303, 0x0107030b, 0x01070501, 0x01070505,
++    0x01070703, 0x01070707, 0x0107070d, 0x01070909, 0x01070b01, 0x01070b05, 0x01070d0f, 0x01070f03,
++    0x01070f0b, 0x01090101, 0x01090307, 0x0109030f, 0x01090503, 0x01090509, 0x01090705, 0x01090901,
++    0x01090907, 0x01090b03, 0x01090f01, 0x010b0105, 0x010b0109, 0x010b0501, 0x010b0505, 0x010b050d,
++    0x010b0707, 0x010b0903, 0x010b090b, 0x010b090f, 0x010b0d0d, 0x010b0f07, 0x010d010d, 0x010d0303,
++    0x010d0307, 0x010d0703, 0x010d0b05, 0x010d0f03, 0x010f0101, 0x010f0105, 0x010f0109, 0x010f0501,
++    0x010f0505, 0x010f050d, 0x010f0707, 0x010f0b01, 0x010f0b09, 0x03010101, 0x03010103, 0x03010105,
++    0x03010109, 0x03010301, 0x03010303, 0x03010307, 0x0301030b, 0x0301030f, 0x03010501, 0x03010505,
++    0x03010703, 0x03010709, 0x0301070d, 0x03010b09, 0x03010b0d, 0x03010d03, 0x03010f05, 0x03030101,
++    0x03030103, 0x03030107, 0x0303010d, 0x03030301, 0x03030309, 0x03030503, 0x03030701, 0x03030707,
++    0x03030903, 0x03030b01, 0x03030b05, 0x03030f01, 0x03030f0d, 0x03050101, 0x03050305, 0x0305030b,
++    0x0305030f, 0x03050501, 0x03050509, 0x03050705, 0x03050901, 0x03050907, 0x03050b0b, 0x03050d01,
++    0x03050f05, 0x03070103, 0x03070109, 0x0307010f, 0x03070301, 0x03070307, 0x03070503, 0x0307050f,
++    0x03070701, 0x03070709, 0x03070903, 0x03070d05, 0x03070f01, 0x03090107, 0x0309010b, 0x03090305,
++    0x03090309, 0x03090703, 0x03090707, 0x03090905, 0x0309090d, 0x03090b01, 0x03090b09, 0x030b0103,
++    0x030b0301, 0x030b0307, 0x030b0503, 0x030b0701, 0x030b0705, 0x030b0b03, 0x030d0501, 0x030d0509,
++    0x030d050f, 0x030d0909, 0x030d090d, 0x030f0103, 0x030f0107, 0x030f0301, 0x030f0305, 0x030f0503,
++    0x030f070b, 0x030f0903, 0x030f0d05, 0x030f0f01, 0x05010101, 0x05010103, 0x05010107, 0x0501010b,
++    0x0501010f, 0x05010301, 0x05010305, 0x05010309, 0x0501030d, 0x05010503, 0x05010507, 0x0501050f,
++    0x05010701, 0x05010705, 0x05010903, 0x05010907, 0x0501090b, 0x05010b01, 0x05010b05, 0x05010d0f,
++    0x05010f01, 0x05010f07, 0x05010f0b, 0x05030101, 0x05030105, 0x05030301, 0x05030307, 0x0503030f,
++    0x05030505, 0x0503050b, 0x05030703, 0x05030709, 0x05030905, 0x05030b03, 0x05050103, 0x05050109,
++    0x0505010f, 0x05050503, 0x05050507, 0x05050701, 0x0505070f, 0x05050903, 0x05050b07, 0x05050b0f,
++    0x05050f03, 0x05050f09, 0x05070101, 0x05070105, 0x0507010b, 0x05070303, 0x05070505, 0x05070509,
++    0x05070703, 0x05070707, 0x05070905, 0x05070b01, 0x05070d0d, 0x05090103, 0x0509010f, 0x05090501,
++    0x05090507, 0x05090705, 0x0509070b, 0x05090903, 0x05090f05, 0x05090f0b, 0x050b0109, 0x050b0303,
++    0x050b0505, 0x050b070f, 0x050b0901, 0x050b0b07, 0x050b0f01, 0x050d0101, 0x050d0105, 0x050d010f,
++    0x050d0503, 0x050d0b0b, 0x050d0d03, 0x050f010b, 0x050f0303, 0x050f050d, 0x050f0701, 0x050f0907,
++    0x050f0b01, 0x07010105, 0x07010303, 0x07010307, 0x0701030b, 0x0701030f, 0x07010505, 0x07010703,
++    0x07010707, 0x0701070b, 0x07010905, 0x07010909, 0x0701090f, 0x07010b03, 0x07010d07, 0x07010f03,
++    0x07030103, 0x07030107, 0x0703010b, 0x07030309, 0x07030503, 0x07030507, 0x07030901, 0x07030d01,
++    0x07030f05, 0x07030f0d, 0x07050101, 0x07050305, 0x07050501, 0x07050705, 0x07050709, 0x07050b01,
++    0x07070103, 0x07070301, 0x07070309, 0x07070503, 0x07070507, 0x0707050f, 0x07070701, 0x07070903,
++    0x07070907, 0x0707090f, 0x07070b0b, 0x07070f07, 0x07090107, 0x07090303, 0x0709030d, 0x07090505,
++    0x07090703, 0x07090b05, 0x07090d01, 0x07090d09, 0x070b0103, 0x070b0301, 0x070b0305, 0x070b050b,
++    0x070b0705, 0x070b0909, 0x070b0b0d, 0x070b0f07, 0x070d030d, 0x070d0903, 0x070f0103, 0x070f0107,
++    0x070f0501, 0x070f0505, 0x070f070b, 0x09010101, 0x09010109, 0x09010305, 0x09010501, 0x09010509,
++    0x0901050f, 0x09010705, 0x09010903, 0x09010b01, 0x09010f01, 0x09030105, 0x0903010f, 0x09030303,
++    0x09030307, 0x09030505, 0x09030701, 0x0903070b, 0x09030907, 0x09030b03, 0x09030b0b, 0x09050103,
++    0x09050107, 0x09050301, 0x0905030b, 0x09050503, 0x09050707, 0x09050901, 0x09050b0f, 0x09050d05,
++    0x09050f01, 0x09070109, 0x09070303, 0x09070307, 0x09070501, 0x09070505, 0x09070703, 0x0907070b,
++    0x09090101, 0x09090105, 0x09090509, 0x0909070f, 0x09090901, 0x09090f03, 0x090b010b, 0x090b010f,
++    0x090b0503, 0x090b0d05, 0x090d0307, 0x090d0709, 0x090d0d01, 0x090f0301, 0x090f030b, 0x090f0701,
++    0x090f0907, 0x090f0b03, 0x0b010105, 0x0b010301, 0x0b010309, 0x0b010505, 0x0b010901, 0x0b010909,
++    0x0b01090f, 0x0b010b05, 0x0b010d0d, 0x0b010f09, 0x0b030103, 0x0b030107, 0x0b03010b, 0x0b030305,
++    0x0b030503, 0x0b030705, 0x0b030f05, 0x0b050101, 0x0b050303, 0x0b050507, 0x0b050701, 0x0b05070d,
++    0x0b050b07, 0x0b070105, 0x0b07010f, 0x0b070301, 0x0b07050f, 0x0b070909, 0x0b070b03, 0x0b070d0b,
++    0x0b070f07, 0x0b090103, 0x0b090109, 0x0b090501, 0x0b090705, 0x0b09090d, 0x0b0b0305, 0x0b0b050d,
++    0x0b0b0b03, 0x0b0b0b07, 0x0b0d0905, 0x0b0f0105, 0x0b0f0109, 0x0b0f0505, 0x0d010303, 0x0d010307,
++    0x0d01030b, 0x0d010703, 0x0d010707, 0x0d010d01, 0x0d030101, 0x0d030501, 0x0d03050f, 0x0d030d09,
++    0x0d050305, 0x0d050709, 0x0d050905, 0x0d050b0b, 0x0d050d05, 0x0d050f01, 0x0d070101, 0x0d070309,
++    0x0d070503, 0x0d070901, 0x0d09050b, 0x0d090907, 0x0d090d05, 0x0d0b0101, 0x0d0b0107, 0x0d0b0709,
++    0x0d0b0d01, 0x0d0d010b, 0x0d0d0901, 0x0d0f0303, 0x0d0f0307, 0x0f010101, 0x0f010109, 0x0f01010f,
++    0x0f010501, 0x0f010505, 0x0f01070d, 0x0f010901, 0x0f010b09, 0x0f010d05, 0x0f030105, 0x0f030303,
++    0x0f030509, 0x0f030907, 0x0f03090b, 0x0f050103, 0x0f050109, 0x0f050301, 0x0f05030d, 0x0f050503,
++    0x0f050701, 0x0f050b03, 0x0f070105, 0x0f070705, 0x0f07070b, 0x0f070b07, 0x0f090103, 0x0f09010b,
++    0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
++};
++
+ static const __device__ uint32_t iq3xs_grid[512] = {
+     0x04040404, 0x0404040c, 0x04040414, 0x0404042c, 0x0404043e, 0x04040c04, 0x04040c0c, 0x04040c14, 0x04040c24,
+     0x04040c34, 0x04041404, 0x0404140c, 0x0404142c, 0x04041c1c, 0x04042404, 0x04042414, 0x0404242c, 0x0404243e,
+@@ -959,6 +1027,27 @@ typedef float (*vec_dot_q_mul_mat_cuda_t)(
+     const int& j,
+     const int& k);
+ 
++// Utility function
++
++template <typename dst_t>
++static __device__ __forceinline__ dst_t convert_from_half(half val) {
++  return val;
++}
++
++template <>
++__device__ __forceinline__ c10::BFloat16 convert_from_half<c10::BFloat16>(half val) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
++  return __float2bfloat16(__half2float(val));
++#else
++  return __half2float(val);
++#endif  // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
++}
++
++template <>
++__device__ __forceinline__ float convert_from_half<float>(half val) {
++  return __half2float(val);
++}
++
+ #if defined(USE_ROCM)
+ 
+ #ifndef __has_builtin
+diff --git a/python/sglang/srt/layers/moe/kt_gguf_moe_multi/kt_gguf_moe_multi.cu b/python/sglang/srt/layers/moe/kt_gguf_moe_multi/kt_gguf_moe_multi.cu
+new file mode 100644
+index 00000000..2b5dc93b
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/kt_gguf_moe_multi/kt_gguf_moe_multi.cu
+@@ -0,0 +1,951 @@
++// rev 2026-10-12: KT_PTR_TABLE (W as a per-slot pointer table for KV-lent hot experts); 10-11: ggml IQ3_S grid
++// Generated from sgl-kernel csrc/quantization/gguf
++// (vllm / llama.cpp b2899 port). Multi-token GGUF MoE GEMV for the KT hot experts.
++#include <c10/cuda/CUDAGuard.h>
++#include <cuda_fp16.h>
++#include <cuda_runtime.h>
++#include <torch/all.h>
++#include <torch/extension.h>
++
++#define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) __shfl_xor_sync((mask), (var), (lane_mask))
++#define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) __shfl_xor_sync((mask), (var), (lane_mask), (width))
++#define WARP_SIZE 32
++#define DISPATCH_CASE_FLOAT_TYPES(...)                 \
++  AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__) \
++  AT_DISPATCH_CASE(at::ScalarType::Half, __VA_ARGS__)  \
++  AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__)
++#define DISPATCH_FLOAT_TYPES(TYPE, NAME, ...) AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_FLOAT_TYPES(__VA_ARGS__))
++#ifndef KT_RPW
++#define KT_RPW 4  // output rows per warp
++#endif
++#ifndef KT_MAXM
++#define KT_MAXM 4  // tokens per window; an expert appears at most once per token
++#endif
++#ifndef KT_PER_ROUTE
++#define KT_PER_ROUTE 0  // 1: no window, one route per row block (moe_a8_vec_routes)
++#endif
++#ifndef KT_PTR_TABLE
++#define KT_PTR_TABLE 0  // 1: W is an int64 table of per-slot weight addresses
++#endif
++
++#include "ggml-common.h"
++#include "vecdotq.cuh"
++
++// Q2_0 (ggml type 42): 64 values a block, one fp16 scale, 2-bit codes, value =
++// code - 1. Byte b of qs holds elements 4b..4b+3 (code s at bits 2s). One
++// thread takes 4 bytes (16 elements) against half a q8_1 block. The -1 is
++// taken as (sum of code * y) - (sum of y): subtracting 1 per byte inside a
++// packed int would borrow across bytes.
++#define QK2_0 64
++#define QR2_0 4
++#define QI2_0 (QK2_0 / (4 * QR2_0))
++#define VDR_Q2_0_Q8_1_MMVQ 1
++typedef struct {
++  half d;
++  uint8_t qs[QK2_0 / 4];
++} block_q2_0;
++static_assert(sizeof(block_q2_0) == 18, "wrong q2_0 block size");
++
++static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
++    const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
++  const block_q2_0* bq = (const block_q2_0*)vbq;
++  const uint8_t* q = bq->qs + 4 * iqs;  // blocks are 18 bytes: no aligned int loads
++  const block_q8_1* y = bq8_1 + (iqs >> 1);
++  const int* u = (const int*)y->qs + (iqs & 1) * 4;
++  int sumi = 0, sumy = 0;
++#pragma unroll
++  for (int b = 0; b < 4; ++b) {
++    const int c = q[b];
++    const int packed = (c & 3) | (((c >> 2) & 3) << 8) | (((c >> 4) & 3) << 16) | (((c >> 6) & 3) << 24);
++    sumi = __dp4a(packed, u[b], sumi);
++    sumy = __dp4a(0x01010101, u[b], sumy);
++  }
++  return __half2float(bq->d) * __low2float(y->ds) * (float)(sumi - sumy);
++}
++
++// copied from
++// https://github.com/vllm-project/vllm/blob/4492e3a55428e161ca8db381edc28263e5da4c8d/csrc/quantization/gguf/moe_vec.cuh
++// copied and adapted from
++// https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmvq.cu
++// The rows of one warp against NM activations. NM is a compile-time count so the
++// member loop has no condition in it: the weight-side work of vec_dot (loads,
++// grid lookups, sign and bit unpacking) is the same for every member and the
++// compiler computes it once per block instead of once per member.
++template <int NM, typename scalar_t, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
++static __device__ __forceinline__ void moe_vec_q_rows(
++    const block_q_t* __restrict__ x,
++    const void* __restrict__ vy,
++    scalar_t* __restrict__ dst,
++    const int* members,
++    const int topk,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    const int row0) {
++  const int blocks_per_row = ncols / qk;
++  const int blocks_per_warp = vdr * WARP_SIZE / qi;
++  const block_q8_1* ys[NM];
++#pragma unroll
++  for (int m = 0; m < NM; ++m) {
++    ys[m] = (const block_q8_1*)(((const int*)vy) + (members[m] / topk) * token_stride);
++  }
++  float tmp[NM][KT_RPW];
++#pragma unroll
++  for (int m = 0; m < NM; ++m) {
++#pragma unroll
++    for (int r = 0; r < KT_RPW; ++r) {
++      tmp[m][r] = 0.0f;
++    }
++  }
++  for (auto i = threadIdx.x / (qi / vdr); i < blocks_per_row; i += blocks_per_warp) {
++    const int iby = i * (qk / QK8_1);  // y block index that aligns with ibx
++    const int iqs = vdr * (threadIdx.x % (qi / vdr));  // x block quant index when casting the quants to int
++#pragma unroll
++    for (int r = 0; r < KT_RPW; ++r) {
++      if (row0 + r < nrows) {
++        const int ibx = (row0 + r) * blocks_per_row + i;  // x block index
++#pragma unroll
++        for (int m = 0; m < NM; ++m) {
++          tmp[m][r] += vec_dot_q_cuda(&x[ibx], &ys[m][iby], iqs);
++        }
++      }
++    }
++  }
++#pragma unroll
++  for (int m = 0; m < NM; ++m) {
++#pragma unroll
++    for (int r = 0; r < KT_RPW; ++r) {
++      if (row0 + r < nrows) {
++        float t = tmp[m][r];
++#pragma unroll
++        for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
++          t += SGLANG_SHFL_XOR_SYNC(uint32_t(-1), t, mask);
++        }
++        if (threadIdx.x == 0) {
++          dst[members[m] * nrows + row0 + r] = t;
++        }
++      }
++    }
++  }
++}
++
++template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
++static __global__ void moe_vec_q(
++    const void* __restrict__ vx,
++    const void* __restrict__ vy,
++    scalar_t* __restrict__ dst,
++    const int* topk_ids,
++    const int topk,
++    const int ncols,
++    const int nrows,
++    const int token_stride) {
++  // KT_RPW rows per warp, interleaved so their loads overlap
++  const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * KT_RPW;
++  const int routes = gridDim.z;
++  const int p = blockIdx.z;
++  const int expert = topk_ids[p];
++
++  if (row0 >= nrows) {
++    return;
++  }
++  // the expert is on the CPU: this route contributes nothing (its weight is 0)
++  if (expert < 0) {
++    if (threadIdx.x == 0) {
++#pragma unroll
++      for (int r = 0; r < KT_RPW; ++r) {
++        if (row0 + r < nrows) {
++          dst[p * nrows + row0 + r] = 0;
++        }
++      }
++    }
++    return;
++  }
++  int members[KT_MAXM];
++  int nm = 0;
++#if KT_PER_ROUTE
++  // per-route build (any number of tokens): every route computes its own rows,
++  // sgl-kernel ggml_moe_a8_vec's work split; one member runs the same sums in the
++  // same order as that member of a window
++  (void)routes;
++  members[nm++] = p;
++#else
++  // the first route of this expert computes all of them
++  for (int q = 0; q < p; ++q) {
++    if (topk_ids[q] == expert) {
++      return;
++    }
++  }
++  // more routes of this expert than a window holds (KT_GPU_MASK_ZERO sends every CPU route to
++  // expert 0 at weight 0: 5-6 of a token's 6, 10-25): the rest in further passes, so no row of
++  // dst is left unwritten (an unwritten row is torch.empty's garbage, and NaN * 0 is NaN)
++  int next = p;
++  while (next < routes) {
++  nm = 0;
++  for (int q = next; q < routes; ++q) {
++    next = q + 1;
++    if (topk_ids[q] == expert) {
++      members[nm++] = q;
++      if (nm == KT_MAXM) {
++        break;
++      }
++    }
++  }
++  if (nm == 0) {
++    break;
++  }
++#endif
++#if KT_PTR_TABLE
++  // vx is a per-slot pointer table (int64): slots in borrowed memory live anywhere
++  const block_q_t* x = (const block_q_t*)(((const long long*)vx)[expert]);
++#else
++  const block_q_t* x = ((const block_q_t*)vx) + expert * nrows * (ncols / qk);
++#endif
++#define KT_ROWS(n) moe_vec_q_rows<n, scalar_t, qk, qi, block_q_t, vdr, vec_dot_q_cuda>( \
++      x, vy, dst, members, topk, ncols, nrows, token_stride, row0)
++  switch (nm) {
++    case 1: KT_ROWS(1); break;
++#if KT_MAXM >= 2
++    case 2: KT_ROWS(2); break;
++#endif
++#if KT_MAXM >= 3
++    case 3: KT_ROWS(3); break;
++#endif
++#if KT_MAXM >= 4
++    case 4: KT_ROWS(4); break;
++#endif
++#if KT_MAXM >= 5
++    case 5: KT_ROWS(5); break;
++#endif
++#if KT_MAXM >= 6
++    case 6: KT_ROWS(6); break;
++#endif
++#if KT_MAXM >= 7
++    case 7: KT_ROWS(7); break;
++#endif
++#if KT_MAXM >= 8
++    case 8: KT_ROWS(8); break;
++#endif
++  }
++#if !KT_PER_ROUTE
++  }
++#endif
++#undef KT_ROWS
++}
++
++template <typename scalar_t>
++static void moe_vec_q4_0_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++template <typename scalar_t>
++static void moe_vec_q4_1_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK4_0, QI4_1, block_q4_1, VDR_Q4_1_Q8_1_MMVQ, vec_dot_q4_1_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++template <typename scalar_t>
++static void moe_vec_q5_0_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++template <typename scalar_t>
++static void moe_vec_q5_1_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK5_1, QI5_1, block_q5_1, VDR_Q5_1_Q8_1_MMVQ, vec_dot_q5_1_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++template <typename scalar_t>
++static void moe_vec_q8_0_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++template <typename scalar_t>
++static void moe_vec_q2_0_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK2_0, QI2_0, block_q2_0, VDR_Q2_0_Q8_1_MMVQ, vec_dot_q2_0_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++template <typename scalar_t>
++static void moe_vec_q2_K_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++template <typename scalar_t>
++static void moe_vec_q3_K_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++template <typename scalar_t>
++static void moe_vec_q4_K_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++template <typename scalar_t>
++static void moe_vec_q5_K_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++template <typename scalar_t>
++static void moe_vec_q6_K_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++template <typename scalar_t>
++static void moe_vec_iq2_xxs_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK_K, QI2_XXS, block_iq2_xxs, 1, vec_dot_iq2_xxs_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++template <typename scalar_t>
++static void moe_vec_iq2_xs_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK_K, QI2_XS, block_iq2_xs, 1, vec_dot_iq2_xs_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++template <typename scalar_t>
++static void moe_vec_iq2_s_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK_K, QI2_S, block_iq2_s, 1, vec_dot_iq2_s_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++template <typename scalar_t>
++static void moe_vec_iq3_xxs_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK_K, QI3_XXS, block_iq3_xxs, 1, vec_dot_iq3_xxs_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++template <typename scalar_t>
++static void moe_vec_iq1_s_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK_K, QI1_S, block_iq1_s, 1, vec_dot_iq1_s_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++template <typename scalar_t>
++static void moe_vec_iq1_m_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK_K, QI1_M, block_iq1_m, 1, vec_dot_iq1_m_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++template <typename scalar_t>
++static void moe_vec_iq4_nl_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK4_NL, QI4_NL, block_iq4_nl, VDR_Q4_0_Q8_1_MMVQ, vec_dot_iq4_nl_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++template <typename scalar_t>
++static void moe_vec_iq4_xs_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK_K, QI4_XS, block_iq4_xs, 1, vec_dot_iq4_xs_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++template <typename scalar_t>
++static void moe_vec_iq3_s_q8_1_cuda(
++    const void* vx,
++    const void* vy,
++    scalar_t* dst,
++    const int* topk_ids,
++    const int top_k,
++    const int tokens,
++    const int ncols,
++    const int nrows,
++    const int token_stride,
++    cudaStream_t stream) {
++  const int block_num_y = (nrows + GGML_CUDA_MMV_Y * KT_RPW - 1) / (GGML_CUDA_MMV_Y * KT_RPW);
++  const dim3 block_nums(block_num_y, 1, tokens * top_k);
++  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
++  moe_vec_q<scalar_t, QK_K, QI3_XS, block_iq3_s, 1, vec_dot_iq3_s_q8_1>
++      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
++}
++
++// Q8 gemv
++template <typename scalar_t>
++static __global__ void
++quantize_q8_1(const scalar_t* __restrict__ x, void* __restrict__ vy, const int kx, const int kx_padded) {
++  const auto ix = blockDim.x * blockIdx.x + threadIdx.x;
++  if (ix >= kx_padded) {
++    return;
++  }
++  const auto iy = blockDim.y * blockIdx.y + threadIdx.y;
++  const int i_padded = iy * kx_padded + ix;
++
++  block_q8_1* y = (block_q8_1*)vy;
++
++  const int ib = i_padded / QK8_1;   // block index
++  const int iqs = i_padded % QK8_1;  // quant index
++
++  const float xi = ix < kx ? static_cast<float>(x[iy * kx + ix]) : 0.0f;
++  float amax = fabsf(xi);
++  float sum = xi;
++
++#pragma unroll
++  for (int mask = 16; mask > 0; mask >>= 1) {
++    amax = fmaxf(amax, SGLANG_SHFL_XOR_SYNC_WIDTH(uint32_t(-1), amax, mask, 32));
++    sum += SGLANG_SHFL_XOR_SYNC_WIDTH(uint32_t(-1), sum, mask, 32);
++  }
++
++  const float d = amax / 127;
++  const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
++
++  y[ib].qs[iqs] = q;
++
++  if (iqs > 0) {
++    return;
++  }
++
++  y[ib].ds.x = __float2half(d);
++  y[ib].ds.y = __float2half(sum);
++}
++
++template <typename scalar_t>
++static void quantize_row_q8_1_cuda(const scalar_t* x, void* vy, const int kx, const int ky, cudaStream_t stream) {
++  const int64_t kx_padded = (kx + 512 - 1) / 512 * 512;
++  const int block_num_x = (kx_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
++  constexpr int MAX_BLOCK_SIZE = 65535;
++  for (int off = 0; off < ky; off += MAX_BLOCK_SIZE) {
++    const int num_blocks_y = std::min(ky, off + MAX_BLOCK_SIZE) - off;
++    const dim3 num_blocks(block_num_x, num_blocks_y, 1);
++    const dim3 block_size(CUDA_DEQUANTIZE_BLOCK_SIZE, 1, 1);
++    quantize_q8_1<<<num_blocks, block_size, 0, stream>>>(
++        &x[off * kx], (int32_t*)vy + off * (kx_padded / 32 * 9), kx, kx_padded);
++  }
++}
++
++
++torch::Tensor kt_moe_a8_vec_multi(
++    torch::Tensor X,  // input
++    torch::Tensor W,  // expert weights
++    torch::Tensor topk_ids,
++    int64_t top_k,
++    int64_t type,
++    int64_t row,
++    int64_t tokens) {
++  int col = X.sizes()[1];
++  const int padded = (col + 512 - 1) / 512 * 512;
++  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
++  auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
++  at::Tensor Y = torch::empty({tokens * top_k, row}, options);
++  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
++  options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
++  at::Tensor quant_X = torch::empty({tokens, padded / 32 * 9}, options);
++  DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_vec_a8", [&] {
++    quantize_row_q8_1_cuda<scalar_t>((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens, stream);
++    switch (type) {
++      case 2:
++        moe_vec_q4_0_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++      case 3:
++        moe_vec_q4_1_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++      case 6:
++        moe_vec_q5_0_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++      case 7:
++        moe_vec_q5_1_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++      case 8:
++        moe_vec_q8_0_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++      case 42:
++        moe_vec_q2_0_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++      case 10:
++        moe_vec_q2_K_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++      case 11:
++        moe_vec_q3_K_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++      case 12:
++        moe_vec_q4_K_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++      case 13:
++        moe_vec_q5_K_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++      case 14:
++        moe_vec_q6_K_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++      case 16:
++        moe_vec_iq2_xxs_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++      case 17:
++        moe_vec_iq2_xs_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++      case 18:
++        moe_vec_iq3_xxs_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++      case 19:
++        moe_vec_iq1_s_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++      case 20:
++        moe_vec_iq4_nl_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++      case 21:
++        moe_vec_iq3_s_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++      case 22:
++        moe_vec_iq2_s_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++      case 23:
++        moe_vec_iq4_xs_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++      case 29:
++        moe_vec_iq1_m_q8_1_cuda<scalar_t>(
++            (void*)W.data_ptr(),
++            (void*)quant_X.data_ptr(),
++            (scalar_t*)Y.data_ptr(),
++            (int*)topk_ids.data_ptr(),
++            top_k,
++            tokens,
++            col,
++            row,
++            quant_X.stride(0),
++            stream);
++        break;
++    }
++  });
++  return Y;
++}
+diff --git a/python/sglang/srt/layers/moe/kt_gguf_moe_multi/vecdotq.cuh b/python/sglang/srt/layers/moe/kt_gguf_moe_multi/vecdotq.cuh
+index 19e990d4..54fabb53 100644
+--- a/python/sglang/srt/layers/moe/kt_gguf_moe_multi/vecdotq.cuh
++++ b/python/sglang/srt/layers/moe/kt_gguf_moe_multi/vecdotq.cuh
+@@ -1,7 +1,3 @@
+-#pragma once
+-
+-#include "ggml-common.h"
+-
+ // copied from
+ // https://github.com/vllm-project/vllm/blob/4492e3a55428e161ca8db381edc28263e5da4c8d/csrc/quantization/gguf/vecdotq.cuh
+ // copied and adapted from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/vecdotq.cuh
+@@ -52,7 +48,7 @@ static __device__ __forceinline__ int get_int_from_uint8_aligned(const uint8_t*
+ template <int vdr>
+ static __device__ __forceinline__ float
+ vec_dot_q4_0_q8_1_impl(const int* v, const int* u, const float& d4, const half2& ds8) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+   int sumi = 0;
+ 
+ #pragma unroll
+@@ -78,7 +74,7 @@ vec_dot_q4_0_q8_1_impl(const int* v, const int* u, const float& d4, const half2&
+ template <int vdr>
+ static __device__ __forceinline__ float
+ vec_dot_q4_1_q8_1_impl(const int* v, const int* u, const half2& dm4, const half2& ds8) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+   int sumi = 0;
+ 
+ #pragma unroll
+@@ -106,7 +102,7 @@ vec_dot_q4_1_q8_1_impl(const int* v, const int* u, const half2& dm4, const half2
+ template <int vdr>
+ static __device__ __forceinline__ float
+ vec_dot_q5_0_q8_1_impl(const int* vl, const int* vh, const int* u, const float& d5, const half2& ds8) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+   int sumi = 0;
+ 
+ #pragma unroll
+@@ -139,7 +135,7 @@ vec_dot_q5_0_q8_1_impl(const int* vl, const int* vh, const int* u, const float&
+ template <int vdr>
+ static __device__ __forceinline__ float
+ vec_dot_q5_1_q8_1_impl(const int* vl, const int* vh, const int* u, const half2& dm5, const half2& ds8) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+   int sumi = 0;
+ 
+ #pragma unroll
+@@ -174,7 +170,7 @@ vec_dot_q5_1_q8_1_impl(const int* vl, const int* vh, const int* u, const half2&
+ template <int vdr>
+ static __device__ __forceinline__ float
+ vec_dot_q8_0_q8_1_impl(const int* v, const int* u, const float& d8_0, const float& d8_1) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+   int sumi = 0;
+ 
+ #pragma unroll
+@@ -189,7 +185,7 @@ vec_dot_q8_0_q8_1_impl(const int* v, const int* u, const float& d8_0, const floa
+ template <int vdr>
+ static __device__ __forceinline__ float
+ vec_dot_q8_1_q8_1_impl(const int* v, const int* u, const half2& dm8, const half2& ds8) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+ 
+   int sumi = 0;
+ 
+@@ -218,7 +214,7 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmvq(
+     const uint8_t* __restrict__ scales,
+     const half2& dm2,
+     const float* __restrict__ d8) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+   float sumf_d = 0.0f;
+   float sumf_m = 0.0f;
+ 
+@@ -249,7 +245,7 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
+     const uint8_t* __restrict__ scales,
+     const half2& dm2,
+     const float& d8) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+   int sumi_d = 0;
+   int sumi_m = 0;
+ 
+@@ -291,7 +287,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
+     const int& scale_offset,
+     const float& d3,
+     const float* __restrict__ d8) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+ 
+   float sumf = 0.0f;
+ 
+@@ -328,7 +324,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
+     const int8_t* __restrict__ scales,
+     const float& d3,
+     const float& d8) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+   int sumi = 0;
+ 
+ #pragma unroll
+@@ -357,7 +353,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
+     const uint8_t* __restrict__ m,
+     const half2& dm4,
+     const float* __restrict__ d8) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+ 
+   float sumf_d = 0.0f;
+   float sumf_m = 0.0f;
+@@ -386,7 +382,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
+     const uint8_t* __restrict__ m,
+     const half2& dm4,
+     const half2* __restrict__ ds8) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+   float sumf_d = 0.0f;
+   float sumf_m = 0.0f;
+ 
+@@ -422,7 +418,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
+     const uint8_t* __restrict__ m,
+     const half2& dm5,
+     const float* __restrict__ d8) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+ 
+   float sumf_d = 0.0f;
+   float sumf_m = 0.0f;
+@@ -457,7 +453,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
+     const uint8_t* __restrict__ m,
+     const half2& dm4,
+     const half2* __restrict__ ds8) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+   float sumf_d = 0.0f;
+   float sumf_m = 0.0f;
+ 
+@@ -493,7 +489,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
+     const int8_t* __restrict__ scales,
+     const float& d,
+     const float* __restrict__ d8) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+   float sumf = 0.0f;
+ 
+ #pragma unroll
+@@ -516,7 +512,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
+     const int8_t* __restrict__ sc,
+     const float& d6,
+     const float* __restrict__ d8) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+   float sumf_d = 0.0f;
+ 
+ #pragma unroll
+@@ -1811,7 +1807,7 @@ vec_dot_iq2_xs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__
+ 
+ static __device__ __forceinline__ float
+ vec_dot_iq2_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+   const block_iq2_s* bq2 = (const block_iq2_s*)vbq;
+ 
+   const int ib32 = iqs;
+@@ -1850,7 +1846,7 @@ vec_dot_iq2_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__
+ 
+ static __device__ __forceinline__ float
+ vec_dot_iq3_xxs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+   const block_iq3_xxs* bq2 = (const block_iq3_xxs*)vbq;
+ 
+   const int ib32 = iqs;
+@@ -1877,7 +1873,7 @@ vec_dot_iq3_xxs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict_
+ 
+ static __device__ __forceinline__ float
+ vec_dot_iq3_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+   const block_iq3_s* bq2 = (const block_iq3_s*)vbq;
+ 
+   const int ib32 = iqs;
+@@ -1885,8 +1881,8 @@ vec_dot_iq3_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__
+   const int8_t* q8 = bq8_1[ib32].qs;
+   int sumi = 0;
+   for (int l = 0; l < 4; ++l) {
+-    const uint32_t* grid1 = iq3xs_grid + (qs[2 * l + 0] | ((bq2->qh[ib32] << (8 - 2 * l)) & 256));
+-    const uint32_t* grid2 = iq3xs_grid + (qs[2 * l + 1] | ((bq2->qh[ib32] << (7 - 2 * l)) & 256));
++    const uint32_t* grid1 = iq3s_grid + (qs[2 * l + 0] | ((bq2->qh[ib32] << (8 - 2 * l)) & 256));
++    const uint32_t* grid2 = iq3s_grid + (qs[2 * l + 1] | ((bq2->qh[ib32] << (7 - 2 * l)) & 256));
+     uint32_t signs0 = __vcmpeq4(((bq2->signs[4 * ib32 + l] & 0xf) * 0x01010101) & 0x08040201, 0x08040201);
+     uint32_t signs1 = __vcmpeq4(((bq2->signs[4 * ib32 + l] >> 4) * 0x01010101) & 0x08040201, 0x08040201);
+     const int grid_l = __vsub4(grid1[0] ^ signs0, signs0);
+@@ -1895,15 +1891,17 @@ vec_dot_iq3_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__
+     sumi = __dp4a(grid_h, *((int*)q8 + 1), sumi);
+     q8 += 8;
+   }
+-  const float d = __half2float(bq2->d) * (0.5f + ((bq2->scales[ib32 / 2] >> 4 * (ib32 % 2)) & 0xf)) *
+-                  __low2float(bq8_1[ib32].ds) * 0.5f;
++  // ggml's IQ3_S: grid iq3s_grid, block scale d * (1 + 2 * s) (the old iq3xs_grid / (0.5 + s) * 0.5
++  // pair is a pre-release format)
++  const float d = __half2float(bq2->d) * (1 + 2 * ((bq2->scales[ib32 / 2] >> 4 * (ib32 % 2)) & 0xf)) *
++                  __low2float(bq8_1[ib32].ds);
+   return d * sumi;
+ #endif
+ }
+ 
+ static __device__ __forceinline__ float
+ vec_dot_iq1_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+   const block_iq1_s* bq1 = (const block_iq1_s*)vbq;
+ 
+   const int qs_packed = get_int_b2(bq1->qs, iqs);
+@@ -1935,7 +1933,7 @@ vec_dot_iq1_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__
+ 
+ static __device__ __forceinline__ float
+ vec_dot_iq1_m_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+ 
+   const block_iq1_m* bq1 = (const block_iq1_m*)vbq;
+ 
+@@ -1995,7 +1993,7 @@ get_int_from_table_16(const uint32_t& q4, const uint8_t* values, int& val1, int&
+ 
+ static __device__ __forceinline__ float
+ vec_dot_iq4_nl_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+ 
+   const block_iq4_nl* bq = (const block_iq4_nl*)vbq;
+ 
+@@ -2019,7 +2017,7 @@ vec_dot_iq4_nl_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__
+ 
+ static __device__ __forceinline__ float
+ vec_dot_iq4_xs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+   const block_iq4_xs* bq4 = (const block_iq4_xs*)vbq;
+   const uint8_t* values = (const uint8_t*)kvalues_iq4nl;
+ 
+diff --git a/python/sglang/srt/layers/moe/kt_gguf_tables.py b/python/sglang/srt/layers/moe/kt_gguf_tables.py
+new file mode 100644
+index 00000000..5b8785b3
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/kt_gguf_tables.py
+@@ -0,0 +1,22 @@
++"""ggml lookup tables for the i-quants, taken from ggml-common.h (vendored a94e6ff87).
++
++Generated by the 10-07 GGUF work; do not edit by hand.
++"""
++
++# iq2s_grid: 1024 x uint64_t, little-endian bytes, 8 per entry
++IQ2S_GRID_BYTES = [8, 8, 8, 8, 8, 8, 8, 8, 43, 8, 8, 8, 8, 8, 8, 8, 25, 25, 8, 8, 8, 8, 8, 8, 8, 43, 8, 8, 8, 8, 8, 8, 43, 43, 8, 8, 8, 8, 8, 8, 25, 8, 25, 8, 8, 8, 8, 8, 8, 25, 25, 8, 8, 8, 8, 8, 43, 25, 25, 8, 8, 8, 8, 8, 25, 43, 25, 8, 8, 8, 8, 8, 8, 8, 43, 8, 8, 8, 8, 8, 43, 8, 43, 8, 8, 8, 8, 8, 25, 25, 43, 8, 8, 8, 8, 8, 8, 43, 43, 8, 8, 8, 8, 8, 25, 8, 8, 25, 8, 8, 8, 8, 8, 25, 8, 25, 8, 8, 8, 8, 43, 25, 8, 25, 8, 8, 8, 8, 25, 43, 8, 25, 8, 8, 8, 8, 8, 8, 25, 25, 8, 8, 8, 8, 43, 8, 25, 25, 8, 8, 8, 8, 25, 25, 25, 25, 8, 8, 8, 8, 8, 43, 25, 25, 8, 8, 8, 8, 25, 8, 43, 25, 8, 8, 8, 8, 8, 25, 43, 25, 8, 8, 8, 8, 43, 25, 43, 25, 8, 8, 8, 8, 25, 43, 43, 25, 8, 8, 8, 8, 8, 8, 8, 43, 8, 8, 8, 8, 43, 8, 8, 43, 8, 8, 8, 8, 25, 25, 8, 43, 8, 8, 8, 8, 8, 43, 8, 43, 8, 8, 8, 8, 25, 8, 25, 43, 8, 8, 8, 8, 8, 25, 25, 43, 8, 8, 8, 8, 8, 8, 43, 43, 8, 8, 8, 8, 25, 25, 43, 43, 8, 8, 8, 8, 43, 43, 43, 43, 8, 8, 8, 8, 25, 8, 8, 8, 25, 8, 8, 8, 8, 25, 8, 8, 25, 8, 8, 8, 43, 25, 8, 8, 25, 8, 8, 8, 25, 43, 8, 8, 25, 8, 8, 8, 8, 8, 25, 8, 25, 8, 8, 8, 43, 8, 25, 8, 25, 8, 8, 8, 25, 25, 25, 8, 25, 8, 8, 8, 8, 43, 25, 8, 25, 8, 8, 8, 25, 8, 43, 8, 25, 8, 8, 8, 8, 25, 43, 8, 25, 8, 8, 8, 8, 8, 8, 25, 25, 8, 8, 8, 43, 8, 8, 25, 25, 8, 8, 8, 25, 25, 8, 25, 25, 8, 8, 8, 8, 43, 8, 25, 25, 8, 8, 8, 25, 8, 25, 25, 25, 8, 8, 8, 8, 25, 25, 25, 25, 8, 8, 8, 43, 25, 25, 25, 25, 8, 8, 8, 25, 43, 25, 25, 25, 8, 8, 8, 8, 8, 43, 25, 25, 8, 8, 8, 25, 25, 43, 25, 25, 8, 8, 8, 8, 43, 43, 25, 25, 8, 8, 8, 25, 8, 8, 43, 25, 8, 8, 8, 8, 25, 8, 43, 25, 8, 8, 8, 8, 8, 25, 43, 25, 8, 8, 8, 43, 8, 25, 43, 25, 8, 8, 8, 25, 25, 25, 43, 25, 8, 8, 8, 25, 8, 43, 43, 25, 8, 8, 8, 8, 25, 43, 43, 25, 8, 8, 8, 8, 8, 8, 8, 43, 8, 8, 8, 43, 8, 8, 8, 43, 8, 8, 8, 25, 25, 8, 8, 43, 8, 8, 8, 8, 43, 8, 8, 43, 8, 8, 8, 25, 8, 25, 8, 43, 8, 8, 8, 8, 25, 25, 8, 43, 8, 8, 8, 8, 8, 43, 8, 43, 8, 8, 8, 43, 43, 43, 8, 43, 8, 8, 8, 25, 8, 8, 25, 43, 8, 8, 8, 8, 25, 8, 25, 43, 8, 8, 8, 43, 25, 8, 25, 43, 8, 8, 8, 25, 43, 8, 25, 43, 8, 8, 8, 8, 8, 25, 25, 43, 8, 8, 8, 25, 25, 25, 25, 43, 8, 8, 8, 8, 8, 8, 43, 43, 8, 8, 8, 25, 25, 8, 43, 43, 8, 8, 8, 43, 43, 8, 43, 43, 8, 8, 8, 8, 25, 25, 43, 43, 8, 8, 8, 43, 8, 43, 43, 43, 8, 8, 8, 25, 8, 8, 8, 8, 25, 8, 8, 8, 25, 8, 8, 8, 25, 8, 8, 43, 25, 8, 8, 8, 25, 8, 8, 25, 43, 8, 8, 8, 25, 8, 8, 8, 8, 25, 8, 8, 25, 8, 8, 43, 8, 25, 8, 8, 25, 8, 8, 25, 25, 25, 8, 8, 25, 8, 8, 8, 43, 25, 8, 8, 25, 8, 8, 25, 8, 43, 8, 8, 25, 8, 8, 8, 25, 43, 8, 8, 25, 8, 8, 43, 25, 43, 8, 8, 25, 8, 8, 25, 43, 43, 8, 8, 25, 8, 8, 8, 8, 8, 25, 8, 25, 8, 8, 43, 8, 8, 25, 8, 25, 8, 8, 25, 25, 8, 25, 8, 25, 8, 8, 8, 43, 8, 25, 8, 25, 8, 8, 43, 43, 8, 25, 8, 25, 8, 8, 25, 8, 25, 25, 8, 25, 8, 8, 8, 25, 25, 25, 8, 25, 8, 8, 43, 25, 25, 25, 8, 25, 8, 8, 25, 43, 25, 25, 8, 25, 8, 8, 8, 8, 43, 25, 8, 25, 8, 8, 43, 8, 43, 25, 8, 25, 8, 8, 25, 25, 43, 25, 8, 25, 8, 8, 25, 8, 8, 43, 8, 25, 8, 8, 8, 25, 8, 43, 8, 25, 8, 8, 43, 25, 8, 43, 8, 25, 8, 8, 25, 43, 8, 43, 8, 25, 8, 8, 8, 8, 25, 43, 8, 25, 8, 8, 25, 25, 25, 43, 8, 25, 8, 8, 8, 43, 25, 43, 8, 25, 8, 8, 25, 8, 43, 43, 8, 25, 8, 8, 8, 25, 43, 43, 8, 25, 8, 8, 8, 8, 8, 8, 25, 25, 8, 8, 43, 8, 8, 8, 25, 25, 8, 8, 25, 25, 8, 8, 25, 25, 8, 8, 8, 43, 8, 8, 25, 25, 8, 8, 43, 43, 8, 8, 25, 25, 8, 8, 25, 8, 25, 8, 25, 25, 8, 8, 8, 25, 25, 8, 25, 25, 8, 8, 43, 25, 25, 8, 25, 25, 8, 8, 25, 43, 25, 8, 25, 25, 8, 8, 8, 8, 43, 8, 25, 25, 8, 8, 25, 25, 43, 8, 25, 25, 8, 8, 8, 43, 43, 8, 25, 25, 8, 8, 25, 8, 8, 25, 25, 25, 8, 8, 8, 25, 8, 25, 25, 25, 8, 8, 43, 25, 8, 25, 25, 25, 8, 8, 25, 43, 8, 25, 25, 25, 8, 8, 8, 8, 25, 25, 25, 25, 8, 8, 43, 8, 25, 25, 25, 25, 8, 8, 25, 25, 25, 25, 25, 25, 8, 8, 8, 43, 25, 25, 25, 25, 8, 8, 25, 8, 43, 25, 25, 25, 8, 8, 8, 25, 43, 25, 25, 25, 8, 8, 8, 8, 8, 43, 25, 25, 8, 8, 43, 8, 8, 43, 25, 25, 8, 8, 25, 25, 8, 43, 25, 25, 8, 8, 8, 43, 8, 43, 25, 25, 8, 8, 25, 8, 25, 43, 25, 25, 8, 8, 8, 25, 25, 43, 25, 25, 8, 8, 8, 8, 43, 43, 25, 25, 8, 8, 25, 8, 8, 8, 43, 25, 8, 8, 8, 25, 8, 8, 43, 25, 8, 8, 43, 25, 8, 8, 43, 25, 8, 8, 25, 43, 8, 8, 43, 25, 8, 8, 8, 8, 25, 8, 43, 25, 8, 8, 25, 25, 25, 8, 43, 25, 8, 8, 8, 8, 8, 25, 43, 25, 8, 8, 25, 25, 8, 25, 43, 25, 8, 8, 8, 43, 8, 25, 43, 25, 8, 8, 25, 8, 25, 25, 43, 25, 8, 8, 8, 25, 25, 25, 43, 25, 8, 8, 8, 8, 43, 25, 43, 25, 8, 8, 25, 8, 8, 43, 43, 25, 8, 8, 8, 25, 8, 43, 43, 25, 8, 8, 8, 8, 25, 43, 43, 25, 8, 8, 8, 8, 8, 8, 8, 43, 8, 8, 43, 8, 8, 8, 8, 43, 8, 8, 25, 25, 8, 8, 8, 43, 8, 8, 8, 43, 8, 8, 8, 43, 8, 8, 25, 8, 25, 8, 8, 43, 8, 8, 8, 25, 25, 8, 8, 43, 8, 8, 43, 25, 25, 8, 8, 43, 8, 8, 25, 43, 25, 8, 8, 43, 8, 8, 8, 8, 43, 8, 8, 43, 8, 8, 25, 25, 43, 8, 8, 43, 8, 8, 43, 43, 43, 8, 8, 43, 8, 8, 25, 8, 8, 25, 8, 43, 8, 8, 8, 25, 8, 25, 8, 43, 8, 8, 43, 25, 8, 25, 8, 43, 8, 8, 25, 43, 8, 25, 8, 43, 8, 8, 8, 8, 25, 25, 8, 43, 8, 8, 43, 8, 25, 25, 8, 43, 8, 8, 25, 25, 25, 25, 8, 43, 8, 8, 8, 43, 25, 25, 8, 43, 8, 8, 25, 8, 43, 25, 8, 43, 8, 8, 8, 25, 43, 25, 8, 43, 8, 8, 8, 8, 8, 43, 8, 43, 8, 8, 25, 25, 8, 43, 8, 43, 8, 8, 8, 25, 25, 43, 8, 43, 8, 8, 43, 43, 43, 43, 8, 43, 8, 8, 25, 8, 8, 8, 25, 43, 8, 8, 8, 25, 8, 8, 25, 43, 8, 8, 8, 8, 25, 8, 25, 43, 8, 8, 43, 8, 25, 8, 25, 43, 8, 8, 25, 25, 25, 8, 25, 43, 8, 8, 8, 43, 25, 8, 25, 43, 8, 8, 25, 8, 43, 8, 25, 43, 8, 8, 8, 8, 8, 25, 25, 43, 8, 8, 25, 25, 8, 25, 25, 43, 8, 8, 8, 43, 8, 25, 25, 43, 8, 8, 25, 8, 25, 25, 25, 43, 8, 8, 8, 25, 25, 25, 25, 43, 8, 8, 8, 8, 43, 25, 25, 43, 8, 8, 25, 8, 8, 43, 25, 43, 8, 8, 8, 8, 25, 43, 25, 43, 8, 8, 8, 8, 8, 8, 43, 43, 8, 8, 25, 8, 25, 8, 43, 43, 8, 8, 8, 25, 25, 8, 43, 43, 8, 8, 43, 8, 43, 8, 43, 43, 8, 8, 8, 43, 43, 8, 43, 43, 8, 8, 43, 43, 43, 8, 43, 43, 8, 8, 8, 8, 25, 25, 43, 43, 8, 8, 25, 43, 25, 43, 43, 43, 8, 8, 25, 8, 8, 8, 8, 8, 25, 8, 8, 25, 8, 8, 8, 8, 25, 8, 43, 25, 8, 8, 8, 8, 25, 8, 25, 43, 8, 8, 8, 8, 25, 8, 8, 8, 25, 8, 8, 8, 25, 8, 43, 8, 25, 8, 8, 8, 25, 8, 25, 25, 25, 8, 8, 8, 25, 8, 8, 43, 25, 8, 8, 8, 25, 8, 25, 8, 43, 8, 8, 8, 25, 8, 8, 25, 43, 8, 8, 8, 25, 8, 43, 25, 43, 8, 8, 8, 25, 8, 8, 8, 8, 25, 8, 8, 25, 8, 43, 8, 8, 25, 8, 8, 25, 8, 25, 25, 8, 25, 8, 8, 25, 8, 8, 43, 8, 25, 8, 8, 25, 8, 25, 8, 25, 25, 8, 8, 25, 8, 8, 25, 25, 25, 8, 8, 25, 8, 43, 25, 25, 25, 8, 8, 25, 8, 25, 43, 25, 25, 8, 8, 25, 8, 8, 8, 43, 25, 8, 8, 25, 8, 43, 8, 43, 25, 8, 8, 25, 8, 25, 25, 43, 25, 8, 8, 25, 8, 8, 43, 43, 25, 8, 8, 25, 8, 25, 8, 8, 43, 8, 8, 25, 8, 8, 25, 8, 43, 8, 8, 25, 8, 43, 25, 8, 43, 8, 8, 25, 8, 8, 8, 25, 43, 8, 8, 25, 8, 25, 25, 25, 43, 8, 8, 25, 8, 8, 43, 25, 43, 8, 8, 25, 8, 25, 8, 43, 43, 8, 8, 25, 8, 8, 25, 43, 43, 8, 8, 25, 8, 8, 8, 8, 8, 25, 8, 25, 8, 43, 8, 8, 8, 25, 8, 25, 8, 25, 25, 8, 8, 25, 8, 25, 8, 8, 43, 8, 8, 25, 8, 25, 8, 43, 43, 8, 8, 25, 8, 25, 8, 25, 8, 25, 8, 25, 8, 25, 8, 8, 25, 25, 8, 25, 8, 25, 8, 43, 25, 25, 8, 25, 8, 25, 8, 25, 43, 25, 8, 25, 8, 25, 8, 8, 8, 43, 8, 25, 8, 25, 8, 43, 8, 43, 8, 25, 8, 25, 8, 25, 25, 43, 8, 25, 8, 25, 8, 8, 43, 43, 8, 25, 8, 25, 8, 25, 8, 8, 25, 25, 8, 25, 8, 8, 25, 8, 25, 25, 8, 25, 8, 43, 25, 8, 25, 25, 8, 25, 8, 25, 43, 8, 25, 25, 8, 25, 8, 8, 8, 25, 25, 25, 8, 25, 8, 43, 8, 25, 25, 25, 8, 25, 8, 25, 25, 25, 25, 25, 8, 25, 8, 8, 43, 25, 25, 25, 8, 25, 8, 25, 8, 43, 25, 25, 8, 25, 8, 8, 25, 43, 25, 25, 8, 25, 8, 8, 8, 8, 43, 25, 8, 25, 8, 43, 8, 8, 43, 25, 8, 25, 8, 25, 25, 8, 43, 25, 8, 25, 8, 8, 43, 8, 43, 25, 8, 25, 8, 25, 8, 25, 43, 25, 8, 25, 8, 8, 25, 25, 43, 25, 8, 25, 8, 25, 8, 8, 8, 43, 8, 25, 8, 8, 25, 8, 8, 43, 8, 25, 8, 25, 43, 8, 8, 43, 8, 25, 8, 8, 8, 25, 8, 43, 8, 25, 8, 25, 25, 25, 8, 43, 8, 25, 8, 25, 8, 43, 8, 43, 8, 25, 8, 8, 25, 43, 8, 43, 8, 25, 8, 8, 8, 8, 25, 43, 8, 25, 8, 25, 25, 8, 25, 43, 8, 25, 8, 25, 8, 25, 25, 43, 8, 25, 8, 8, 25, 25, 25, 43, 8, 25, 8, 25, 8, 8, 43, 43, 8, 25, 8, 8, 25, 8, 43, 43, 8, 25, 8, 8, 8, 25, 43, 43, 8, 25, 8, 8, 8, 8, 8, 8, 25, 25, 8, 43, 8, 8, 8, 8, 25, 25, 8, 25, 25, 8, 8, 8, 25, 25, 8, 8, 43, 8, 8, 8, 25, 25, 8, 25, 8, 25, 8, 8, 25, 25, 8, 8, 25, 25, 8, 8, 25, 25, 8, 43, 25, 25, 8, 8, 25, 25, 8, 25, 43, 25, 8, 8, 25, 25, 8, 8, 8, 43, 8, 8, 25, 25, 8, 25, 25, 43, 8, 8, 25, 25, 8, 8, 43, 43, 8, 8, 25, 25, 8, 25, 8, 8, 25, 8, 25, 25, 8, 8, 25, 8, 25, 8, 25, 25, 8, 43, 25, 8, 25, 8, 25, 25, 8, 25, 43, 8, 25, 8, 25, 25, 8, 8, 8, 25, 25, 8, 25, 25, 8, 43, 8, 25, 25, 8, 25, 25, 8, 25, 25, 25, 25, 8, 25, 25, 8, 8, 43, 25, 25, 8, 25, 25, 8, 25, 8, 43, 25, 8, 25, 25, 8, 8, 25, 43, 25, 8, 25, 25, 8, 8, 8, 8, 43, 8, 25, 25, 8, 43, 8, 8, 43, 8, 25, 25, 8, 25, 25, 8, 43, 8, 25, 25, 8, 8, 43, 8, 43, 8, 25, 25, 8, 25, 8, 25, 43, 8, 25, 25, 8, 8, 25, 25, 43, 8, 25, 25, 8, 8, 8, 43, 43, 8, 25, 25, 8, 25, 8, 8, 8, 25, 25, 25, 8, 8, 25, 8, 8, 25, 25, 25, 8, 43, 25, 8, 8, 25, 25, 25, 8, 25, 43, 8, 8, 25, 25, 25, 8, 8, 8, 25, 8, 25, 25, 25, 8, 43, 8, 25, 8, 25, 25, 25, 8, 25, 25, 25, 8, 25, 25, 25, 8, 8, 43, 25, 8, 25, 25, 25, 8, 25, 8, 43, 8, 25, 25, 25, 8, 8, 25, 43, 8, 25, 25, 25, 8, 8, 8, 8, 25, 25, 25, 25, 8, 43, 8, 8, 25, 25, 25, 25, 8, 25, 25, 8, 25, 25, 25, 25, 8, 8, 43, 8, 25, 25, 25, 25, 8, 25, 8, 25, 25, 25, 25, 25, 8, 8, 25, 25, 25, 25, 25, 25, 8, 8, 8, 43, 25, 25, 25, 25, 8, 25, 8, 8, 43, 25, 25, 25, 8, 8, 25, 8, 43, 25, 25, 25, 8, 8, 8, 25, 43, 25, 25, 25, 8, 8, 8, 8, 8, 43, 25, 25, 8, 25, 25, 8, 8, 43, 25, 25, 8, 8, 43, 8, 8, 43, 25, 25, 8, 25, 8, 25, 8, 43, 25, 25, 8, 8, 25, 25, 8, 43, 25, 25, 8, 8, 8, 43, 8, 43, 25, 25, 8, 25, 8, 8, 25, 43, 25, 25, 8, 8, 25, 8, 25, 43, 25, 25, 8, 8, 8, 25, 25, 43, 25, 25, 8, 8, 8, 8, 43, 43, 25, 25, 8, 43, 43, 43, 43, 43, 25, 25, 8, 25, 8, 8, 8, 8, 43, 25, 8, 8, 25, 8, 8, 8, 43, 25, 8, 43, 25, 8, 8, 8, 43, 25, 8, 25, 43, 8, 8, 8, 43, 25, 8, 8, 8, 25, 8, 8, 43, 25, 8, 25, 25, 25, 8, 8, 43, 25, 8, 8, 43, 25, 8, 8, 43, 25, 8, 25, 8, 43, 8, 8, 43, 25, 8, 8, 8, 8, 25, 8, 43, 25, 8, 43, 8, 8, 25, 8, 43, 25, 8, 25, 25, 8, 25, 8, 43, 25, 8, 8, 43, 8, 25, 8, 43, 25, 8, 25, 8, 25, 25, 8, 43, 25, 8, 8, 25, 25, 25, 8, 43, 25, 8, 8, 8, 43, 25, 8, 43, 25, 8, 25, 8, 8, 43, 8, 43, 25, 8, 8, 25, 8, 43, 8, 43, 25, 8, 8, 8, 8, 8, 25, 43, 25, 8, 43, 8, 8, 8, 25, 43, 25, 8, 25, 25, 8, 8, 25, 43, 25, 8, 8, 43, 8, 8, 25, 43, 25, 8, 25, 8, 25, 8, 25, 43, 25, 8, 8, 25, 25, 8, 25, 43, 25, 8, 8, 8, 43, 8, 25, 43, 25, 8, 25, 8, 8, 25, 25, 43, 25, 8, 8, 25, 8, 25, 25, 43, 25, 8, 8, 8, 25, 25, 25, 43, 25, 8, 25, 43, 43, 25, 25, 43, 25, 8, 43, 8, 43, 43, 25, 43, 25, 8, 8, 25, 8, 8, 43, 43, 25, 8, 8, 8, 25, 8, 43, 43, 25, 8, 8, 8, 8, 25, 43, 43, 25, 8, 43, 25, 25, 25, 43, 43, 25, 8, 8, 8, 8, 8, 8, 8, 43, 8, 43, 8, 8, 8, 8, 8, 43, 8, 25, 25, 8, 8, 8, 8, 43, 8, 8, 43, 8, 8, 8, 8, 43, 8, 25, 8, 25, 8, 8, 8, 43, 8, 8, 25, 25, 8, 8, 8, 43, 8, 43, 25, 25, 8, 8, 8, 43, 8, 25, 43, 25, 8, 8, 8, 43, 8, 8, 8, 43, 8, 8, 8, 43, 8, 25, 25, 43, 8, 8, 8, 43, 8, 43, 43, 43, 8, 8, 8, 43, 8, 25, 8, 8, 25, 8, 8, 43, 8, 8, 25, 8, 25, 8, 8, 43, 8, 8, 8, 25, 25, 8, 8, 43, 8, 43, 8, 25, 25, 8, 8, 43, 8, 25, 25, 25, 25, 8, 8, 43, 8, 8, 25, 43, 25, 8, 8, 43, 8, 8, 8, 8, 43, 8, 8, 43, 8, 43, 43, 8, 43, 8, 8, 43, 8, 8, 25, 25, 43, 8, 8, 43, 8, 43, 43, 43, 43, 8, 8, 43, 8, 25, 8, 8, 8, 25, 8, 43, 8, 8, 25, 8, 8, 25, 8, 43, 8, 8, 8, 25, 8, 25, 8, 43, 8, 43, 8, 25, 8, 25, 8, 43, 8, 25, 25, 25, 8, 25, 8, 43, 8, 25, 8, 43, 8, 25, 8, 43, 8, 8, 8, 8, 25, 25, 8, 43, 8, 43, 8, 8, 25, 25, 8, 43, 8, 25, 25, 8, 25, 25, 8, 43, 8, 25, 8, 25, 25, 25, 8, 43, 8, 8, 25, 25, 25, 25, 8, 43, 8, 8, 8, 43, 25, 25, 8, 43, 8, 25, 8, 8, 43, 25, 8, 43, 8, 8, 25, 8, 43, 25, 8, 43, 8, 8, 8, 25, 43, 25, 8, 43, 8, 8, 8, 8, 8, 43, 8, 43, 8, 43, 43, 8, 8, 43, 8, 43, 8, 43, 8, 43, 8, 43, 8, 43, 8, 8, 43, 43, 8, 43, 8, 43, 8, 43, 43, 43, 8, 43, 8, 43, 8, 8, 25, 8, 25, 43, 8, 43, 8, 8, 8, 25, 25, 43, 8, 43, 8, 8, 43, 8, 43, 43, 8, 43, 8, 43, 43, 8, 43, 43, 8, 43, 8, 8, 43, 43, 43, 43, 8, 43, 8, 25, 8, 8, 8, 8, 25, 43, 8, 8, 25, 8, 8, 8, 25, 43, 8, 43, 25, 8, 8, 8, 25, 43, 8, 25, 43, 8, 8, 8, 25, 43, 8, 8, 8, 25, 8, 8, 25, 43, 8, 25, 25, 25, 8, 8, 25, 43, 8, 8, 43, 25, 8, 8, 25, 43, 8, 25, 8, 43, 8, 8, 25, 43, 8, 8, 25, 43, 8, 8, 25, 43, 8, 8, 8, 8, 25, 8, 25, 43, 8, 43, 8, 8, 25, 8, 25, 43, 8, 25, 25, 8, 25, 8, 25, 43, 8, 8, 43, 8, 25, 8, 25, 43, 8, 25, 8, 25, 25, 8, 25, 43, 8, 8, 25, 25, 25, 8, 25, 43, 8, 8, 8, 43, 25, 8, 25, 43, 8, 25, 8, 8, 43, 8, 25, 43, 8, 8, 25, 8, 43, 8, 25, 43, 8, 8, 8, 25, 43, 8, 25, 43, 8, 8, 8, 8, 8, 25, 25, 43, 8, 25, 25, 8, 8, 25, 25, 43, 8, 8, 43, 8, 8, 25, 25, 43, 8, 25, 8, 25, 8, 25, 25, 43, 8, 8, 25, 25, 8, 25, 25, 43, 8, 8, 8, 43, 8, 25, 25, 43, 8, 25, 8, 8, 25, 25, 25, 43, 8, 8, 25, 8, 25, 25, 25, 43, 8, 8, 8, 25, 25, 25, 25, 43, 8, 43, 25, 43, 25, 25, 25, 43, 8, 8, 8, 8, 43, 25, 25, 43, 8, 25, 8, 8, 8, 43, 25, 43, 8, 8, 25, 8, 8, 43, 25, 43, 8, 8, 8, 25, 8, 43, 25, 43, 8, 8, 8, 8, 25, 43, 25, 43, 8, 25, 43, 25, 25, 43, 25, 43, 8, 8, 8, 8, 8, 8, 43, 43, 8, 25, 25, 8, 8, 8, 43, 43, 8, 25, 8, 25, 8, 8, 43, 43, 8, 8, 25, 25, 8, 8, 43, 43, 8, 25, 8, 8, 25, 8, 43, 43, 8, 8, 25, 8, 25, 8, 43, 43, 8, 8, 8, 25, 25, 8, 43, 43, 8, 43, 43, 8, 43, 8, 43, 43, 8, 43, 43, 43, 43, 8, 43, 43, 8, 25, 8, 8, 8, 25, 43, 43, 8, 8, 25, 8, 8, 25, 43, 43, 8, 8, 8, 25, 8, 25, 43, 43, 8, 25, 25, 25, 43, 25, 43, 43, 8, 43, 43, 8, 8, 43, 43, 43, 8, 43, 8, 43, 8, 43, 43, 43, 8, 8, 25, 43, 25, 43, 43, 43, 8, 8, 43, 8, 43, 43, 43, 43, 8, 43, 43, 8, 43, 43, 43, 43, 8, 25, 8, 8, 8, 8, 8, 8, 25, 8, 25, 8, 8, 8, 8, 8, 25, 43, 25, 8, 8, 8, 8, 8, 25, 25, 43, 8, 8, 8, 8, 8, 25, 8, 8, 25, 8, 8, 8, 8, 25, 43, 8, 25, 8, 8, 8, 8, 25, 25, 25, 25, 8, 8, 8, 8, 25, 8, 43, 25, 8, 8, 8, 8, 25, 43, 43, 25, 8, 8, 8, 8, 25, 25, 8, 43, 8, 8, 8, 8, 25, 8, 25, 43, 8, 8, 8, 8, 25, 43, 25, 43, 8, 8, 8, 8, 25, 8, 8, 8, 25, 8, 8, 8, 25, 43, 8, 8, 25, 8, 8, 8, 25, 25, 25, 8, 25, 8, 8, 8, 25, 8, 43, 8, 25, 8, 8, 8, 25, 43, 43, 8, 25, 8, 8, 8, 25, 25, 8, 25, 25, 8, 8, 8, 25, 8, 25, 25, 25, 8, 8, 8, 25, 43, 25, 25, 25, 8, 8, 8, 25, 25, 43, 25, 25, 8, 8, 8, 25, 8, 8, 43, 25, 8, 8, 8, 25, 43, 8, 43, 25, 8, 8, 8, 25, 25, 25, 43, 25, 8, 8, 8, 25, 25, 8, 8, 43, 8, 8, 8, 25, 8, 25, 8, 43, 8, 8, 8, 25, 8, 8, 25, 43, 8, 8, 8, 25, 25, 25, 25, 43, 8, 8, 8, 25, 8, 43, 25, 43, 8, 8, 8, 25, 25, 8, 43, 43, 8, 8, 8, 25, 8, 25, 43, 43, 8, 8, 8, 25, 8, 8, 8, 8, 25, 8, 8, 25, 43, 8, 8, 8, 25, 8, 8, 25, 25, 25, 8, 8, 25, 8, 8, 25, 8, 43, 8, 8, 25, 8, 8, 25, 25, 8, 25, 8, 25, 8, 8, 25, 8, 25, 25, 8, 25, 8, 8, 25, 43, 25, 25, 8, 25, 8, 8, 25, 25, 43, 25, 8, 25, 8, 8, 25, 8, 8, 43, 8, 25, 8, 8, 25, 43, 8, 43, 8, 25, 8, 8, 25, 25, 25, 43, 8, 25, 8, 8, 25, 25, 8, 8, 25, 25, 8, 8, 25, 8, 25, 8, 25, 25, 8, 8, 25, 43, 25, 8, 25, 25, 8, 8, 25, 25, 43, 8, 25, 25, 8, 8, 25, 8, 8, 25, 25, 25, 8, 8, 25, 43, 8, 25, 25, 25, 8, 8, 25, 25, 25, 25, 25, 25, 8, 8, 25, 8, 43, 25, 25, 25, 8, 8, 25, 25, 8, 43, 25, 25, 8, 8, 25, 8, 25, 43, 25, 25, 8, 8, 25, 8, 8, 8, 43, 25, 8, 8, 25, 43, 8, 8, 43, 25, 8, 8, 25, 25, 25, 8, 43, 25, 8, 8, 25, 8, 43, 8, 43, 25, 8, 8, 25, 25, 8, 25, 43, 25, 8, 8, 25, 8, 25, 25, 43, 25, 8, 8, 25, 8, 8, 43, 43, 25, 8, 8, 25, 25, 8, 8, 8, 43, 8, 8, 25, 8, 25, 8, 8, 43, 8, 8, 25, 8, 8, 25, 8, 43, 8, 8, 25, 43, 8, 25, 8, 43, 8, 8, 25, 25, 25, 25, 8, 43, 8, 8, 25, 8, 43, 25, 8, 43, 8, 8, 25, 8, 25, 43, 8, 43, 8, 8, 25, 8, 8, 8, 25, 43, 8, 8, 25, 25, 25, 8, 25, 43, 8, 8, 25, 8, 43, 8, 25, 43, 8, 8, 25, 25, 8, 25, 25, 43, 8, 8, 25, 8, 25, 25, 25, 43, 8, 8, 25, 8, 8, 43, 25, 43, 8, 8, 25, 25, 8, 8, 43, 43, 8, 8, 25, 8, 25, 8, 43, 43, 8, 8, 25, 8, 8, 8, 8, 8, 25, 8, 25, 43, 8, 8, 8, 8, 25, 8, 25, 25, 25, 8, 8, 8, 25, 8, 25, 8, 43, 8, 8, 8, 25, 8, 25, 43, 43, 8, 8, 8, 25, 8, 25, 25, 8, 25, 8, 8, 25, 8, 25, 8, 25, 25, 8, 8, 25, 8, 25, 43, 25, 25, 8, 8, 25, 8, 25, 25, 43, 25, 8, 8, 25, 8, 25, 8, 8, 43, 8, 8, 25, 8, 25, 43, 8, 43, 8, 8, 25, 8, 25, 25, 25, 43, 8, 8, 25, 8, 25, 8, 43, 43, 8, 8, 25, 8, 25, 25, 8, 8, 25, 8, 25, 8, 25, 8, 25, 8, 25, 8, 25, 8, 25, 43, 25, 8, 25, 8, 25, 8, 25, 25, 43, 8, 25, 8, 25, 8, 25, 8, 8, 25, 25, 8, 25, 8, 25, 43, 8, 25, 25, 8, 25, 8, 25, 25, 25, 25, 25, 8, 25, 8, 25, 8, 43, 25, 25, 8, 25, 8, 25, 25, 8, 43, 25, 8, 25, 8, 25, 8, 25, 43, 25, 8, 25, 8, 25, 8, 8, 8, 43, 8, 25, 8, 25, 43, 8, 8, 43, 8, 25, 8, 25, 25, 25, 8, 43, 8, 25, 8, 25, 8, 43, 8, 43, 8, 25, 8, 25, 25, 8, 25, 43, 8, 25, 8, 25, 8, 25, 25, 43, 8, 25, 8, 25, 8, 8, 43, 43, 8, 25, 8, 25, 25, 8, 8, 8, 25, 25, 8, 25, 8, 25, 8, 8, 25, 25, 8, 25, 43, 25, 8, 8, 25, 25, 8, 25, 25, 43, 8, 8, 25, 25, 8, 25, 8, 8, 25, 8, 25, 25, 8, 25, 43, 8, 25, 8, 25, 25, 8, 25, 25, 25, 25, 8, 25, 25, 8, 25, 8, 43, 25, 8, 25, 25, 8, 25, 25, 8, 43, 8, 25, 25, 8, 25, 8, 25, 43, 8, 25, 25, 8, 25, 8, 8, 8, 25, 25, 25, 8, 25, 43, 8, 8, 25, 25, 25, 8, 25, 25, 25, 8, 25, 25, 25, 8, 25, 8, 43, 8, 25, 25, 25, 8, 25, 25, 8, 25, 25, 25, 25, 8, 25, 8, 25, 25, 25, 25, 25, 8, 25, 8, 8, 43, 25, 25, 25, 8, 25, 43, 43, 43, 25, 25, 25, 8, 25, 25, 8, 8, 43, 25, 25, 8, 25, 8, 25, 8, 43, 25, 25, 8, 25, 8, 8, 25, 43, 25, 25, 8, 25, 8, 8, 8, 8, 43, 25, 8, 25, 43, 8, 8, 8, 43, 25, 8, 25, 25, 25, 8, 8, 43, 25, 8, 25, 8, 43, 8, 8, 43, 25, 8, 25, 25, 8, 25, 8, 43, 25, 8, 25, 8, 25, 25, 8, 43, 25, 8, 25, 8, 8, 43, 8, 43, 25, 8, 25, 25, 8, 8, 25, 43, 25, 8, 25, 8, 25, 8, 25, 43, 25, 8, 25, 8, 8, 25, 25, 43, 25, 8, 25, 8, 8, 8, 43, 43, 25, 8, 25, 25, 25, 43, 43, 43, 25, 8, 25, 25, 8, 8, 8, 8, 43, 8, 25, 8, 25, 8, 8, 8, 43, 8, 25, 25, 43, 8, 8, 8, 43, 8, 25, 8, 8, 25, 8, 8, 43, 8, 25, 43, 8, 25, 8, 8, 43, 8, 25, 25, 25, 25, 8, 8, 43, 8, 25, 8, 43, 25, 8, 8, 43, 8, 25, 25, 8, 43, 8, 8, 43, 8, 25, 8, 25, 43, 8, 8, 43, 8, 25, 8, 8, 8, 25, 8, 43, 8, 25, 43, 8, 8, 25, 8, 43, 8, 25, 25, 25, 8, 25, 8, 43, 8, 25, 8, 43, 8, 25, 8, 43, 8, 25, 25, 8, 25, 25, 8, 43, 8, 25, 8, 25, 25, 25, 8, 43, 8, 25, 8, 8, 43, 25, 8, 43, 8, 25, 8, 25, 8, 43, 8, 43, 8, 25, 8, 8, 25, 43, 8, 43, 8, 25, 8, 8, 8, 8, 25, 43, 8, 25, 43, 8, 8, 8, 25, 43, 8, 25, 25, 25, 8, 8, 25, 43, 8, 25, 8, 43, 8, 8, 25, 43, 8, 25, 25, 8, 25, 8, 25, 43, 8, 25, 8, 25, 25, 8, 25, 43, 8, 25, 8, 8, 43, 8, 25, 43, 8, 25, 25, 8, 8, 25, 25, 43, 8, 25, 8, 25, 8, 25, 25, 43, 8, 25, 8, 8, 25, 25, 25, 43, 8, 25, 8, 8, 8, 43, 25, 43, 8, 25, 43, 25, 25, 43, 25, 43, 8, 25, 25, 8, 8, 8, 43, 43, 8, 25, 8, 25, 8, 8, 43, 43, 8, 25, 8, 8, 25, 8, 43, 43, 8, 25, 8, 8, 8, 25, 43, 43, 8, 25, 8, 8, 8, 8, 8, 8, 25, 25, 43, 8, 8, 8, 8, 8, 25, 25, 25, 25, 8, 8, 8, 8, 25, 25, 8, 43, 8, 8, 8, 8, 25, 25, 25, 8, 25, 8, 8, 8, 25, 25, 8, 25, 25, 8, 8, 8, 25, 25, 43, 25, 25, 8, 8, 8, 25, 25, 25, 43, 25, 8, 8, 8, 25, 25, 8, 8, 43, 8, 8, 8, 25, 25, 43, 8, 43, 8, 8, 8, 25, 25, 25, 25, 43, 8, 8, 8, 25, 25, 8, 43, 43, 8, 8, 8, 25, 25, 25, 8, 8, 25, 8, 8, 25, 25, 8, 25, 8, 25, 8, 8, 25, 25, 43, 25, 8, 25, 8, 8, 25, 25, 25, 43, 8, 25, 8, 8, 25, 25, 8, 8, 25, 25, 8, 8, 25, 25, 43, 8, 25, 25, 8, 8, 25, 25, 25, 25, 25, 25, 8, 8, 25, 25, 8, 43, 25, 25, 8, 8, 25, 25, 25, 8, 43, 25, 8, 8, 25, 25, 8, 25, 43, 25, 8, 8, 25, 25, 8, 8, 8, 43, 8, 8, 25, 25, 43, 8, 8, 43, 8, 8, 25, 25, 25, 25, 8, 43, 8, 8, 25, 25, 8, 43, 8, 43, 8, 8, 25, 25, 25, 8, 25, 43, 8, 8, 25, 25, 8, 25, 25, 43, 8, 8, 25, 25, 25, 8, 8, 8, 25, 8, 25, 25, 8, 25, 8, 8, 25, 8, 25, 25, 43, 25, 8, 8, 25, 8, 25, 25, 25, 43, 8, 8, 25, 8, 25, 25, 8, 8, 25, 8, 25, 8, 25, 25, 43, 8, 25, 8, 25, 8, 25, 25, 25, 25, 25, 8, 25, 8, 25, 25, 8, 43, 25, 8, 25, 8, 25, 25, 25, 8, 43, 8, 25, 8, 25, 25, 8, 25, 43, 8, 25, 8, 25, 25, 8, 8, 8, 25, 25, 8, 25, 25, 43, 8, 8, 25, 25, 8, 25, 25, 25, 25, 8, 25, 25, 8, 25, 25, 8, 43, 8, 25, 25, 8, 25, 25, 25, 8, 25, 25, 25, 8, 25, 25, 8, 25, 25, 25, 25, 8, 25, 25, 8, 8, 43, 25, 25, 8, 25, 25, 25, 8, 8, 43, 25, 8, 25, 25, 8, 25, 8, 43, 25, 8, 25, 25, 8, 8, 25, 43, 25, 8, 25, 25, 8, 8, 8, 8, 43, 8, 25, 25, 25, 25, 8, 8, 43, 8, 25, 25, 8, 43, 8, 8, 43, 8, 25, 25, 25, 8, 25, 8, 43, 8, 25, 25, 8, 25, 25, 8, 43, 8, 25, 25, 8, 8, 43, 8, 43, 8, 25, 25, 25, 8, 8, 25, 43, 8, 25, 25, 8, 25, 8, 25, 43, 8, 25, 25, 8, 8, 25, 25, 43, 8, 25, 25, 25, 43, 43, 25, 43, 8, 25, 25, 8, 8, 8, 43, 43, 8, 25, 25, 25, 8, 8, 8, 8, 25, 25, 25, 8, 25, 8, 8, 8, 25, 25, 25, 43, 25, 8, 8, 8, 25, 25, 25, 25, 43, 8, 8, 8, 25, 25, 25, 8, 8, 25, 8, 8, 25, 25, 25, 43, 8, 25, 8, 8, 25, 25, 25, 25, 25, 25, 8, 8, 25, 25, 25, 8, 43, 25, 8, 8, 25, 25, 25, 25, 8, 43, 8, 8, 25, 25, 25, 8, 25, 43, 8, 8, 25, 25, 25, 8, 8, 8, 25, 8, 25, 25, 25, 43, 8, 8, 25, 8, 25, 25, 25, 25, 25, 8, 25, 8, 25, 25, 25, 8, 43, 8, 25, 8, 25, 25, 25, 25, 8, 25, 25, 8, 25, 25, 25, 8, 25, 25, 25, 8, 25, 25, 25, 8, 8, 43, 25, 8, 25, 25, 25, 25, 8, 8, 43, 8, 25, 25, 25, 8, 25, 8, 43, 8, 25, 25, 25, 8, 8, 25, 43, 8, 25, 25, 25, 8, 8, 8, 8, 25, 25, 25, 25, 43, 8, 8, 8, 25, 25, 25, 25, 25, 25, 8, 8, 25, 25, 25, 25, 8, 43, 8, 8, 25, 25, 25, 25, 25, 8, 25, 8, 25, 25, 25, 25, 8, 25, 25, 8, 25, 25, 25, 25, 8, 8, 43, 8, 25, 25, 25, 25, 25, 8, 8, 25, 25, 25, 25, 25, 8, 25, 8, 25, 25, 25, 25, 25, 8, 8, 25, 25, 25, 25, 25, 25, 8, 8, 8, 43, 25, 25, 25, 25, 25, 8, 8, 8, 43, 25, 25, 25, 8, 25, 8, 8, 43, 25, 25, 25, 8, 8, 25, 8, 43, 25, 25, 25, 43, 25, 43, 8, 43, 25, 25, 25, 8, 8, 8, 25, 43, 25, 25, 25, 8, 8, 8, 8, 8, 43, 25, 25, 43, 8, 8, 8, 8, 43, 25, 25, 25, 25, 8, 8, 8, 43, 25, 25, 8, 43, 8, 8, 8, 43, 25, 25, 25, 8, 25, 8, 8, 43, 25, 25, 8, 25, 25, 8, 8, 43, 25, 25, 8, 8, 43, 8, 8, 43, 25, 25, 25, 8, 8, 25, 8, 43, 25, 25, 8, 25, 8, 25, 8, 43, 25, 25, 8, 8, 25, 25, 8, 43, 25, 25, 43, 43, 25, 25, 8, 43, 25, 25, 8, 8, 8, 43, 8, 43, 25, 25, 25, 8, 8, 8, 25, 43, 25, 25, 8, 25, 8, 8, 25, 43, 25, 25, 8, 8, 25, 8, 25, 43, 25, 25, 8, 8, 8, 25, 25, 43, 25, 25, 8, 8, 8, 8, 43, 43, 25, 25, 25, 43, 25, 8, 43, 43, 25, 25, 25, 25, 8, 43, 43, 43, 25, 25, 8, 43, 43, 43, 43, 43, 25, 25, 25, 8, 8, 8, 8, 8, 43, 25, 8, 25, 8, 8, 8, 8, 43, 25, 43, 25, 8, 8, 8, 8, 43, 25, 8, 8, 25, 8, 8, 8, 43, 25, 43, 8, 25, 8, 8, 8, 43, 25, 25, 25, 25, 8, 8, 8, 43, 25, 8, 43, 25, 8, 8, 8, 43, 25, 25, 8, 43, 8, 8, 8, 43, 25, 8, 25, 43, 8, 8, 8, 43, 25, 8, 8, 8, 25, 8, 8, 43, 25, 25, 25, 8, 25, 8, 8, 43, 25, 8, 43, 8, 25, 8, 8, 43, 25, 25, 8, 25, 25, 8, 8, 43, 25, 8, 25, 25, 25, 8, 8, 43, 25, 8, 8, 43, 25, 8, 8, 43, 25, 8, 25, 8, 43, 8, 8, 43, 25, 8, 8, 25, 43, 8, 8, 43, 25, 8, 8, 8, 8, 25, 8, 43, 25, 43, 8, 8, 8, 25, 8, 43, 25, 25, 25, 8, 8, 25, 8, 43, 25, 8, 43, 8, 8, 25, 8, 43, 25, 25, 8, 25, 8, 25, 8, 43, 25, 8, 25, 25, 8, 25, 8, 43, 25, 8, 8, 43, 8, 25, 8, 43, 25, 25, 8, 8, 25, 25, 8, 43, 25, 8, 25, 8, 25, 25, 8, 43, 25, 8, 8, 25, 25, 25, 8, 43, 25, 8, 8, 8, 43, 25, 8, 43, 25, 25, 43, 25, 43, 25, 8, 43, 25, 8, 25, 8, 8, 43, 8, 43, 25, 8, 8, 25, 8, 43, 8, 43, 25, 8, 8, 8, 25, 43, 8, 43, 25, 43, 25, 25, 25, 43, 8, 43, 25, 25, 8, 43, 43, 43, 8, 43, 25, 8, 8, 8, 8, 8, 25, 43, 25, 25, 25, 8, 8, 8, 25, 43, 25, 8, 43, 8, 8, 8, 25, 43, 25, 25, 8, 25, 8, 8, 25, 43, 25, 8, 25, 25, 8, 8, 25, 43, 25, 8, 8, 43, 8, 8, 25, 43, 25, 25, 8, 8, 25, 8, 25, 43, 25, 8, 25, 8, 25, 8, 25, 43, 25, 8, 8, 25, 25, 8, 25, 43, 25, 8, 8, 8, 43, 8, 25, 43, 25, 25, 8, 8, 8, 25, 25, 43, 25, 8, 25, 8, 8, 25, 25, 43, 25, 8, 8, 25, 8, 25, 25, 43, 25, 8, 8, 8, 25, 25, 25, 43, 25, 43, 43, 8, 25, 25, 25, 43, 25, 8, 43, 43, 25, 25, 25, 43, 25, 43, 8, 25, 43, 25, 25, 43, 25, 8, 8, 8, 8, 43, 25, 43, 25, 8, 25, 25, 43, 43, 25, 43, 25, 25, 8, 8, 8, 8, 43, 43, 25, 8, 25, 8, 8, 8, 43, 43, 25, 8, 8, 25, 8, 8, 43, 43, 25, 25, 25, 43, 25, 8, 43, 43, 25, 8, 43, 25, 43, 8, 43, 43, 25, 8, 8, 8, 8, 25, 43, 43, 25, 43, 43, 43, 8, 25, 43, 43, 25, 43, 8, 8, 25, 43, 43, 43, 25, 25, 8, 43, 43, 43, 43, 43, 25, 8, 8, 8, 8, 8, 8, 8, 43, 43, 8, 8, 8, 8, 8, 8, 43, 25, 25, 8, 8, 8, 8, 8, 43, 8, 43, 8, 8, 8, 8, 8, 43, 25, 8, 25, 8, 8, 8, 8, 43, 8, 25, 25, 8, 8, 8, 8, 43, 25, 43, 25, 8, 8, 8, 8, 43, 8, 8, 43, 8, 8, 8, 8, 43, 25, 25, 43, 8, 8, 8, 8, 43, 25, 8, 8, 25, 8, 8, 8, 43, 8, 25, 8, 25, 8, 8, 8, 43, 8, 8, 25, 25, 8, 8, 8, 43, 43, 8, 25, 25, 8, 8, 8, 43, 25, 25, 25, 25, 8, 8, 8, 43, 8, 43, 25, 25, 8, 8, 8, 43, 25, 8, 43, 25, 8, 8, 8, 43, 8, 8, 8, 43, 8, 8, 8, 43, 25, 25, 8, 43, 8, 8, 8, 43, 25, 8, 25, 43, 8, 8, 8, 43, 8, 25, 25, 43, 8, 8, 8, 43, 25, 8, 8, 8, 25, 8, 8, 43, 8, 25, 8, 8, 25, 8, 8, 43, 25, 43, 8, 8, 25, 8, 8, 43, 8, 8, 25, 8, 25, 8, 8, 43, 43, 8, 25, 8, 25, 8, 8, 43, 25, 25, 25, 8, 25, 8, 8, 43, 8, 43, 25, 8, 25, 8, 8, 43, 25, 8, 43, 8, 25, 8, 8, 43, 8, 25, 43, 8, 25, 8, 8, 43, 8, 8, 8, 25, 25, 8, 8, 43, 43, 8, 8, 25, 25, 8, 8, 43, 25, 25, 8, 25, 25, 8, 8, 43, 8, 43, 8, 25, 25, 8, 8, 43, 25, 8, 25, 25, 25, 8, 8, 43, 8, 25, 25, 25, 25, 8, 8, 43, 25, 8, 8, 43, 25, 8, 8, 43, 8, 25, 8, 43, 25, 8, 8, 43, 8, 8, 25, 43, 25, 8, 8, 43, 25, 43, 43, 43, 25, 8, 8, 43, 8, 8, 8, 8, 43, 8, 8, 43, 25, 25, 8, 8, 43, 8, 8, 43, 43, 43, 8, 8, 43, 8, 8, 43, 25, 8, 25, 8, 43, 8, 8, 43, 8, 25, 25, 8, 43, 8, 8, 43, 25, 8, 8, 25, 43, 8, 8, 43, 8, 25, 8, 25, 43, 8, 8, 43, 8, 8, 25, 25, 43, 8, 8, 43, 25, 8, 8, 8, 8, 25, 8, 43, 8, 25, 8, 8, 8, 25, 8, 43, 43, 25, 8, 8, 8, 25, 8, 43, 25, 43, 8, 8, 8, 25, 8, 43, 8, 8, 25, 8, 8, 25, 8, 43, 43, 8, 25, 8, 8, 25, 8, 43, 25, 25, 25, 8, 8, 25, 8, 43, 8, 43, 25, 8, 8, 25, 8, 43, 25, 8, 43, 8, 8, 25, 8, 43, 8, 8, 8, 25, 8, 25, 8, 43, 43, 8, 8, 25, 8, 25, 8, 43, 25, 25, 8, 25, 8, 25, 8, 43, 8, 43, 8, 25, 8, 25, 8, 43, 25, 8, 25, 25, 8, 25, 8, 43, 8, 25, 25, 25, 8, 25, 8, 43, 8, 8, 43, 25, 8, 25, 8, 43, 25, 8, 8, 43, 8, 25, 8, 43, 8, 25, 8, 43, 8, 25, 8, 43, 8, 8, 25, 43, 8, 25, 8, 43, 8, 8, 8, 8, 25, 25, 8, 43, 43, 8, 8, 8, 25, 25, 8, 43, 25, 25, 8, 8, 25, 25, 8, 43, 8, 43, 8, 8, 25, 25, 8, 43, 25, 8, 25, 8, 25, 25, 8, 43, 8, 25, 25, 8, 25, 25, 8, 43, 8, 8, 43, 8, 25, 25, 8, 43, 25, 8, 8, 25, 25, 25, 8, 43, 8, 25, 8, 25, 25, 25, 8, 43, 8, 8, 25, 25, 25, 25, 8, 43, 8, 8, 8, 43, 25, 25, 8, 43, 43, 43, 8, 43, 25, 25, 8, 43, 25, 8, 8, 8, 43, 25, 8, 43, 8, 25, 8, 8, 43, 25, 8, 43, 8, 8, 25, 8, 43, 25, 8, 43, 25, 43, 43, 8, 43, 25, 8, 43, 8, 8, 8, 25, 43, 25, 8, 43, 8, 8, 8, 8, 8, 43, 8, 43, 25, 25, 8, 8, 8, 43, 8, 43, 25, 8, 25, 8, 8, 43, 8, 43, 8, 25, 25, 8, 8, 43, 8, 43, 25, 8, 8, 25, 8, 43, 8, 43, 8, 25, 8, 25, 8, 43, 8, 43, 8, 8, 25, 25, 8, 43, 8, 43, 43, 8, 43, 43, 8, 43, 8, 43, 25, 8, 8, 8, 25, 43, 8, 43, 8, 25, 8, 8, 25, 43, 8, 43, 8, 8, 8, 25, 25, 43, 8, 43, 25, 25, 43, 25, 25, 43, 8, 43, 43, 8, 43, 8, 43, 43, 8, 43, 8, 43, 25, 25, 43, 43, 8, 43, 43, 43, 25, 25, 43, 43, 8, 43, 43, 8, 8, 43, 43, 43, 8, 43, 43, 8, 43, 43, 43, 43, 8, 43, 25, 8, 8, 8, 8, 8, 25, 43, 8, 25, 8, 8, 8, 8, 25, 43, 25, 43, 8, 8, 8, 8, 25, 43, 8, 8, 25, 8, 8, 8, 25, 43, 43, 8, 25, 8, 8, 8, 25, 43, 25, 25, 25, 8, 8, 8, 25, 43, 8, 43, 25, 8, 8, 8, 25, 43, 8, 25, 43, 8, 8, 8, 25, 43, 8, 8, 8, 25, 8, 8, 25, 43, 43, 8, 8, 25, 8, 8, 25, 43, 25, 25, 8, 25, 8, 8, 25, 43, 8, 43, 8, 25, 8, 8, 25, 43, 25, 8, 25, 25, 8, 8, 25, 43, 8, 25, 25, 25, 8, 8, 25, 43, 8, 8, 43, 25, 8, 8, 25, 43, 25, 8, 8, 43, 8, 8, 25, 43, 8, 25, 8, 43, 8, 8, 25, 43, 8, 8, 25, 43, 8, 8, 25, 43, 8, 8, 8, 8, 25, 8, 25, 43, 25, 25, 8, 8, 25, 8, 25, 43, 25, 8, 25, 8, 25, 8, 25, 43, 8, 25, 25, 8, 25, 8, 25, 43, 25, 8, 8, 25, 25, 8, 25, 43, 8, 25, 8, 25, 25, 8, 25, 43, 8, 8, 25, 25, 25, 8, 25, 43, 43, 43, 25, 25, 25, 8, 25, 43, 25, 8, 8, 8, 43, 8, 25, 43, 8, 25, 8, 8, 43, 8, 25, 43, 8, 8, 25, 8, 43, 8, 25, 43, 8, 8, 8, 25, 43, 8, 25, 43, 43, 25, 43, 43, 43, 8, 25, 43, 8, 8, 8, 8, 8, 25, 25, 43, 43, 8, 8, 8, 8, 25, 25, 43, 25, 25, 8, 8, 8, 25, 25, 43, 8, 43, 8, 8, 8, 25, 25, 43, 25, 8, 25, 8, 8, 25, 25, 43, 8, 25, 25, 8, 8, 25, 25, 43, 8, 8, 43, 8, 8, 25, 25, 43, 25, 8, 8, 25, 8, 25, 25, 43, 8, 25, 8, 25, 8, 25, 25, 43, 8, 8, 25, 25, 8, 25, 25, 43, 8, 8, 8, 43, 8, 25, 25, 43, 43, 25, 25, 43, 8, 25, 25, 43, 25, 8, 8, 8, 25, 25, 25, 43, 8, 25, 8, 8, 25, 25, 25, 43, 8, 8, 25, 8, 25, 25, 25, 43, 8, 8, 8, 25, 25, 25, 25, 43, 8, 43, 25, 43, 25, 25, 25, 43, 25, 8, 43, 43, 25, 25, 25, 43, 8, 8, 8, 8, 43, 25, 25, 43, 43, 25, 8, 25, 43, 25, 25, 43, 8, 25, 43, 25, 43, 25, 25, 43, 25, 8, 8, 8, 8, 43, 25, 43, 8, 25, 8, 8, 8, 43, 25, 43, 8, 8, 25, 8, 8, 43, 25, 43, 43, 25, 43, 8, 8, 43, 25, 43, 8, 8, 8, 25, 8, 43, 25, 43, 25, 43, 43, 43, 8, 43, 25, 43, 8, 8, 8, 8, 25, 43, 25, 43, 25, 43, 8, 25, 25, 43, 25, 43, 43, 8, 25, 25, 25, 43, 25, 43, 8, 8, 25, 43, 43, 43, 25, 43, 8, 8, 8, 8, 8, 8, 43, 43, 25, 25, 8, 8, 8, 8, 43, 43, 43, 43, 8, 8, 8, 8, 43, 43, 8, 25, 25, 8, 8, 8, 43, 43, 43, 8, 43, 8, 8, 8, 43, 43, 43, 43, 43, 8, 8, 8, 43, 43, 25, 8, 8, 25, 8, 8, 43, 43, 8, 25, 8, 25, 8, 8, 43, 43, 8, 8, 25, 25, 8, 8, 43, 43, 43, 8, 43, 43, 8, 8, 43, 43, 43, 43, 43, 43, 8, 8, 43, 43, 8, 8, 8, 25, 25, 8, 43, 43, 25, 25, 43, 25, 25, 8, 43, 43, 43, 8, 8, 8, 43, 8, 43, 43, 43, 43, 8, 8, 43, 8, 43, 43, 43, 8, 43, 8, 43, 8, 43, 43, 8, 43, 43, 8, 43, 8, 43, 43, 43, 43, 43, 8, 43, 8, 43, 43, 43, 8, 8, 43, 43, 8, 43, 43, 8, 43, 8, 43, 43, 8, 43, 43, 43, 43, 8, 43, 43, 8, 43, 43, 8, 43, 43, 43, 43, 8, 43, 43, 25, 8, 8, 8, 8, 25, 43, 43, 8, 25, 8, 8, 8, 25, 43, 43, 8, 8, 25, 8, 8, 25, 43, 43, 8, 8, 8, 25, 8, 25, 43, 43, 25, 43, 8, 43, 8, 25, 43, 43, 8, 25, 43, 43, 8, 25, 43, 43, 8, 8, 8, 8, 25, 25, 43, 43, 25, 43, 25, 8, 25, 25, 43, 43, 25, 8, 25, 25, 43, 25, 43, 43, 43, 43, 8, 8, 8, 43, 43, 43, 8, 43, 43, 8, 8, 43, 43, 43, 43, 8, 43, 43, 8, 43, 43, 43, 8, 25, 25, 25, 25, 43, 43, 43, 43, 25, 8, 43, 25, 43, 43, 43, 8, 43, 8, 8, 43, 43, 43, 43, 43, 43, 8, 8, 43, 43, 43, 43, 8, 8, 43, 8, 43, 43, 43, 43, 43, 8, 43, 8, 43, 43, 43, 43, 8, 43, 43, 8, 43, 43, 43, 43, 8, 43, 8, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43]
++
++# iq3xxs_grid: 256 x uint32_t, little-endian bytes, 4 per entry
++IQ3XXS_GRID_BYTES = [4, 4, 4, 4, 20, 4, 4, 4, 36, 4, 4, 4, 12, 12, 4, 4, 28, 12, 4, 4, 62, 12, 4, 4, 4, 20, 4, 4, 20, 20, 4, 4, 12, 28, 4, 4, 20, 36, 4, 4, 28, 62, 4, 4, 44, 62, 4, 4, 12, 4, 12, 4, 28, 4, 12, 4, 4, 12, 12, 4, 20, 12, 12, 4, 12, 20, 12, 4, 44, 20, 12, 4, 4, 28, 12, 4, 20, 28, 12, 4, 12, 36, 12, 4, 36, 44, 12, 4, 4, 62, 12, 4, 4, 4, 20, 4, 20, 4, 20, 4, 36, 4, 20, 4, 12, 12, 20, 4, 4, 20, 20, 4, 20, 20, 20, 4, 12, 28, 20, 4, 28, 28, 20, 4, 62, 28, 20, 4, 12, 44, 20, 4, 62, 44, 20, 4, 44, 62, 20, 4, 12, 4, 28, 4, 62, 4, 28, 4, 4, 12, 28, 4, 20, 12, 28, 4, 44, 20, 28, 4, 4, 62, 28, 4, 28, 12, 36, 4, 62, 28, 36, 4, 36, 36, 36, 4, 62, 44, 36, 4, 28, 62, 36, 4, 44, 62, 36, 4, 12, 4, 44, 4, 62, 4, 44, 4, 20, 28, 44, 4, 20, 44, 44, 4, 44, 28, 52, 4, 36, 52, 52, 4, 4, 12, 62, 4, 36, 12, 62, 4, 52, 12, 62, 4, 28, 36, 62, 4, 12, 52, 62, 4, 12, 4, 4, 12, 28, 4, 4, 12, 4, 12, 4, 12, 20, 12, 4, 12, 12, 20, 4, 12, 28, 20, 4, 12, 4, 28, 4, 12, 20, 28, 4, 12, 36, 28, 4, 12, 62, 36, 4, 12, 4, 44, 4, 12, 4, 4, 12, 12, 20, 4, 12, 12, 12, 12, 12, 12, 4, 20, 12, 12, 20, 20, 12, 12, 12, 4, 20, 12, 28, 4, 20, 12, 4, 12, 20, 12, 20, 12, 20, 12, 12, 20, 20, 12, 4, 28, 20, 12, 20, 62, 20, 12, 4, 4, 28, 12, 20, 4, 28, 12, 4, 20, 28, 12, 12, 28, 28, 12, 52, 36, 28, 12, 52, 52, 28, 12, 12, 4, 36, 12, 44, 4, 36, 12, 4, 44, 36, 12, 4, 20, 44, 12, 36, 20, 44, 12, 52, 36, 44, 12, 12, 62, 44, 12, 44, 4, 52, 12, 20, 20, 62, 12, 4, 36, 62, 12, 4, 4, 4, 20, 20, 4, 4, 20, 12, 12, 4, 20, 28, 12, 4, 20, 4, 20, 4, 20, 20, 20, 4, 20, 52, 20, 4, 20, 12, 28, 4, 20, 20, 36, 4, 20, 12, 4, 12, 20, 28, 4, 12, 20, 44, 4, 12, 20, 4, 12, 12, 20, 20, 12, 12, 20, 12, 20, 12, 20, 4, 28, 12, 20, 28, 52, 12, 20, 62, 52, 12, 20, 4, 62, 12, 20, 4, 4, 20, 20, 20, 4, 20, 20, 12, 12, 20, 20, 62, 12, 20, 20, 4, 20, 20, 20, 20, 20, 20, 20, 62, 28, 20, 20, 4, 36, 20, 20, 44, 44, 20, 20, 12, 4, 28, 20, 4, 12, 28, 20, 36, 12, 28, 20, 4, 62, 28, 20, 36, 62, 28, 20, 44, 28, 36, 20, 28, 44, 36, 20, 28, 4, 44, 20, 62, 20, 44, 20, 12, 36, 44, 20, 36, 62, 44, 20, 12, 4, 62, 20, 28, 4, 62, 20, 52, 12, 62, 20, 44, 36, 62, 20, 12, 4, 4, 28, 4, 12, 4, 28, 20, 12, 4, 28, 12, 20, 4, 28, 28, 20, 4, 28, 4, 44, 4, 28, 44, 52, 4, 28, 20, 62, 4, 28, 4, 4, 12, 28, 20, 4, 12, 28, 4, 20, 12, 28, 12, 28, 12, 28, 36, 36, 12, 28, 52, 36, 12, 28, 12, 4, 20, 28, 28, 4, 20, 28, 4, 12, 20, 28, 44, 20, 20, 28, 20, 44, 20, 28, 20, 62, 20, 28, 12, 12, 28, 28, 28, 28, 28, 28, 4, 28, 36, 28, 62, 36, 36, 28, 20, 62, 36, 28, 4, 4, 44, 28, 52, 4, 44, 28, 20, 20, 44, 28, 44, 44, 44, 28, 36, 12, 52, 28, 52, 28, 52, 28, 28, 52, 52, 28, 28, 28, 62, 28, 4, 52, 62, 28, 36, 4, 4, 36, 62, 12, 4, 36, 44, 28, 4, 36, 62, 28, 4, 36, 28, 44, 4, 36, 62, 44, 4, 36, 36, 62, 12, 36, 4, 20, 20, 36, 62, 28, 20, 36, 4, 36, 20, 36, 4, 52, 20, 36, 52, 52, 20, 36, 62, 4, 28, 36, 44, 36, 28, 36, 36, 4, 36, 36, 12, 44, 36, 36, 36, 52, 36, 36, 44, 20, 44, 36, 28, 36, 44, 36, 4, 62, 44, 36, 44, 4, 62, 36, 4, 12, 62, 36, 20, 12, 62, 36, 4, 28, 62, 36, 20, 12, 4, 44, 12, 36, 4, 44, 4, 62, 4, 44, 4, 4, 12, 44, 52, 4, 12, 44, 52, 20, 12, 44, 44, 44, 12, 44, 36, 12, 20, 44, 20, 28, 20, 44, 20, 62, 20, 44, 20, 4, 28, 44, 28, 44, 28, 44, 4, 12, 36, 44, 28, 20, 36, 44, 62, 20, 36, 44, 20, 62, 36, 44, 20, 4, 44, 44, 12, 28, 44, 44, 4, 44, 52, 44, 36, 20, 62, 44, 20, 36, 62, 44, 36, 20, 4, 52, 36, 36, 4, 52, 52, 36, 4, 52, 36, 52, 4, 52, 12, 20, 12, 52, 12, 52, 12, 52, 62, 12, 20, 52, 36, 52, 20, 52, 4, 28, 28, 52, 52, 28, 28, 52, 36, 36, 36, 52, 44, 4, 44, 52, 20, 44, 44, 52, 28, 28, 52, 52, 28, 4, 62, 52, 12, 20, 62, 52, 28, 4, 4, 62, 44, 4, 4, 62, 62, 4, 4, 62, 4, 12, 4, 62, 20, 28, 4, 62, 20, 44, 4, 62, 52, 20, 12, 62, 4, 36, 12, 62, 20, 12, 20, 62, 44, 36, 20, 62, 20, 44, 20, 62, 4, 4, 28, 62, 44, 12, 28, 62, 28, 28, 28, 62, 4, 52, 28, 62, 12, 20, 36, 62, 12, 36, 36, 62, 4, 4, 44, 62, 20, 4, 44, 62, 36, 20, 44, 62, 4, 28, 52, 62]
++
++# iq3s_grid: 512 x uint32_t, little-endian bytes, 4 per entry
++IQ3S_GRID_BYTES = [1, 1, 1, 1, 3, 1, 1, 1, 5, 1, 1, 1, 11, 1, 1, 1, 15, 1, 1, 1, 1, 3, 1, 1, 3, 3, 1, 1, 5, 3, 1, 1, 9, 3, 1, 1, 13, 3, 1, 1, 1, 5, 1, 1, 3, 5, 1, 1, 11, 5, 1, 1, 7, 7, 1, 1, 1, 9, 1, 1, 5, 9, 1, 1, 11, 9, 1, 1, 15, 9, 1, 1, 3, 11, 1, 1, 7, 11, 1, 1, 1, 13, 1, 1, 5, 13, 1, 1, 3, 15, 1, 1, 9, 15, 1, 1, 15, 15, 1, 1, 1, 1, 3, 1, 3, 1, 3, 1, 5, 1, 3, 1, 9, 1, 3, 1, 1, 3, 3, 1, 3, 3, 3, 1, 11, 3, 3, 1, 1, 5, 3, 1, 7, 5, 3, 1, 15, 5, 3, 1, 3, 7, 3, 1, 11, 7, 3, 1, 9, 9, 3, 1, 3, 13, 3, 1, 11, 13, 3, 1, 5, 15, 3, 1, 1, 1, 5, 1, 3, 1, 5, 1, 11, 1, 5, 1, 15, 1, 5, 1, 1, 3, 5, 1, 7, 3, 5, 1, 13, 3, 5, 1, 3, 5, 5, 1, 11, 5, 5, 1, 1, 7, 5, 1, 9, 7, 5, 1, 5, 9, 5, 1, 11, 9, 5, 1, 15, 9, 5, 1, 3, 11, 5, 1, 7, 11, 5, 1, 1, 15, 5, 1, 7, 15, 5, 1, 7, 1, 7, 1, 3, 3, 7, 1, 11, 3, 7, 1, 1, 5, 7, 1, 5, 5, 7, 1, 3, 7, 7, 1, 7, 7, 7, 1, 13, 7, 7, 1, 9, 9, 7, 1, 1, 11, 7, 1, 5, 11, 7, 1, 15, 13, 7, 1, 3, 15, 7, 1, 11, 15, 7, 1, 1, 1, 9, 1, 7, 3, 9, 1, 15, 3, 9, 1, 3, 5, 9, 1, 9, 5, 9, 1, 5, 7, 9, 1, 1, 9, 9, 1, 7, 9, 9, 1, 3, 11, 9, 1, 1, 15, 9, 1, 5, 1, 11, 1, 9, 1, 11, 1, 1, 5, 11, 1, 5, 5, 11, 1, 13, 5, 11, 1, 7, 7, 11, 1, 3, 9, 11, 1, 11, 9, 11, 1, 15, 9, 11, 1, 13, 13, 11, 1, 7, 15, 11, 1, 13, 1, 13, 1, 3, 3, 13, 1, 7, 3, 13, 1, 3, 7, 13, 1, 5, 11, 13, 1, 3, 15, 13, 1, 1, 1, 15, 1, 5, 1, 15, 1, 9, 1, 15, 1, 1, 5, 15, 1, 5, 5, 15, 1, 13, 5, 15, 1, 7, 7, 15, 1, 1, 11, 15, 1, 9, 11, 15, 1, 1, 1, 1, 3, 3, 1, 1, 3, 5, 1, 1, 3, 9, 1, 1, 3, 1, 3, 1, 3, 3, 3, 1, 3, 7, 3, 1, 3, 11, 3, 1, 3, 15, 3, 1, 3, 1, 5, 1, 3, 5, 5, 1, 3, 3, 7, 1, 3, 9, 7, 1, 3, 13, 7, 1, 3, 9, 11, 1, 3, 13, 11, 1, 3, 3, 13, 1, 3, 5, 15, 1, 3, 1, 1, 3, 3, 3, 1, 3, 3, 7, 1, 3, 3, 13, 1, 3, 3, 1, 3, 3, 3, 9, 3, 3, 3, 3, 5, 3, 3, 1, 7, 3, 3, 7, 7, 3, 3, 3, 9, 3, 3, 1, 11, 3, 3, 5, 11, 3, 3, 1, 15, 3, 3, 13, 15, 3, 3, 1, 1, 5, 3, 5, 3, 5, 3, 11, 3, 5, 3, 15, 3, 5, 3, 1, 5, 5, 3, 9, 5, 5, 3, 5, 7, 5, 3, 1, 9, 5, 3, 7, 9, 5, 3, 11, 11, 5, 3, 1, 13, 5, 3, 5, 15, 5, 3, 3, 1, 7, 3, 9, 1, 7, 3, 15, 1, 7, 3, 1, 3, 7, 3, 7, 3, 7, 3, 3, 5, 7, 3, 15, 5, 7, 3, 1, 7, 7, 3, 9, 7, 7, 3, 3, 9, 7, 3, 5, 13, 7, 3, 1, 15, 7, 3, 7, 1, 9, 3, 11, 1, 9, 3, 5, 3, 9, 3, 9, 3, 9, 3, 3, 7, 9, 3, 7, 7, 9, 3, 5, 9, 9, 3, 13, 9, 9, 3, 1, 11, 9, 3, 9, 11, 9, 3, 3, 1, 11, 3, 1, 3, 11, 3, 7, 3, 11, 3, 3, 5, 11, 3, 1, 7, 11, 3, 5, 7, 11, 3, 3, 11, 11, 3, 1, 5, 13, 3, 9, 5, 13, 3, 15, 5, 13, 3, 9, 9, 13, 3, 13, 9, 13, 3, 3, 1, 15, 3, 7, 1, 15, 3, 1, 3, 15, 3, 5, 3, 15, 3, 3, 5, 15, 3, 11, 7, 15, 3, 3, 9, 15, 3, 5, 13, 15, 3, 1, 15, 15, 3, 1, 1, 1, 5, 3, 1, 1, 5, 7, 1, 1, 5, 11, 1, 1, 5, 15, 1, 1, 5, 1, 3, 1, 5, 5, 3, 1, 5, 9, 3, 1, 5, 13, 3, 1, 5, 3, 5, 1, 5, 7, 5, 1, 5, 15, 5, 1, 5, 1, 7, 1, 5, 5, 7, 1, 5, 3, 9, 1, 5, 7, 9, 1, 5, 11, 9, 1, 5, 1, 11, 1, 5, 5, 11, 1, 5, 15, 13, 1, 5, 1, 15, 1, 5, 7, 15, 1, 5, 11, 15, 1, 5, 1, 1, 3, 5, 5, 1, 3, 5, 1, 3, 3, 5, 7, 3, 3, 5, 15, 3, 3, 5, 5, 5, 3, 5, 11, 5, 3, 5, 3, 7, 3, 5, 9, 7, 3, 5, 5, 9, 3, 5, 3, 11, 3, 5, 3, 1, 5, 5, 9, 1, 5, 5, 15, 1, 5, 5, 3, 5, 5, 5, 7, 5, 5, 5, 1, 7, 5, 5, 15, 7, 5, 5, 3, 9, 5, 5, 7, 11, 5, 5, 15, 11, 5, 5, 3, 15, 5, 5, 9, 15, 5, 5, 1, 1, 7, 5, 5, 1, 7, 5, 11, 1, 7, 5, 3, 3, 7, 5, 5, 5, 7, 5, 9, 5, 7, 5, 3, 7, 7, 5, 7, 7, 7, 5, 5, 9, 7, 5, 1, 11, 7, 5, 13, 13, 7, 5, 3, 1, 9, 5, 15, 1, 9, 5, 1, 5, 9, 5, 7, 5, 9, 5, 5, 7, 9, 5, 11, 7, 9, 5, 3, 9, 9, 5, 5, 15, 9, 5, 11, 15, 9, 5, 9, 1, 11, 5, 3, 3, 11, 5, 5, 5, 11, 5, 15, 7, 11, 5, 1, 9, 11, 5, 7, 11, 11, 5, 1, 15, 11, 5, 1, 1, 13, 5, 5, 1, 13, 5, 15, 1, 13, 5, 3, 5, 13, 5, 11, 11, 13, 5, 3, 13, 13, 5, 11, 1, 15, 5, 3, 3, 15, 5, 13, 5, 15, 5, 1, 7, 15, 5, 7, 9, 15, 5, 1, 11, 15, 5, 5, 1, 1, 7, 3, 3, 1, 7, 7, 3, 1, 7, 11, 3, 1, 7, 15, 3, 1, 7, 5, 5, 1, 7, 3, 7, 1, 7, 7, 7, 1, 7, 11, 7, 1, 7, 5, 9, 1, 7, 9, 9, 1, 7, 15, 9, 1, 7, 3, 11, 1, 7, 7, 13, 1, 7, 3, 15, 1, 7, 3, 1, 3, 7, 7, 1, 3, 7, 11, 1, 3, 7, 9, 3, 3, 7, 3, 5, 3, 7, 7, 5, 3, 7, 1, 9, 3, 7, 1, 13, 3, 7, 5, 15, 3, 7, 13, 15, 3, 7, 1, 1, 5, 7, 5, 3, 5, 7, 1, 5, 5, 7, 5, 7, 5, 7, 9, 7, 5, 7, 1, 11, 5, 7, 3, 1, 7, 7, 1, 3, 7, 7, 9, 3, 7, 7, 3, 5, 7, 7, 7, 5, 7, 7, 15, 5, 7, 7, 1, 7, 7, 7, 3, 9, 7, 7, 7, 9, 7, 7, 15, 9, 7, 7, 11, 11, 7, 7, 7, 15, 7, 7, 7, 1, 9, 7, 3, 3, 9, 7, 13, 3, 9, 7, 5, 5, 9, 7, 3, 7, 9, 7, 5, 11, 9, 7, 1, 13, 9, 7, 9, 13, 9, 7, 3, 1, 11, 7, 1, 3, 11, 7, 5, 3, 11, 7, 11, 5, 11, 7, 5, 7, 11, 7, 9, 9, 11, 7, 13, 11, 11, 7, 7, 15, 11, 7, 13, 3, 13, 7, 3, 9, 13, 7, 3, 1, 15, 7, 7, 1, 15, 7, 1, 5, 15, 7, 5, 5, 15, 7, 11, 7, 15, 7, 1, 1, 1, 9, 9, 1, 1, 9, 5, 3, 1, 9, 1, 5, 1, 9, 9, 5, 1, 9, 15, 5, 1, 9, 5, 7, 1, 9, 3, 9, 1, 9, 1, 11, 1, 9, 1, 15, 1, 9, 5, 1, 3, 9, 15, 1, 3, 9, 3, 3, 3, 9, 7, 3, 3, 9, 5, 5, 3, 9, 1, 7, 3, 9, 11, 7, 3, 9, 7, 9, 3, 9, 3, 11, 3, 9, 11, 11, 3, 9, 3, 1, 5, 9, 7, 1, 5, 9, 1, 3, 5, 9, 11, 3, 5, 9, 3, 5, 5, 9, 7, 7, 5, 9, 1, 9, 5, 9, 15, 11, 5, 9, 5, 13, 5, 9, 1, 15, 5, 9, 9, 1, 7, 9, 3, 3, 7, 9, 7, 3, 7, 9, 1, 5, 7, 9, 5, 5, 7, 9, 3, 7, 7, 9, 11, 7, 7, 9, 1, 1, 9, 9, 5, 1, 9, 9, 9, 5, 9, 9, 15, 7, 9, 9, 1, 9, 9, 9, 3, 15, 9, 9, 11, 1, 11, 9, 15, 1, 11, 9, 3, 5, 11, 9, 5, 13, 11, 9, 7, 3, 13, 9, 9, 7, 13, 9, 1, 13, 13, 9, 1, 3, 15, 9, 11, 3, 15, 9, 1, 7, 15, 9, 7, 9, 15, 9, 3, 11, 15, 9, 5, 1, 1, 11, 1, 3, 1, 11, 9, 3, 1, 11, 5, 5, 1, 11, 1, 9, 1, 11, 9, 9, 1, 11, 15, 9, 1, 11, 5, 11, 1, 11, 13, 13, 1, 11, 9, 15, 1, 11, 3, 1, 3, 11, 7, 1, 3, 11, 11, 1, 3, 11, 5, 3, 3, 11, 3, 5, 3, 11, 5, 7, 3, 11, 5, 15, 3, 11, 1, 1, 5, 11, 3, 3, 5, 11, 7, 5, 5, 11, 1, 7, 5, 11, 13, 7, 5, 11, 7, 11, 5, 11, 5, 1, 7, 11, 15, 1, 7, 11, 1, 3, 7, 11, 15, 5, 7, 11, 9, 9, 7, 11, 3, 11, 7, 11, 11, 13, 7, 11, 7, 15, 7, 11, 3, 1, 9, 11, 9, 1, 9, 11, 1, 5, 9, 11, 5, 7, 9, 11, 13, 9, 9, 11, 5, 3, 11, 11, 13, 5, 11, 11, 3, 11, 11, 11, 7, 11, 11, 11, 5, 9, 13, 11, 5, 1, 15, 11, 9, 1, 15, 11, 5, 5, 15, 11, 3, 3, 1, 13, 7, 3, 1, 13, 11, 3, 1, 13, 3, 7, 1, 13, 7, 7, 1, 13, 1, 13, 1, 13, 1, 1, 3, 13, 1, 5, 3, 13, 15, 5, 3, 13, 9, 13, 3, 13, 5, 3, 5, 13, 9, 7, 5, 13, 5, 9, 5, 13, 11, 11, 5, 13, 5, 13, 5, 13, 1, 15, 5, 13, 1, 1, 7, 13, 9, 3, 7, 13, 3, 5, 7, 13, 1, 9, 7, 13, 11, 5, 9, 13, 7, 9, 9, 13, 5, 13, 9, 13, 1, 1, 11, 13, 7, 1, 11, 13, 9, 7, 11, 13, 1, 13, 11, 13, 11, 1, 13, 13, 1, 9, 13, 13, 3, 3, 15, 13, 7, 3, 15, 13, 1, 1, 1, 15, 9, 1, 1, 15, 15, 1, 1, 15, 1, 5, 1, 15, 5, 5, 1, 15, 13, 7, 1, 15, 1, 9, 1, 15, 9, 11, 1, 15, 5, 13, 1, 15, 5, 1, 3, 15, 3, 3, 3, 15, 9, 5, 3, 15, 7, 9, 3, 15, 11, 9, 3, 15, 3, 1, 5, 15, 9, 1, 5, 15, 1, 3, 5, 15, 13, 3, 5, 15, 3, 5, 5, 15, 1, 7, 5, 15, 3, 11, 5, 15, 5, 1, 7, 15, 5, 7, 7, 15, 11, 7, 7, 15, 7, 11, 7, 15, 3, 1, 9, 15, 11, 1, 9, 15, 7, 3, 9, 15, 1, 5, 9, 15, 1, 11, 9, 15, 5, 5, 11, 15, 5, 9, 11, 15, 5, 1, 13, 15, 3, 7, 13, 15, 1, 1, 15, 15]
++
++# ksigns_iq2xs: 128 x uint8_t
++KSIGNS_IQ2XS = [0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15, 144, 17, 18, 147, 20, 149, 150, 23, 24, 153, 154, 27, 156, 29, 30, 159, 160, 33, 34, 163, 36, 165, 166, 39, 40, 169, 170, 43, 172, 45, 46, 175, 48, 177, 178, 51, 180, 53, 54, 183, 184, 57, 58, 187, 60, 189, 190, 63, 192, 65, 66, 195, 68, 197, 198, 71, 72, 201, 202, 75, 204, 77, 78, 207, 80, 209, 210, 83, 212, 85, 86, 215, 216, 89, 90, 219, 92, 221, 222, 95, 96, 225, 226, 99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111, 240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255]
++
++# kmask_iq2xs: 8 x uint8_t
++KMASK_IQ2XS = [1, 2, 4, 8, 16, 32, 64, 128]
++
++# kvalues_iq4nl: the IQ4_NL / IQ4_XS non-linear 4-bit values (ggml-quants.c)
++KVALUES_IQ4NL = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
+diff --git a/python/sglang/srt/layers/quantization/gguf.py b/python/sglang/srt/layers/quantization/gguf.py
+index 666efe32..1b5b4d30 100644
+--- a/python/sglang/srt/layers/quantization/gguf.py
++++ b/python/sglang/srt/layers/quantization/gguf.py
+@@ -205,6 +205,89 @@ def dequantize_gguf_weight(
+     return ggml_dequantize(qweight, qweight_type, *shape, dtype)
+ 
+ 
++_DEQUANT_ROWS = int(__import__("os").environ.get("SGLANG_GGUF_DEQUANT_ROWS", "64") or 1 << 30)
++# Prefill-sized batches (SGLANG_GGUF_MMQ_ROWS rows and more) of the types below run on llama.cpp's MMQ
++# (kt_gguf_moe_mmq, built for the GPU's own arch): the weight stays in its GGUF blocks, the activations are
++# quantized to q8_1 in slices of rows whose buffer stays under SGLANG_GGUF_MMQ_SLICE_MB, and the output is
++# written in the activations' dtype. SGLANG_GGUF_PREFILL_MMQ=0 keeps the dequant + bf16 GEMM path below.
++_MMQ_ON = __import__("os").environ.get("SGLANG_GGUF_PREFILL_MMQ", "1") == "1"
++_MMQ_ROWS = int(__import__("os").environ.get("SGLANG_GGUF_MMQ_ROWS", "64") or 1 << 30)
++_MMQ_SLICE_MB = int(__import__("os").environ.get("SGLANG_GGUF_MMQ_SLICE_MB", "32") or 32)
++# the template instances kt_gguf_moe_mmq builds: Q8_0, Q5_K, IQ2_XXS, IQ2_XS, IQ1_S, IQ1_M, Q2_0
++MMQ_PREFILL_TYPES = {8, 13, 16, 17, 19, 29, 42}
++_MATRIX_ROW_PADDING = 512
++
++
++def mmq_tail_bytes(qweight_type: int, K: int) -> int:
++    """Bytes the MMQ kernel reads past a weight's last row: ggml pads a row to 512 values."""
++    if K % _MATRIX_ROW_PADDING == 0:
++        return 0
++    block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
++    return (_MATRIX_ROW_PADDING - K % _MATRIX_ROW_PADDING) // block_size * type_size
++
++
++def _mmq_weight_ok(qweight: torch.Tensor, qweight_type: int) -> bool:
++    if qweight.dim() != 2 or qweight.dtype != torch.uint8 or qweight.stride(1) != 1 or not qweight.is_cuda:
++        return False
++    block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
++    K = qweight.shape[1] // type_size * block_size
++    needed = (qweight.shape[0] - 1) * qweight.stride(0) + qweight.shape[1] + mmq_tail_bytes(qweight_type, K)
++    return qweight.untyped_storage().nbytes() - qweight.storage_offset() >= needed
++
++
++_MMQ_QBUF: dict = {}
++_MMQ_STEP: dict = {}
++
++
++def mmq_qbuf(device: torch.device) -> torch.Tensor:
++    """The q8_1 buffer every prefill MMQ call on a device quantizes its activations into (SGLANG_GGUF_MMQ_SLICE_MB),
++    made at load: one block the caching allocator keeps, instead of one of each size a call."""
++    buf = _MMQ_QBUF.get(device)
++    if buf is None:
++        buf = _MMQ_QBUF[device] = torch.empty(_MMQ_SLICE_MB << 20, dtype=torch.uint8, device=device)
++    return buf
++
++
++def mmq_mul_mat(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int, out: torch.Tensor) -> None:
++    """out[M, rows] = x @ W^T on llama.cpp's MMQ, M in slices whose q8_1 activations fit the device's buffer."""
++    from sglang.srt.layers.moe import kt_gguf_moe_mmq
++
++    M, K = x.shape
++    qbuf = mmq_qbuf(x.device)
++    step = _MMQ_STEP.get(K)
++    if step is None:
++        step = 64
++        while kt_gguf_moe_mmq.q8_bytes(step * 2, K) <= qbuf.numel():
++            step *= 2
++        while kt_gguf_moe_mmq.q8_bytes(step + 64, K) <= qbuf.numel():
++            step += 64
++        _MMQ_STEP[K] = step
++    for r0 in range(0, M, step):
++        kt_gguf_moe_mmq.mul_mat(x[r0 : r0 + step], qweight, qweight_type, out[r0 : r0 + step], qbuf)
++
++
++def pad_for_mmq(qweight: torch.Tensor, qweight_types) -> "torch.Tensor | None":
++    """A copy of a GGUF weight whose storage extends the MMQ tail past its last row (zeros), or None when it
++    already does or MMQ does not take it. Done once at load, before any CUDA graph records the weight."""
++    if not _MMQ_ON or qweight.dim() != 2 or qweight.dtype != torch.uint8 or not qweight.is_cuda:
++        return None
++    if not qweight.is_contiguous():
++        return None
++    tail = 0
++    for t in qweight_types:
++        if t in MMQ_PREFILL_TYPES:
++            block_size, type_size = gguf.GGML_QUANT_SIZES[t]
++            tail = max(tail, mmq_tail_bytes(t, qweight.shape[1] // type_size * block_size))
++    n = qweight.numel()
++    if tail == 0 or qweight.untyped_storage().nbytes() - qweight.storage_offset() >= n + tail:
++        return None
++    buf = torch.zeros(n + tail, dtype=torch.uint8, device=qweight.device)
++    padded = buf[:n].view(qweight.shape)
++    padded.copy_(qweight)
++    return padded
++_DEQUANT_SLICE_MB = int(__import__("os").environ.get("SGLANG_GGUF_DEQUANT_SLICE_MB", "256") or 1 << 20)
++
++
+ def fused_mul_mat_gguf(
+     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
+ ) -> torch.Tensor:
+@@ -219,6 +302,30 @@ def fused_mul_mat_gguf(
+     # there is no need to call any kernel for fp16/bf16
+     if qweight_type in UNQUANTIZED_TYPES:
+         return x @ qweight.T
++    # prefill-sized batches on llama.cpp's MMQ (no copy of the weight)
++    if (
++        _MMQ_ON
++        and x.shape[0] >= _MMQ_ROWS
++        and qweight_type in MMQ_PREFILL_TYPES
++        and x.stride(1) == 1
++        and _mmq_weight_ok(qweight, qweight_type)
++    ):
++        out = torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
++        mmq_mul_mat(x, qweight, qweight_type, out)
++        return out
++    # otherwise prefill-sized batches dequantize and run a bf16 GEMM (the a8 MMQ
++    # below is a decode kernel: 71% of a 27K prefill's GPU time on Q5_K / Q8_0 dense weights, 10-25);
++    # the copy is made in slices of rows so the transient stays small (the lm_head's is 1.2 GiB whole)
++    if x.shape[0] >= _DEQUANT_ROWS and qweight_type in DEQUANT_TYPES:
++        n = qweight.shape[0]
++        step = max(256, (_DEQUANT_SLICE_MB << 20) // (x.shape[1] * x.element_size()) // 256 * 256)
++        if step >= n:
++            return x @ dequantize_gguf_weight(qweight, qweight_type, x.dtype).T
++        out = torch.empty(x.shape[0], n, dtype=x.dtype, device=x.device)
++        for r0 in range(0, n, step):
++            w = dequantize_gguf_weight(qweight[r0 : r0 + step], qweight_type, x.dtype)
++            out[:, r0 : r0 + w.shape[0]] = x @ w.T
++        return out
+     # enable MMVQ in contiguous batching with batch_size=1
+     if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
+         y = ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
+@@ -374,6 +481,48 @@ def fused_moe_gguf(
+     return out_hidden_states
+ 
+ 
++# Q5_K embedding rows in float32, in gguf-py's order of operations
++_QK_K = 256
++Q5_K_BLOCK = 176  # d (f16), dmin (f16), scales[12], qh[32], qs[128]
++_SHIFTS = {}
++
++
++def _shifts(device):
++    # made once a device: a tensor built inside a CUDA graph capture would be a host copy
++    if device not in _SHIFTS:
++        _SHIFTS[device] = (
++            torch.tensor([0, 4], dtype=torch.uint8, device=device).view(1, 1, 1, 2, 1),
++            torch.arange(8, dtype=torch.uint8, device=device).view(1, 1, 8, 1),
++        )
++    return _SHIFTS[device]
++
++
++def q5k_rows_f32(raw: torch.Tensor) -> torch.Tensor:
++    """Q5_K rows (uint8 [n, blocks * 176]) to float32 [n, blocks * 256], in gguf-py's order of operations
++    ((d * sc) * q - dmin * m, each a separate float32 op), so the values equal its dequantize."""
++    n = raw.shape[0]
++    b = raw.reshape(n, -1, Q5_K_BLOCK)
++    nb = b.shape[1]
++    d = b[..., 0:2].contiguous().view(torch.float16).float()  # [n, nb, 1]
++    dmin = b[..., 2:4].contiguous().view(torch.float16).float()
++    s = b[..., 4:16].reshape(n, nb, 3, 4)
++    s_d, s_m, s_md = s[:, :, 0], s[:, :, 1], s[:, :, 2]
++    sc = torch.cat([s_d & 0x3F, (s_md & 0x0F) | ((s_d >> 2) & 0x30)], dim=-1)  # [n, nb, 8]
++    mn = torch.cat([s_m & 0x3F, (s_md >> 4) | ((s_m >> 2) & 0x30)], dim=-1)
++    dd = (d * sc.float()).unsqueeze(-1)  # [n, nb, 8, 1]
++    dm = (dmin * mn.float()).unsqueeze(-1)
++    qh = b[..., 16:48]  # [n, nb, 32]
++    qs = b[..., 48:176].reshape(n, nb, 4, 32)  # 4 groups of 32 bytes, two sub-blocks each
++    shifts4, shifts8 = _shifts(raw.device)
++    ql = ((qs.unsqueeze(3) >> shifts4) & 0x0F).reshape(n, nb, 8, 32)
++    qhb = (qh.unsqueeze(2) >> shifts8) & 0x01  # [n, nb, 8, 32]
++    q = (ql | (qhb << 4)).float()
++    return (dd * q - dm).reshape(n, nb * _QK_K)
++
++
++_Q5K_ROWS_A_STEP = 4096
++
++
+ def apply_gguf_embedding(
+     x: torch.Tensor,
+     qweight: torch.Tensor,
+@@ -383,6 +532,14 @@ def apply_gguf_embedding(
+ ) -> torch.Tensor:
+     if qweight_type in UNQUANTIZED_TYPES:
+         return torch.embedding(qweight, x)
++    elif qweight_type == WeightType.Q5_K:
++        # float32 rows as gguf-py opens them, in steps (a prefill's lookups)
++        x_flat = x.flatten()
++        out = torch.empty(x_flat.shape[0], hidden_size, dtype=dtype or torch.bfloat16, device=qweight.device)
++        for r0 in range(0, x_flat.shape[0], _Q5K_ROWS_A_STEP):
++            ids = x_flat[r0 : r0 + _Q5K_ROWS_A_STEP]
++            out[r0 : r0 + ids.shape[0]] = q5k_rows_f32(torch.index_select(qweight, 0, ids))
++        return out.view(*x.shape, hidden_size)
+     elif qweight_type in DEQUANT_TYPES:
+         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+         x_flat = x.flatten()
+@@ -397,6 +554,12 @@ def apply_gguf_embedding(
+         raise NotImplementedError(f"Unsupported GGUF quantization type: {qweight_type}")
+ 
+ 
++# sgl-kernel's ops built for GPUs older than the wheel's arches (nothing on SM80 and newer)
++from sglang.srt.layers import kt_sm75_ops as _kt_sm75_ops  # noqa: E402
++
++_kt_sm75_ops.load_if_needed()
++
++
+ class GGUFLinearMethod(LinearMethodBase):
+     """Linear method for GGUF.
+ 
+@@ -463,6 +626,15 @@ class GGUFLinearMethod(LinearMethodBase):
+         # For MergedColumnParallelLinear and QKVParallelLinear, we need to
+         # materialize the padded weight parameter for CUDA Graph compatibility.
+         self._create_padded_weight_param(layer)
++        # the bytes MMQ reads past the last row, once, before decode graphs record the weight
++        types = set(layer.qweight_type.shard_weight_type.values()) or {qweight_type}
++        if _MMQ_ON and layer.qweight.is_cuda and types & MMQ_PREFILL_TYPES:
++            mmq_qbuf(layer.qweight.device)
++        padded = pad_for_mmq(layer.qweight.data, types)
++        if padded is not None:
++            padded_param = Parameter(padded, requires_grad=False)
++            set_weight_attrs(padded_param, vars(layer.qweight))
++            layer.register_parameter("qweight", padded_param)
+ 
+     def _create_padded_weight_param(self, layer: torch.nn.Module):
+         """Create padded weight parameter for GGUF MergedLinear layer."""
+diff --git a/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py b/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
+index 1390153c..e8ae6414 100644
+--- a/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
++++ b/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
+@@ -80,7 +80,8 @@ class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
+ 
+ 
+ def maybe_downgrade_dtype_for_legacy_gpu(*, model_config: ModelConfig) -> None:
+-    if torch.cuda.get_device_capability()[0] < 8:
++    # KT_SM75_BF16=1 keeps bf16 (DSV4's JIT kernels take bf16, not fp16)
++    if torch.cuda.get_device_capability()[0] < 8 and os.environ.get("KT_SM75_BF16") != "1":
+         logger.info(
+             "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
+         )
+diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
+index 4146a420..2ec313af 100644
+--- a/python/sglang/srt/model_loader/loader.py
++++ b/python/sglang/srt/model_loader/loader.py
+@@ -772,8 +772,19 @@ class DefaultModelLoader(BaseModelLoader):
+         model: nn.Module,
+     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+ 
+-        primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
+-        yield from self._get_weights_iterator(primary_weights)
++        gguf_v41 = os.environ.get("KT_GGUF_V41_DENSE")
++        if gguf_v41:
++            # DeepSeek-V4.1 dense weights from a "deepseek41" GGUF under the checkpoint's own names
++            # (patches/sglang-dsv41-gguf); --model-path only holds config.json and the tokenizer
++            from sglang.srt.layers.moe.kt_gguf_dense_v41 import gguf_v41_dense_weights
++
++            logger.info("loading the dense weights from GGUF %s", gguf_v41)
++            if self.counter_before_loading_weights == 0.0:
++                self.counter_before_loading_weights = time.perf_counter()
++            yield from gguf_v41_dense_weights(gguf_v41, model)
++        else:
++            primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
++            yield from self._get_weights_iterator(primary_weights)
+ 
+         secondary_weights = cast(
+             Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
+diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+index d81fec0f..c6bf678e 100644
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -699,6 +699,56 @@ _FREQS_CIS_TO_COS_SIN: dict[
+ ] = {}
+ 
+ 
++_SERVED_ROWS = {}
++# a GGUF pack (KT_GGUF_V41_DENSE): its own RoPE rows; the MXFP4 checkpoint keeps upstream's
++# tables and SGLANG_DSV4_ROPE_LAZY (layers/lazy_rope_table.py)
++_GGUF_ROPE = bool(__import__("os").environ.get("KT_GGUF_V41_DENSE"))
++_ROPE_DEVICE_ROWS = int(__import__("os").environ.get("KT_ROPE_DEVICE_ROWS", "131072") or 0)
++
++
++def _rope_rows_split(table: torch.Tensor) -> torch.Tensor:
++    """A per-position table longer than KT_ROPE_DEVICE_ROWS rows (0: all on the GPU): its first
++    rows on the GPU and the rest in host memory of the GPU's NUMA node, one range the kernels
++    address as before (kv_vmm, as the host KV). The same values; positions past the GPU part
++    are read over PCIe."""
++    n = table.shape[0]
++    if not _GGUF_ROPE or _ROPE_DEVICE_ROWS <= 0 or n <= _ROPE_DEVICE_ROWS or not table.is_cuda or not table.is_contiguous():
++        return table
++    try:
++        from sglang.srt.layers.moe import kt_kv_vmm
++        from sglang.srt.mem_cache.dsv41_host_kv import _gpu_numa_node
++    except ImportError:  # without tier 1's kv-vmm and host-kv: the table stays on the GPU
++        return table
++    if not kt_kv_vmm.ENABLED:
++        return table
++
++    index = table.device.index
++    row = table.nbytes // n
++    out = kt_kv_vmm.split_tensor(table.shape, table.dtype, index, _ROPE_DEVICE_ROWS * row, _gpu_numa_node(index))
++    out.copy_(table)
++    logger.info("RoPE table %s %s: %d of %d rows on the GPU (%d MiB), the rest in host memory",
++                tuple(table.shape), table.dtype, _ROPE_DEVICE_ROWS, n, _ROPE_DEVICE_ROWS * row >> 20)
++    return out
++
++
++def _served_rows(table: torch.Tensor, key) -> torch.Tensor:
++    """The first context_length rows of a per-position table, or the whole table when the
++    served context is not known or not shorter; one copy for the layers that share a table
++    either way (the table comes from precompute_freqs_cis.__wrapped__, which caches nothing)."""
++    try:
++        from sglang.srt.runtime_context import get_server_args
++
++        n = int(get_server_args().context_length or 0)
++    except Exception:
++        n = 0
++    if n <= 0 or n >= table.shape[0]:
++        n = table.shape[0]
++    key = (key, n)
++    if key not in _SERVED_ROWS:
++        _SERVED_ROWS[key] = _rope_rows_split(table) if n == table.shape[0] else table[:n].clone()
++    return _SERVED_ROWS[key]
++
++
+ def _freqs_cis_to_cos_sin(
+     freqs_cis: torch.Tensor, dtype: torch.dtype, device: torch.device
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+@@ -710,8 +760,8 @@ def _freqs_cis_to_cos_sin(
+     if cached is not None:
+         return cached
+     fr = torch.view_as_real(freqs_cis)
+-    cos = fr[..., 0].to(device=device, dtype=dtype).contiguous()
+-    sin = fr[..., 1].to(device=device, dtype=dtype).contiguous()
++    cos = _rope_rows_split(fr[..., 0].to(device=device, dtype=dtype).contiguous())
++    sin = _rope_rows_split(fr[..., 1].to(device=device, dtype=dtype).contiguous())
+     _FREQS_CIS_TO_COS_SIN[key] = (cos, sin)
+     return cos, sin
+ 
+@@ -738,6 +788,23 @@ def _fp8_wo_a_einsum(
+     return out
+ 
+ 
++_WO_A_DEQUANT_ROWS = int(__import__("os").environ.get("SGLANG_DSV4_WO_A_DEQUANT_ROWS", "64") or 0)
++
++
++_WO_A_MOE_VEC = __import__("os").environ.get("SGLANG_DSV4_WO_A_MOE_VEC", "1") == "1"
++_WO_A_MOE_VEC_TYPES = {2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 30}  # sgl_kernel's MMVQ types
++_WO_A_IDS: dict = {}
++
++
++def _wo_a_group_ids(G: int, M: int, device) -> torch.Tensor:
++    """[M * G, 1] int32: token m*G+g picks expert g (kept per (G, M, device); captured decode graphs reuse it)."""
++    key = (G, M, device)
++    t = _WO_A_IDS.get(key)
++    if t is None:
++        t = _WO_A_IDS[key] = torch.arange(G, dtype=torch.int32, device=device).repeat(M).view(M * G, 1)
++    return t
++
++
+ def _apply_gguf_grouped_wo_a(
+     o: torch.Tensor,
+     qweight: torch.Tensor,
+@@ -749,6 +816,44 @@ def _apply_gguf_grouped_wo_a(
+         from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+ 
+         matmul_fn = fused_mul_mat_gguf
++        # prefill-sized batches on llama.cpp's MMQ, one group at a time (its q8_1 buffer is one group's
++        # activations, sliced by rows; the weight stays in its GGUF blocks)
++        from sglang.srt.layers.quantization import gguf as _gguf
++
++        if (
++            _gguf._MMQ_ON
++            and o.shape[0] >= _gguf._MMQ_ROWS
++            and qweight_type in _gguf.MMQ_PREFILL_TYPES
++            and o.stride(2) == 1
++            and _gguf._mmq_weight_ok(qweight, qweight_type)
++        ):
++            M, G, _ = o.shape
++            out = torch.empty(M, G, o_lora_rank, dtype=o.dtype, device=o.device)
++            for g in range(G):
++                _gguf.mmq_mul_mat(
++                    o[:, g, :], qweight[g * o_lora_rank : (g + 1) * o_lora_rank], qweight_type, out[:, g, :]
++                )
++            return out
++        # otherwise prefill-sized batches dequantize the layer's rows once and run one
++        # batched bf16 GEMM (sgl_kernel's a8 MMQ a head took 72% of a 27K prefill's GPU time, 10-25)
++        if o.shape[0] >= _WO_A_DEQUANT_ROWS:
++            from sglang.srt.layers.quantization.gguf import dequantize_gguf_weight
++
++            w = dequantize_gguf_weight(qweight, qweight_type, o.dtype)
++            w = w.view(o.shape[1], o_lora_rank, w.shape[-1])
++            return torch.bmm(o.transpose(0, 1), w.transpose(1, 2)).transpose(0, 1).contiguous()
++        # every head in one MoE-vector launch (one MMVQ a head was 521 launches a token)
++        if _WO_A_MOE_VEC and qweight_type in _WO_A_MOE_VEC_TYPES:
++            from sgl_kernel import ggml_moe_a8_vec
++
++            M, G, K_in = o.shape
++            x = o.reshape(M * G, K_in)
++            if x.stride(1) != 1:
++                x = x.contiguous()
++            ids = _wo_a_group_ids(G, M, o.device)
++            w = qweight.view(G, o_lora_rank, qweight.shape[-1])
++            y = ggml_moe_a8_vec(x, w, ids, 1, qweight_type, o_lora_rank, M * G)
++            return y.view(M, G, o_lora_rank)
+ 
+     group_outputs = []
+     for group_id in range(o.shape[1]):
+@@ -1085,7 +1190,7 @@ class MqaAttentionBase(nn.Module):
+         quantize_wo_a = fp8 or self.use_npu_arch35_mxfp8_wo_a
+         if wo_a_keeps_quant_config is None:
+             keep_source_quant = (
+-                quant_config is not None and quant_config.get_name() == "expert_pack"
++                quant_config is not None and quant_config.get_name() in ("expert_pack", "gguf")
+             )
+             wo_a_quant_config: Optional[QuantizationConfig] = (
+                 quant_config if quantize_wo_a or keep_source_quant else None
+@@ -1205,7 +1310,13 @@ class MqaAttentionBase(nn.Module):
+             beta_fast=scaling.get("beta_fast", 32),
+             beta_slow=scaling.get("beta_slow", 1),
+         )
+-        freqs_cis = precompute_freqs_cis(**self.rope_kwargs)
++        if _GGUF_ROPE:
++            # the cached full table is not kept
++            freqs_cis = _served_rows(
++                precompute_freqs_cis.__wrapped__(**self.rope_kwargs), ("freqs_cis", tuple(sorted(self.rope_kwargs.items())))
++            )
++        else:
++            freqs_cis = precompute_freqs_cis(**self.rope_kwargs)
+         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+         self.freqs_cis: torch.Tensor
+ 
+@@ -1410,6 +1521,9 @@ class MQALayer(MqaAttentionBase):
+             is_neox_style=False,
+             device=get_device().device,
+         )
++        if _GGUF_ROPE and isinstance(getattr(self.rotary_emb, "cos_sin_cache", None), torch.Tensor):
++            # the served context's rows only, as freqs_cis
++            self.rotary_emb.cos_sin_cache = _served_rows(self.rotary_emb.cos_sin_cache, ("cos_sin", id(self.rotary_emb)))
+ 
+         if _is_npu:
+             rope = Dsv4NpuRoPE.for_freqs(
+@@ -3815,7 +3929,7 @@ class DeepseekV4Model(nn.Module):
+         if self.pp_group.is_first_rank:
+             embedding_quant_config = (
+                 quant_config
+-                if quant_config is not None and quant_config.get_name() == "expert_pack"
++                if quant_config is not None and quant_config.get_name() in ("expert_pack", "gguf")
+                 else None
+             )
+             self.embed_tokens = VocabParallelEmbedding(

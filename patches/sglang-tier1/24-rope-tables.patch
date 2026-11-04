@@ -1,4 +1,4 @@
-From d5689407ddafcf004d8a1e1d6fa3c2d0086eeac4 Mon Sep 17 00:00:00 2001
+From 0fad63a940ee056ea390c327943644fe12991c5b Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Wed, 4 Nov 2026 10:31:24 +0900
 Subject: [PATCH] rope-tables: map the RoPE tables as the context grows, and
@@ -177,7 +177,7 @@ index 7e849d8b..a27e0aea 100644
              if self.enable_elastic_ep:
                  output = self._maybe_rebalance_after_rank_fault(
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index e60ee72f..5cb3dc77 100644
+index dc107fcc..02e463e1 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
 @@ -602,6 +602,19 @@ def _vision_offload(model) -> None:
@@ -200,7 +200,7 @@ index e60ee72f..5cb3dc77 100644
  @contextmanager
  def _vision_on_gpu(model):
      """Around an image batch: the tower's parameters back on the GPU, freed after."""
-@@ -1601,14 +1614,21 @@ class MQALayer(MqaAttentionBase):
+@@ -1712,14 +1725,21 @@ class MQALayer(MqaAttentionBase):
          if self.compress_ratio:
              active_rope_scaling = dict(self.rope_scaling or {})
              active_rope_scaling["rope_type"] = "deepseek_yarn"
@@ -228,9 +228,9 @@ index e60ee72f..5cb3dc77 100644
 +                device=get_device().device,
 +            )
          )
- 
-         if _is_npu:
-@@ -5391,6 +5411,7 @@ class DeepseekV4ForCausalLM(nn.Module):
+         if _GGUF_ROPE and isinstance(getattr(self.rotary_emb, "cos_sin_cache", None), torch.Tensor):
+             # the served context's rows only, as freqs_cis
+@@ -5505,6 +5525,7 @@ class DeepseekV4ForCausalLM(nn.Module):
      def post_load_weights(self, is_nextn=False, weight_names=None):
          if not is_nextn:
              _vision_offload(self)

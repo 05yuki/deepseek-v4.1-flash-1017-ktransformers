@@ -12,6 +12,8 @@
 # HF_HUB_DISABLE_XET=0 uses Xet. Everything setup.sh and serve.sh read (CUDA_HOME, TIER, KT_*, SGLANG_*) passes through.
 set -Eeuo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# a GGUF pack (BUILD=IQ1_M|IQ2_XXS|IQ2_XS, or GGUF=<dir>): lib/run-gguf.sh, docs/gguf.md
+[[ -n "${GGUF:-}${BUILD:-}" ]] && exec "$here/lib/run-gguf.sh" "$@"
 cd "$here"
 
 mode="${1:---foreground}"

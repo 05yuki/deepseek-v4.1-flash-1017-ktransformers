@@ -2,6 +2,7 @@
 # Serve DeepSeek-V4.1-Flash(-1017) with SGLang + KTransformers from what setup.sh built.
 #
 #   MODEL=<checkpoint dir> ./serve.sh [--foreground|--background]
+#   GGUF=<dir with the GGUF shards and the Engram file> ./serve.sh   (lib/serve-gguf.sh, docs/gguf.md)
 #
 # The routed experts run on the CPU (kt-kernel, MXFP4); attention, the hottest experts and
 # the prefill (experts streamed over PCIe) run on the GPUs. The engram tables are read
@@ -14,6 +15,8 @@
 set -Eeuo pipefail
 export LC_ALL=C PYTHONUNBUFFERED=1
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# a GGUF pack of the model: one GPU and the socket next to it (lib/serve-gguf.sh)
+[[ -n "${GGUF:-}" ]] && exec "$here/lib/serve-gguf.sh" "$@"
 root="$here"  # read by lib/*.sh
 mode="${1:---foreground}"
 if [[ "$mode" != "--foreground" && "$mode" != "--background" ]]; then

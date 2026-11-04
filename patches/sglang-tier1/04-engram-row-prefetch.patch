@@ -1,4 +1,4 @@
-From c69cd9cf67dd32ed28e9f11d148dd0146b38911a Mon Sep 17 00:00:00 2001
+From 95659447d46db1e25168099d624ab1b994f4594c Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] engram-row-prefetch: start the engram row lookups with the
@@ -48,7 +48,7 @@ index 20e4d172..07741bc0 100644
          image_ids = input_ids if self.image_token_id is not None else None
          return engram_gate(
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index d81fec0f..8ba06eac 100644
+index c6bf678e..3fbe3985 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
 @@ -3,6 +3,7 @@ from __future__ import annotations
@@ -59,7 +59,7 @@ index d81fec0f..8ba06eac 100644
  import time
  from array import array
  from contextlib import contextmanager, nullcontext
-@@ -3907,6 +3908,26 @@ class DeepseekV4Model(nn.Module):
+@@ -4021,6 +4022,26 @@ class DeepseekV4Model(nn.Module):
                  self.engram_layout,
                  image_token_id=_engram_image_token_id(config),
              )
@@ -86,7 +86,7 @@ index d81fec0f..8ba06eac 100644
  
          if not _is_cuda:
              self.use_fused_mhc_post_pre = (
-@@ -4062,6 +4083,37 @@ class DeepseekV4Model(nn.Module):
+@@ -4176,6 +4197,37 @@ class DeepseekV4Model(nn.Module):
                  bcg_deepseek_v4_engram_hash_ids(self.engram_hasher, input_ids, hash_ids)
              else:
                  hash_ids = self.engram_hasher(input_ids, forward_batch)
@@ -124,7 +124,7 @@ index d81fec0f..8ba06eac 100644
          tail = None
          if (
              self.late_layer_start is not None
-@@ -4240,13 +4292,22 @@ class DeepseekV4Model(nn.Module):
+@@ -4354,13 +4406,22 @@ class DeepseekV4Model(nn.Module):
              if engram is not None:
                  # No local name holds the pre-Engram residual: it would stay alive
                  # until the next Engram layer.

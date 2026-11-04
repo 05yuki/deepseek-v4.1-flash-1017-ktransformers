@@ -34,6 +34,11 @@ _HERE = Path(__file__).resolve().parent
 _lib = C.CDLL(str(_HERE / "librow_store.so"))
 _lib.row_store_open.argtypes = [C.c_char_p, U, U, U, U, C.c_int]
 _lib.row_store_open.restype = P
+_lib.row_store_open_fmt.argtypes = [C.c_char_p, U, U, U, U, C.c_int, U, U]
+_lib.row_store_open_fmt.restype = P
+# IQ4_NL rows (a GGUF's engram_embd): 8 blocks of fp16 d + 16 bytes of nibbles, low nibbles first
+IQ4NL_ROW = 144
+IQ4NL_VALUES = (-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113)
 _lib.row_store_range.argtypes = [P, U, U]
 _lib.row_store_stats.argtypes = [P, C.POINTER(U)]
 _lib.row_store_close.argtypes = [P]
@@ -254,14 +259,22 @@ def install(module):
         soff = int(meta.get("scale_offset", meta["weight_bytes"]))
         assert meta["rows"] == num_embeddings, (meta["rows"], num_embeddings)
         assert meta["dim"] == DIM and meta["block_size"] == BLOCK, meta
-        assert meta["weight_dtype"] == "F8_E4M3" and meta["scale_dtype"] == "F8_E8M0", meta
+        self._iq4nl = meta["weight_dtype"] == "IQ4_NL"
+        if self._iq4nl:
+            assert int(meta.get("row_bytes", IQ4NL_ROW)) == IQ4NL_ROW, meta
+            self._wb, self._sb = IQ4NL_ROW, 0
+        else:
+            assert meta["weight_dtype"] == "F8_E4M3" and meta["scale_dtype"] == "F8_E8M0", meta
+            self._wb, self._sb = DIM, SCALES
+        self._lut = {}
         n_layers = len(manifest["layers"])
 
         mode = os.environ.get("DSV41_ENGRAM_MODE", "nvme")
         budget_gib = float(os.environ.get("DSV41_CACHE_GIB", "128"))
         budget = int(budget_gib * 2**30) // (n_layers * self.tp_size)
-        self._store = _lib.row_store_open(
-            str(path).encode(), num_embeddings, woff, soff, budget, int(mode == "ram")
+        self._store = _lib.row_store_open_fmt(
+            str(path).encode(), num_embeddings, woff, soff, budget, int(mode == "ram"),
+            self._wb, self._sb,
         )
         if not self._store:
             raise RuntimeError(f"row_store_open failed for {path}")
@@ -326,14 +339,14 @@ def install(module):
 
                     region = kt_lend.scratch_region()
                 ids = torch.empty(capacity, dtype=torch.int64, pin_memory=True)
-                w = torch.empty((capacity, DIM), dtype=torch.uint8, pin_memory=True)
-                s = torch.empty((capacity, SCALES), dtype=torch.uint8, pin_memory=True)
+                w = torch.empty((capacity, self._wb), dtype=torch.uint8, pin_memory=True)
+                s = torch.empty((capacity, max(self._sb, 1)), dtype=torch.uint8, pin_memory=True)
                 # dw / ds are rewritten by every lookup before the gather reads
                 # them, so the scratch may lose their contents between windows;
                 # seq is written once and must not live there
                 with region:
-                    dw = torch.empty((capacity, DIM), dtype=torch.uint8, device=indices.device)
-                    ds = torch.empty((capacity, SCALES), dtype=torch.uint8, device=indices.device)
+                    dw = torch.empty((capacity, self._wb), dtype=torch.uint8, device=indices.device)
+                    ds = torch.empty((capacity, max(self._sb, 1)), dtype=torch.uint8, device=indices.device)
                 seq = torch.arange(capacity, dtype=torch.int64, device=indices.device)
                 self._staging[key] = (ids, w, s, dw, ds, seq)
         else:
@@ -342,8 +355,8 @@ def install(module):
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError(f"engram staging {key} must be warmed before graph capture")
                 ids = torch.empty(capacity, dtype=torch.int64, pin_memory=True)
-                w = torch.empty((capacity, DIM), dtype=torch.uint8, pin_memory=True)
-                s = torch.empty((capacity, SCALES), dtype=torch.uint8, pin_memory=True)
+                w = torch.empty((capacity, self._wb), dtype=torch.uint8, pin_memory=True)
+                s = torch.empty((capacity, max(self._sb, 1)), dtype=torch.uint8, pin_memory=True)
                 dw, ds = w.to(indices.device), s.to(indices.device)
                 seq = torch.arange(capacity, dtype=torch.int64, device=indices.device)
                 self._staging[key] = (ids, w, s, dw, ds, seq)
@@ -364,10 +377,28 @@ def install(module):
         if err:
             raise RuntimeError(f"cudaLaunchHostFunc failed: {err}")
         dw[:count].copy_(w[:count], non_blocking=True)
+        if self._iq4nl:
+            out = self.new_rows(indices)
+            out.view(-1, DIM).copy_(self._iq4nl_rows(dw[:count]))
+            return out
         ds[:count].copy_(s[:count], non_blocking=True)
         out = self.new_rows(indices)
         engram_gather(dw.data_ptr(), ds.data_ptr(), seq[:count], out.view(-1, DIM), DIM, BLOCK)
         return out
+
+    def _iq4nl_rows(self, raw):
+        """[n, 144] IQ4_NL rows (on the GPU) -> [n, 256] bf16: d * kvalues[q] a block of 32, the block's 16
+        bytes holding values j (low nibble) and j + 16 (high nibble), as llama.cpp's dequantize_row_iq4_nl."""
+        dev = raw.device
+        lut = self._lut.get(dev)
+        if lut is None:
+            lut = self._lut[dev] = torch.tensor(IQ4NL_VALUES, dtype=torch.float32, device=dev)
+        n = raw.shape[0]
+        b = raw.view(n, DIM // BLOCK, 2 + BLOCK // 2)
+        d = b[:, :, :2].contiguous().view(torch.float16).float()
+        q = b[:, :, 2:]
+        idx = torch.cat([q & 15, q >> 4], dim=-1).long()
+        return (lut[idx] * d).reshape(n, DIM).to(torch.bfloat16)
 
     def check_errors(self):
         st = _stats(self._store)
@@ -377,4 +408,5 @@ def install(module):
 
     cls.__init__ = init
     cls._owned_rows = owned
+    cls._iq4nl_rows = _iq4nl_rows
     cls.engram_stats = check_errors

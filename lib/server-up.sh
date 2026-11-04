@@ -17,7 +17,7 @@ server_stop() {  # and wait for it to go, so the GPUs are free when this returns
 
 server_up() {
   local log_dir before cur stall
-  log_dir="$here/logs/$(basename "$(cd "$MODEL" && pwd)")"
+  log_dir="$here/logs/$(basename "$(cd "${MODEL:-$GGUF}" && pwd)")"
   before="$(readlink -f "$log_dir/current" 2>/dev/null || true)"
   "$here/serve.sh" --background || { echo "serve.sh failed (see its output above)" >&2; return 1; }
   run_dir=""

@@ -1,12 +1,12 @@
 # Tier 1, one patch per feature
 
 Tier 1 is one patch per feature in `patches/sglang-tier1/`, applied in the order of their numbers on
-SGLang main at `58484246` after tier 0; tier 2 applies on top. `setup.sh` applies all of them by
+SGLang main at `58484246` after tiers 0 and 0.5; tier 2 applies on top. `setup.sh` applies all of them by
 default; `SGLANG_FEATURES=a,b,...` picks some (the names below), and `serve.sh` turns on only what
 was applied.
 
-A patch with no prerequisites applies alone on tier 0. A patch with prerequisites applies on tier 0
-plus those patches (`patches/sglang-tier1/requires.txt`, checked by `setup.sh`). Combinations that
+A patch with no prerequisites applies alone on tiers 0 and 0.5. A patch with prerequisites applies on
+them plus those patches (`patches/sglang-tier1/requires.txt`, checked by `setup.sh`). Combinations that
 
 apply: each patch alone, all of them, and all of them but any one (with what needs it); other
 combinations may need `git apply -3`. Served and checked end to end: all of them, none, and each
@@ -43,6 +43,7 @@ the code" are on as soon as the patch is applied.
 | 23 | [`23-swa-checkpoint-tail.patch`](#23-swa-checkpoint-tail) | +16 / -2 | none |
 | 24 | [`24-rope-tables.patch`](#24-rope-tables) | +160 / -8 | `wo-a-fp8`, `vision-on-demand`, `kv-vmm`, `prefill-lend` |
 | 25 | [`25-embed-on-host.patch`](#25-embed-on-host) | +88 / -0 | `wo-a-fp8`, `vision-on-demand`, `kv-vmm`, `prefill-lend`, `rope-tables` |
+| 26 | [`26-gguf-lend.patch`](#26-gguf-lend) | +2826 / -38 | `wo-a-fp8`, `vision-on-demand`, `loading`, `placement`, `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan`, `hot-lend`, `stream-mmq`, `cpu-gpu-overlap`, `expert-cache`, `rope-tables` |
 
 ## Effect of each patch
 
@@ -799,3 +800,21 @@ On one GPU the 35K prefill is faster too; the prompt runs as two chunks of 18,43
 without the patches.
 
 - `SGLANG_DSV4_EMBED_ON_HOST`: 0 / 1
+
+## 26 gguf-lend
+
+Tier 1's features with a GGUF pack under them (tier 0.5, [gguf.md](gguf.md)):
+
+- The streamed prefill's GGUF edition (`kt_stream_prefill_gguf.py`, `kt_stream_prefill_gguf_nvme.py`):
+  the experts from RAM or the drive through llama.cpp's MMQ, added into the MoE output.
+- The prefill lend's copy of the dense weights read back from the GGUF shards instead of kept in
+  pinned host memory (`KT_PREFILL_LEND_MIRROR=gguf`).
+- The hot lend's GGUF slots, their swaps loaded on background threads from kt-kernel's GGUF expert
+  cache or the file, and the dynamic hot cache that follows the decode's routing
+  (`KT_HOT_DYNAMIC=1`, `kt_hot_cache.py`).
+- The prefill plan may run a chunk up to `KT_PREFILL_PLAN_TAIL_STEPS` aligned steps over the launch
+  chunk when that spares a chunk.
+
+All of it is gated on a GGUF pack (`KT_GGUF_V41_DENSE`, or kt-kernel's LLAMAFILE method). With the MXFP4
+checkpoint the patch changes nothing: the plan's tail steps are 0, the lend keeps its pinned copy,
+and the free-memory reads and the swap budget are as before.

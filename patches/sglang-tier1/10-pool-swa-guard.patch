@@ -1,4 +1,4 @@
-From a16a794834721c1f7995ba6054b487864861ca22 Mon Sep 17 00:00:00 2001
+From 0ea5e3bbec10f8e369dd78ba93b8058d5dd5428a Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] pool-swa-guard: fail at startup when the SWA pool cannot hold

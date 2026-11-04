@@ -59,6 +59,16 @@ In short, from [docs/requirements.md](docs/requirements.md):
 
 A prebuilt archive for each tag skips every build at setup: `PREBUILT=<archive> ./setup.sh` ([docs/setup.md](docs/setup.md#prebuilt-pieces)).
 
+## GGUF packs
+
+The same tree serves [ISTA-DASLab's GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) of the model.
+One 16 GB GPU and 64 GB of RAM are enough for it.
+`BUILD=IQ2_XXS ./run.sh` downloads the IQ2_XXS build and serves it.
+`GGUF=<dir> ./setup.sh` and `GGUF=<dir> ./serve.sh` take a build already downloaded.
+On the two-GPU machine below, the IQ2_XXS build decodes Japanese prose at 62.6 tok/s.
+Its NLL is 0.327 above the reference, from the pack's quantization.
+What it needs, how it runs and its results: [docs/gguf.md](docs/gguf.md).
+
 ## Results
 
 2 × EPYC 7452 (Zen 2), 512 GB DDR4, 2 × RTX 5070 Ti 16 GB, the `serve.sh` defaults with a 1M-token context.
@@ -89,6 +99,7 @@ Its mean NLL is 0.7192 on two GPUs and 0.7224 on one, against 0.7185 for the ref
 - [docs/patches.md](docs/patches.md) and [docs/tier1.md](docs/tier1.md): every patch, with its switch and measured effect.
 - [docs/optimizations.md](docs/optimizations.md): what made it fast, and what was tried and dropped.
 - [docs/sm89.md](docs/sm89.md): Ada (RTX 40) attention.
+- [docs/gguf.md](docs/gguf.md): serving a GGUF pack of the model.
 
 ## Fixes from dsv41-flash-dual-epyc
 

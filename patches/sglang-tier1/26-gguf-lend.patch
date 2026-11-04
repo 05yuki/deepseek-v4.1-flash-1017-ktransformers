@@ -1,0 +1,3378 @@
+From 3be5fc03a5b4f3cff6947e3f190cb3f30aaa691d Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Wed, 4 Nov 2026 20:44:04 +0900
+Subject: [PATCH] gguf-lend: the lends, the streamed prefill and the hot cache
+ take a GGUF pack
+
+Tier 1's features with a GGUF pack (tier 0.5's gguf) under them. The streamed
+prefill's GGUF edition (kt_stream_prefill_gguf, from RAM or NVMe through
+llama.cpp's MMQ, accumulating into the MoE output), the prefill lend's mirror read
+back from the GGUF shards instead of a pinned copy (KT_PREFILL_LEND_MIRROR=gguf),
+the hot lend's GGUF slots with background swap loads (kt-kernel's GGUF expert
+cache or the file), the dynamic hot cache that follows the decode's routing
+(KT_HOT_DYNAMIC=1, kt_hot_cache), and the prefill plan's tail steps.
+
+Gated on a GGUF pack (KT_GGUF_V41_DENSE or kt_config.method LLAMAFILE): the
+MXFP4 checkpoint keeps its chunk choice (KT_PREFILL_PLAN_TAIL_STEPS 0), its
+free-memory reads without an empty_cache, its pinned mirror and its swap budget.
+With a GGUF pack the calibration server (KT_PREFILL_LEND_CALIBRATING=1) skips the CPU experts.
+---
+ python/sglang/srt/layers/moe/kt_ep_wrapper.py |  39 +-
+ python/sglang/srt/layers/moe/kt_hot_cache.py  | 718 ++++++++++++++++
+ .../sglang/srt/layers/moe/kt_kv_hot_lend.py   | 396 ++++++++-
+ python/sglang/srt/layers/moe/kt_lend.py       | 340 +++++++-
+ .../sglang/srt/layers/moe/kt_prefill_plan.py  |  22 +-
+ .../srt/layers/moe/kt_stream_prefill.py       |  15 +-
+ .../srt/layers/moe/kt_stream_prefill_gguf.py  | 559 +++++++++++++
+ .../layers/moe/kt_stream_prefill_gguf_nvme.py | 772 ++++++++++++++++++
+ .../sglang/srt/model_executor/model_runner.py |   3 +
+ 9 files changed, 2826 insertions(+), 38 deletions(-)
+ create mode 100644 python/sglang/srt/layers/moe/kt_hot_cache.py
+ create mode 100644 python/sglang/srt/layers/moe/kt_stream_prefill_gguf.py
+ create mode 100644 python/sglang/srt/layers/moe/kt_stream_prefill_gguf_nvme.py
+
+diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+index e0ccb123..e3ef36bd 100644
+--- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
++++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+@@ -14,12 +14,17 @@ from typing import TYPE_CHECKING, Optional
+ 
+ import torch
+ 
++# the prefill lend's calibration server measures GPU memory only: with a GGUF pack the CPU experts
++# are skipped there
++_CALIBRATING = os.environ.get("KT_PREFILL_LEND_CALIBRATING") == "1" and bool(os.environ.get("KT_GGUF_V41_DENSE"))
++
+ from sglang.srt.arg_groups.model_override_base import model_config_of
+ from sglang.srt.layers.moe.kt_handoff_pack import (
+     PACK as _KT_HANDOFF_PACK,
+     SHARED_AFTER_SUBMIT as _KT_SHARED_AFTER_SUBMIT,
+     pack_to_host,
+ )
++from sglang.srt.layers.moe import kt_hot_cache
+ from sglang.srt.layers.moe.kt_stream_prefill import stream_prefill_for
+ from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+ from sglang.srt.runtime_context import (
+@@ -330,7 +335,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+             gpu_mask = torch.zeros(num_experts, dtype=torch.bool)
+             # kt_kv_hot_lend's dynamic resident rows: kt-kernel loads every expert, the
+             # routes say what it computes (-1 for what the GPU takes)
+-            if not kt_kv_hot_lend.cpu_holds_all(self):
++            # KT_HOT_DYNAMIC=1 (kt_hot_cache.py): the slots hold what the cache put there and the CPU
++            # gets the logical ids with the residents set to -1, so kt-kernel must not skip ids on its own
++            if not kt_kv_hot_lend.cpu_holds_all(self) and not kt_hot_cache.ENABLED:
+                 gpu_mask[: self.num_gpu_experts] = True
+             KT_LAYERS[self.kt_config.layer_idx] = self
+             self.wrapper = KTMoEWrapper(
+@@ -399,6 +406,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+             from sglang.srt.layers.moe.kt_stream_prefill import stream_prefill_init_early
+ 
+             stream_prefill_init_early(self, layer)
++        kt_hot_cache.register(self, layer)
+ 
+     def create_moe_runner(
+         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+@@ -439,7 +447,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+             "Only SiLU activation is supported."
+         )
+ 
+-        if self.tp_rank != 0 or self.wrapper is None:
++        if self.tp_rank != 0 or self.wrapper is None or _CALIBRATING:
+             return
+ 
+         x = dispatch_output.hidden_states
+@@ -484,7 +492,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         Returns:
+             CPU expert computation results
+         """
+-        if self.tp_rank != 0 or self.wrapper is None:
++        if self.tp_rank != 0 or self.wrapper is None or _CALIBRATING:
+             return torch.zeros_like(x)
+ 
+         # Wait for CPU computation and retrieve results
+@@ -570,6 +578,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         # their slots, and to the CPU at weight 0
+         hot = kt_kv_hot_lend.route(self, dispatch_output) if streamer is None else None
+ 
++        # KT_HOT_DYNAMIC=1 (kt_hot_cache.py): the GPU slots follow the decode's routing; the tables give
++        # the CPU the logical ids minus the resident ones and the GPU method the slot ids
++        if streamer is None and kt_hot_cache.ENABLED and kt_hot_cache._cache is not None and kt_hot_cache._cache.ready:
++            slot_ids, cpu_ids = kt_hot_cache._cache.route(self.kt_config.layer_idx, topk_output.topk_ids)
++            if self.tp_rank == 0:
++                self.submit(layer, dispatch_output._replace(topk_output=topk_output._replace(topk_ids=cpu_ids)))
++            output = self.gpu_method.apply(
++                layer, dispatch_output._replace(topk_output=topk_output._replace(topk_ids=slot_ids))
++            ).hidden_states
++            if self.tp_rank == 0:
++                output = output + self.sync(x)
++            return StandardCombineInput(hidden_states=output)
++
+         # Step 1: Submit CPU expert computation (non-blocking)
+         if streamer is None and self.tp_rank == 0:
+             self.submit(layer, hot[0] if hot is not None else dispatch_output)
+@@ -608,7 +629,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         # experts (--kt-num-gpu-experts 0, every slot given to the streamer
+         # and the KV pool) there is nothing to run and the FlashInfer MXFP4
+         # runner refuses a zero-expert workspace (09-16).
+-        if self.num_gpu_experts > 0:
++        if self.num_gpu_experts > 0 and not (
++            streamer is not None
++            and getattr(self.gpu_method, "streams_hot_experts", False)
++        ):
+             gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+             output = gpu_combine_input.hidden_states
+             if streamer is not None and _hot_check:
+@@ -622,7 +646,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+ 
+         # Step 4: Synchronize CPU results and merge with GPU results
+         if streamer is not None:
+-            output = output + streamer.run(self, layer, dispatch_output, physical_ids)
++            if getattr(streamer, "accumulates_into", False) and output.is_contiguous() and \
++                    output.untyped_storage().data_ptr() != x.untyped_storage().data_ptr():
++                # the GGUF MMQ streamer adds into the output: no chunk-sized accumulator and no sum
++                output = streamer.run(self, layer, dispatch_output, physical_ids, into=output)
++            else:
++                output = output + streamer.run(self, layer, dispatch_output, physical_ids)
+             if cpu_share:
+                 output = output + self.sync(x)
+         elif self.tp_rank == 0:
+diff --git a/python/sglang/srt/layers/moe/kt_hot_cache.py b/python/sglang/srt/layers/moe/kt_hot_cache.py
+new file mode 100644
+index 00000000..ad58af7d
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/kt_hot_cache.py
+@@ -0,0 +1,718 @@
++"""Decode-adaptive hot experts for the KT hybrid with GGUF experts
++(KT_HOT_DYNAMIC=1): the GPU slots of every layer follow the decode's own
++routing instead of a static map.
++
++Measured on a 38K brief + 512 generated tokens: a corpus map catches 0.29 /
++0.42 / 0.53 of the decode routes with 32 / 64 / 96 slots, the decode's own
++top-n 0.50 / 0.69 / 0.80. Every route a
++slot catches is one expert the CPU does not compute that layer.
++
++How it works
++- tables on the GPU: log2slot [L, E] (slot or -1), log2cpu [L, E] (-1 or the
++  logical id itself), both int32 like the router's ids, and counts [L, E]; the
++  captured decode graph only does table lookups and an index_add_ on them,
++  so the policy runs outside the graph, between steps (model_runner.forward
++  -> before_forward), and changes the tables in place.
++- the CPU pools are in logical order (launch with KT_EXPERT_PLACEMENT=none);
++  the CPU gets the logical ids with the resident ones set to -1, the GPU
++  method the slot ids with the non-resident ones -1.
++- a swap copies the expert's TP slice from the GGUF streamer's pinned banks
++  (every expert of every layer, this rank's rows) into the slot; the lend's
++  host mirror of the slot gets the same bytes, so the restore after a prefill
++  keeps the swapped experts.
++- policy every KT_HOT_INTERVAL decode (or MTP verify) steps: counts *= KT_HOT_DECAY; per
++  layer, the coldest residents give way to the hottest non-residents when
++  candidate > KT_HOT_MARGIN * resident, at most KT_HOT_SWAPS per layer.
++- KT_HOT_SEED=<placement json> fills the slots at start from a map
++  (physical_to_logical_map, first N per layer); without it they start as
++  logical 0..N-1.
++- KT_HOT_KV_LEND=1 (kt_hot_kv_lend.py): more slots per layer, ids N.., in free
++  KV pages. A slot entry is the resident logical id, -1 for an empty slot the
++  policy fills first, -2 for a slot that does not exist (not lent now). The
++  kernels read every slot through per-layer pointer tables; base tables
++  (log2slot_base / log2cpu_base) leave the lent residents on the CPU for the
++  kernel path that cannot read the tables (kt_gguf_moe_multi.reads_table).
++"""
++import collections
++import json
++import os
++import queue
++import threading
++import time
++from typing import Dict, List, Optional
++
++import torch
++
++ENABLED = os.environ.get("KT_HOT_DYNAMIC") == "1"
++INTERVAL = int(os.environ.get("KT_HOT_INTERVAL", "32"))
++MAX_SWAPS = int(os.environ.get("KT_HOT_SWAPS", "8"))
++DECAY = float(os.environ.get("KT_HOT_DECAY", "0.9"))
++MARGIN = float(os.environ.get("KT_HOT_MARGIN", "1.5"))
++SEED = os.environ.get("KT_HOT_SEED")
++LOG_EVERY = int(os.environ.get("KT_HOT_LOG", "0"))  # rounds between log lines (0: only the first and every 64th)
++KV_LEND = os.environ.get("KT_HOT_KV_LEND", "0") == "1"
++KV_LEND_MAX = int(os.environ.get("KT_HOT_KV_LEND_MAX", "64"))  # lent slots per layer at most (table size)
++# KT_HOT_FUSED_ROUTE=1: route() as one Triton kernel (the two table lookups and the count update) instead of
++# index_add_ + two gathers (+ casts): 4-5 launches, ~10 us a layer on the critical path between the router and the
++# CPU submit; integer tables, the counts stay exact integers, so the result is identical. =0 keeps the torch ops.
++FUSED_ROUTE = os.environ.get("KT_HOT_FUSED_ROUTE", "1") == "1"
++# KT_HOT_BANKS=own: build the cache's own pinned expert banks even when the GGUF streamer is loaded (otherwise
++# the streamer's banks are shared; without the streamer the own banks are the only source)
++OWN_BANKS = os.environ.get("KT_HOT_BANKS", "auto")
++# KT_HOT_SOURCE=file: a swap reads the expert's rows from the GGUF file mapping itself (the hot method's reader),
++# no pinned bank of every expert: for hosts whose RAM cannot hold the experts (the NVMe-fed streamer, 64 GB)
++SOURCE = os.environ.get("KT_HOT_SOURCE", "banks")
++# with the file source the swap's read and copy run on a worker thread and a side stream (KT_HOT_ASYNC=0: on the
++# forward's thread, 0.5-1 s a round of 80 swaps from the NVMe, 10-25): the expert leaves the table when the swap is
++# decided (its routes go to the CPU), the new one enters on a later round once its copy has landed
++ASYNC = os.environ.get("KT_HOT_ASYNC", "1") == "1"
++STAGES = int(os.environ.get("KT_HOT_STAGES", "16"))  # pinned staging buffers (swaps in flight at most)
++_ROUTE_BLOCK = 64  # routes per call at most for the fused kernel (decode / verify windows: tokens x top_k)
++
++
++def _route_kernel_fn():
++    import triton
++    import triton.language as tl
++
++    @triton.jit
++    def _route_kernel(ids_ptr, slot_tab_ptr, cpu_tab_ptr, counts_ptr, slot_out_ptr, cpu_out_ptr, n, BLOCK: tl.constexpr):
++        offs = tl.arange(0, BLOCK)
++        m = offs < n
++        ids = tl.load(ids_ptr + offs, mask=m, other=0)
++        tl.store(slot_out_ptr + offs, tl.load(slot_tab_ptr + ids, mask=m, other=-1), mask=m)
++        tl.store(cpu_out_ptr + offs, tl.load(cpu_tab_ptr + ids, mask=m, other=-1), mask=m)
++        tl.atomic_add(counts_ptr + ids, 1.0, mask=m)
++
++    return _route_kernel
++
++
++_route_kernel = None
++EMPTY, ABSENT, PENDING = -1, -2, -3  # PENDING: a swap decided, its copy not landed (never chosen, not computed)
++
++
++def _log(msg):
++    print(f"[kt-hot {time.strftime('%H:%M:%S')}] {msg}", flush=True)
++
++
++class HotCache:
++    def __init__(self, num_layers: int, num_experts: int, slots: int, device: torch.device, rank: int):
++        self.L, self.E, self.N, self.device, self.rank = num_layers, num_experts, slots, device, rank
++        # int32 like the router's topk ids: route() is two lookups, no casts
++        self.log2slot_cpu = torch.full((num_layers, num_experts), -1, dtype=torch.int32)
++        self.log2slot = torch.full((num_layers, num_experts), -1, dtype=torch.int32, device=device)
++        # the CPU's view: -1 for a resident expert, the logical id otherwise
++        self.log2cpu_cpu = torch.arange(num_experts, dtype=torch.int32).repeat(num_layers, 1)
++        self.log2cpu = self.log2cpu_cpu.to(device)
++        self.counts = torch.zeros((num_layers, num_experts), dtype=torch.float32, device=device)
++        self.ones = torch.ones((1,), dtype=torch.float32, device=device)
++        self.S = slots + (KV_LEND_MAX if KV_LEND else 0)  # slot ids per layer (resident + lent)
++        self.slot2log: List[List[int]] = [[EMPTY] * slots + [ABSENT] * (self.S - slots) for _ in range(num_layers)]
++        # lent slot (layer, slot) -> (w13 view, w2 view) in borrowed KV pages
++        self.lent_views: Dict[tuple, tuple] = {}
++        if KV_LEND:
++            self.log2slot_base_cpu = self.log2slot_cpu.clone()
++            self.log2cpu_base_cpu = self.log2cpu_cpu.clone()
++            self.log2slot_base = self.log2slot.clone()
++            self.log2cpu_base = self.log2cpu.clone()
++        self.layers: Dict[int, tuple] = {}  # layer_idx -> (hot method, FusedMoE layer)
++        self._mirrors: Dict[tuple, Optional[torch.Tensor]] = {}
++        self._counts_host = torch.zeros((num_layers, num_experts), dtype=torch.float32).pin_memory()
++        self._counts_event: Optional[torch.cuda.Event] = None
++        self._q8_banks: Dict[int, torch.Tensor] = {}
++        self._own_banks: Dict[int, list] = {}
++        self.ready = False
++        # the asynchronous swaps (SOURCE=file, ASYNC): worker thread, side stream, pinned staging, landed copies
++        self._q: "queue.Queue" = queue.Queue()
++        self._done: "collections.deque" = collections.deque()
++        self._worker: Optional[threading.Thread] = None
++        self._side: Optional[torch.cuda.Stream] = None
++        self._stages: "queue.Queue" = queue.Queue()
++        self._go = threading.Event()  # copies may be issued (cleared across a prefill window: the slots are lent)
++        self._go.set()
++        self._lock = threading.Lock()
++        self._after = None  # event: the restore's copies, which a swap's copy follows
++        self._t_read = self._t_wait = self._t_issue = 0.0
++        self._n_swapped = 0
++        self._inflight: "collections.deque" = collections.deque()  # (event, stage): the worker recycles the stages
++        self.step = 0
++        self.rounds = 0
++        self.swaps = 0
++        self.bytes = 0
++        self.swap_s = 0.0
++
++    # -- graph side ----------------------------------------------------------
++
++    def route(self, layer_idx: int, ids: torch.Tensor):
++        """ids: logical [T, k] (>= 0). Returns (slot ids with -1 for CPU experts,
++        logical ids with -1 for the resident ones). Captured in the graph."""
++        flat = ids.reshape(-1)
++        slot_tab, cpu_tab = self.log2slot, self.log2cpu
++        if KV_LEND:
++            from sglang.srt.layers.moe import kt_gguf_moe_multi as _multi
++
++            if not _multi.reads_table(ids.shape[0]):
++                # a kernel that addresses base + slot * stride: lent residents
++                # are computed by the CPU in this call
++                slot_tab, cpu_tab = self.log2slot_base, self.log2cpu_base
++        if FUSED_ROUTE and flat.numel() <= _ROUTE_BLOCK and flat.is_contiguous():
++            global _route_kernel
++            if _route_kernel is None:
++                _route_kernel = _route_kernel_fn()
++            slot_ids = torch.empty_like(flat, dtype=torch.int32)
++            cpu_ids = torch.empty_like(flat, dtype=torch.int32)
++            _route_kernel[(1,)](flat, slot_tab[layer_idx], cpu_tab[layer_idx], self.counts[layer_idx], slot_ids, cpu_ids,
++                                flat.numel(), BLOCK=_ROUTE_BLOCK, num_warps=1)
++            return slot_ids.view_as(ids), cpu_ids.view_as(ids)
++        self.counts[layer_idx].index_add_(0, flat, self.ones.expand(flat.numel()))
++        return slot_tab[layer_idx][ids], cpu_tab[layer_idx][ids]
++
++    def push_tables(self) -> None:
++        """The host tables to the GPU on the current stream."""
++        self.log2slot.copy_(self.log2slot_cpu, non_blocking=True)
++        self.log2cpu.copy_(self.log2cpu_cpu, non_blocking=True)
++        if KV_LEND:
++            self.log2slot_base.copy_(self.log2slot_base_cpu, non_blocking=True)
++            self.log2cpu_base.copy_(self.log2cpu_base_cpu, non_blocking=True)
++
++    # -- filling -------------------------------------------------------------
++
++    def _bank(self, layer_idx: int):
++        """This rank's slice of every expert of the layer (gate, up, down), pinned, physical order: the GGUF
++        streamer's banks when it is loaded (one pinned copy serves both), otherwise the cache's own, built from the
++        hot method's GGUF reader (KT_HOT_BANKS=own forces these; the cache does not need the streamer)."""
++        if OWN_BANKS != "own":
++            try:
++                from sglang.srt.layers.moe import kt_stream_prefill_gguf as G
++            except ImportError:
++                G = None
++            inst = getattr(G, "_instance", None)
++            if inst is not None:
++                return inst._bank(layer_idx)
++        b = self._own_banks.get(layer_idx)
++        if b is not None:
++            return b
++        t0 = time.time()
++        method, _layer = self.layers[layer_idx]
++        rd, E, N, K, r, world = method.reader, method.reader.E, method.N, method.K, method.rank, method.world
++        from sglang.srt.layers.moe.kt_gguf_hot import BLOCK_INFO
++
++        p2l = None
++        try:
++            from sglang.srt.eplb.expert_location_dispatch import get_global_expert_location_metadata
++
++            meta = get_global_expert_location_metadata()
++            if meta is not None:
++                m = meta.physical_to_logical_map_cpu[layer_idx].to(torch.int64)
++                if not torch.equal(m, torch.arange(m.numel(), dtype=torch.int64)):
++                    p2l = m
++        except ImportError:
++            pass
++        banks = []
++        for proj in ("gate", "up", "down"):
++            data, qt = rd._raw(f"blk.{layer_idx}.ffn_{proj}_exps.weight")
++            blck, ts = BLOCK_INFO[qt]
++            if proj != "down":
++                v = data.view(E, N * world, (K // blck) * ts)[:, N * r:N * (r + 1), :]
++            else:
++                v = data.view(E, K, (N * world) // blck, ts)[:, :, (N * r) // blck:(N * (r + 1)) // blck, :]
++            v = v.reshape(E, -1)
++            if p2l is not None:
++                v = v[p2l]
++            h = torch.empty((E, v.shape[1]), dtype=torch.uint8, pin_memory=True)
++            h.copy_(v)
++            banks.append(h)
++            del data
++        self._own_banks[layer_idx] = banks
++        if layer_idx == min(self.layers):
++            _log(f"rank {self.rank}: layer {layer_idx} own bank {sum(b.numel() for b in banks) / 1e9:.2f} GB pinned in "
++                 f"{time.time() - t0:.1f} s (no streamer{', placement map' if p2l is not None else ''})")
++        return banks
++
++    def _mirror(self, layer_idx: int, param: torch.Tensor) -> Optional[torch.Tensor]:
++        """The lend's pinned host copy of this parameter (same shape), or None.
++        Resolved once per parameter after the lend has mirrored."""
++        from sglang.srt.layers.moe import kt_lend
++
++        key = (layer_idx, param.data_ptr())
++        if key in self._mirrors:
++            return self._mirrors[key]
++        st = kt_lend.STATE
++        if st.get("host") is None or "dev_spans" not in st:
++            # not mirrored yet (seeding at load), lend off, or a mirror without a pinned host copy
++            # (KT_PREFILL_LEND_MIRROR=gguf: the restore reads the files, after_restore refills the swaps)
++            return None
++        found = None
++        for i, dspan in enumerate(st["dev_spans"]):
++            lo = dspan.data_ptr()
++            if lo <= param.data_ptr() < lo + dspan.numel():
++                off = param.data_ptr() - lo + st["bases"][i]
++                found = st["host"][off:off + param.numel() * param.element_size()].view(param.dtype).view(param.shape)
++                break
++        self._mirrors[key] = found
++        return found
++
++    def _down_source(self, layer_idx: int, method, down_bank: torch.Tensor) -> torch.Tensor:
++        """The bank to copy a slot's down matrix from: the raw bank, or for the
++        Q2_0 layers a Q8_0 repack of the whole layer built on first use
++        (every expert, 0.45 GB pinned per such layer)."""
++        if method.types[2] == method.type2:
++            return down_bank
++        b = self._q8_banks.get(layer_idx)
++        if b is None:
++            from sglang.srt.layers.moe.kt_gguf_hot import q2_0_to_q8_0
++
++            t0 = time.time()
++            b = q2_0_to_q8_0(down_bank).pin_memory()
++            self._q8_banks[layer_idx] = b
++            _log(f"rank {self.rank}: layer {layer_idx} down bank repacked Q2_0 -> Q8_0 for the slots "
++                 f"({b.numel() / 1e9:.2f} GB pinned, {time.time() - t0:.1f} s)")
++        return b
++
++    def _file_rows(self, layer_idx: int, logical: int, method, layer):
++        """A logical expert's rows of this rank (gate, up, down) straight from the GGUF file mapping (page cache
++        or the NVMe): pageable host tensors, ~8 MB, a few ms."""
++        N, w2 = method.N, layer.w2_qweight.data
++        e = torch.tensor([logical], dtype=torch.int64)
++        g = method.reader.slice(layer_idx, "gate", N, method.rank, e)[0].view(N, -1)
++        u = method.reader.slice(layer_idx, "up", N, method.rank, e)[0].view(N, -1)
++        d = method.reader.slice(layer_idx, "down", N, method.rank, e)
++        if method.types[2] != method.type2:
++            from sglang.srt.layers.moe.kt_gguf_hot import q2_0_to_q8_0
++
++            d = q2_0_to_q8_0(d)
++        return g, u, d[0].view(w2.shape[1], -1)
++
++    def _pread_rows(self, layer_idx: int, logical: int, method, layer, st13, st2):
++        """The expert's rows read with pread straight into the pinned staging buffers (one read a projection;
++        this rank's rows are contiguous in the file when it holds every row, world 1). Returns (n13, n2) bytes,
++        or None when the rows are not contiguous (TP > 1: the mmap path)."""
++        if method.world != 1:
++            return None
++        rd = method.reader
++        fds = self.__dict__.setdefault("_fds", {})
++        n13 = 0
++        for proj, dst in (("gate", 0), ("up", 1)):
++            name = f"blk.{layer_idx}.ffn_{proj}_exps.weight"
++            info = rd.loader.tensor_info[name]
++            path = rd.loader.tensor_file_map[name]
++            per = layer.w13_qweight.data[0, :method.N].numel()
++            fd = fds.get(path)
++            if fd is None:
++                fd = fds[path] = os.open(path, os.O_RDONLY)
++            view = st13[dst * per:(dst + 1) * per].numpy()
++            got = os.preadv(fd, [memoryview(view)], int(info["offset"]) + logical * per)
++            if got != per:
++                raise RuntimeError(f"pread {name} expert {logical}: {got} of {per} bytes")
++            n13 += per
++        name = f"blk.{layer_idx}.ffn_down_exps.weight"
++        info = rd.loader.tensor_info[name]
++        path = rd.loader.tensor_file_map[name]
++        if method.types[2] != method.type2:
++            return None  # a Q2_0 down is repacked on the mmap path
++        per = layer.w2_qweight.data[0].numel()
++        fd = fds.get(path)
++        if fd is None:
++            fd = fds[path] = os.open(path, os.O_RDONLY)
++        got = os.preadv(fd, [memoryview(st2[:per].numpy())], int(info["offset"]) + logical * per)
++        if got != per:
++            raise RuntimeError(f"pread {name} expert {logical}: {got} of {per} bytes")
++        return n13, per
++
++    def fill(self, layer_idx: int, slot: int, logical: int) -> None:
++        method, layer = self.layers[layer_idx]
++        N = method.N
++        w13, w2 = layer.w13_qweight.data, layer.w2_qweight.data
++        if SOURCE == "file":
++            g, u, d = self._file_rows(layer_idx, logical, method, layer)
++        else:
++            gate, up, down = self._bank(layer_idx)
++            g = gate[logical].view(N, -1)
++            u = up[logical].view(N, -1)
++            d = self._down_source(layer_idx, method, down)[logical].view(w2.shape[1], -1)
++        if slot >= self.N:
++            # a lent slot: KV pages, no lend mirror (lent slots are given back
++            # before every streamed prefill, kt_hot_kv_lend.py)
++            v13, v2 = self.lent_views[(layer_idx, slot)]
++            v13[:N].copy_(g, non_blocking=True)
++            v13[N:].copy_(u, non_blocking=True)
++            v2.copy_(d, non_blocking=True)
++            self.bytes += g.numel() + u.numel() + d.numel()
++            return
++        w13[slot, :N].copy_(g, non_blocking=True)
++        w13[slot, N:].copy_(u, non_blocking=True)
++        w2[slot].copy_(d, non_blocking=True)
++        m13, m2 = self._mirror(layer_idx, layer.w13_qweight), self._mirror(layer_idx, layer.w2_qweight)
++        if m13 is not None:
++            m13[slot, :N].copy_(g)
++            m13[slot, N:].copy_(u)
++        if m2 is not None:
++            m2[slot].copy_(d)
++        self.bytes += g.numel() + u.numel() + d.numel()
++
++    def _set(self, layer_idx: int, slot: int, logical: int) -> None:
++        """Slot <- logical (>= 0), or EMPTY / ABSENT. Residency is carried by
++        the ids alone: an expert is in log2slot or in log2cpu, never both,
++        never neither (check_tables)."""
++        old = self.slot2log[layer_idx][slot]
++        if old >= 0:
++            self.log2slot_cpu[layer_idx, old] = -1
++            self.log2cpu_cpu[layer_idx, old] = old
++            if KV_LEND and slot < self.N:
++                self.log2slot_base_cpu[layer_idx, old] = -1
++                self.log2cpu_base_cpu[layer_idx, old] = old
++        self.slot2log[layer_idx][slot] = logical
++        if logical < 0:
++            return
++        self.log2slot_cpu[layer_idx, logical] = slot
++        self.log2cpu_cpu[layer_idx, logical] = -1
++        if KV_LEND and slot < self.N:
++            self.log2slot_base_cpu[layer_idx, logical] = slot
++            self.log2cpu_base_cpu[layer_idx, logical] = -1
++
++    def check_tables(self) -> str:
++        """Every expert of every layer exactly once: on a slot that holds it
++        (full and base tables, host and device) or on the CPU. Returns '' or
++        the first violation."""
++        pairs = [("full", self.log2slot_cpu, self.log2cpu_cpu, self.log2slot, self.log2cpu, False)]
++        if KV_LEND:
++            pairs.append(("base", self.log2slot_base_cpu, self.log2cpu_base_cpu, self.log2slot_base,
++                          self.log2cpu_base, True))
++        for name, s_cpu, c_cpu, s_dev, c_dev, base in pairs:
++            if not torch.equal(s_dev.cpu(), s_cpu) or not torch.equal(c_dev.cpu(), c_cpu):
++                return f"{name}: device tables differ from the host's"
++            if not bool(((s_cpu >= 0) ^ (c_cpu >= 0)).all()):
++                return f"{name}: an expert both or neither on a slot and on the CPU"
++            if not bool(((c_cpu < 0) | (c_cpu == torch.arange(self.E, dtype=torch.int32))).all()):
++                return f"{name}: CPU id is not the logical id"
++            for li in range(self.L):
++                for e in (s_cpu[li] >= 0).nonzero().flatten().tolist():
++                    sl = int(s_cpu[li, e])
++                    if self.slot2log[li][sl] != e or (base and sl >= self.N):
++                        return f"{name}: layer {li} expert {e} -> slot {sl} holding {self.slot2log[li][sl]}"
++                for sl, e in enumerate(self.slot2log[li]):
++                    if e >= 0 and (int(self.log2slot_cpu[li, e]) != sl):
++                        return f"{name}: layer {li} slot {sl} holds {e} but the table says {int(self.log2slot_cpu[li, e])}"
++        return ""
++
++    # -- lent slots (kt_hot_kv_lend.py) -------------------------------------------
++
++    def lend_slot(self, layer_idx: int, slot: int, v13: torch.Tensor, v2: torch.Tensor) -> None:
++        assert self.slot2log[layer_idx][slot] == ABSENT, (layer_idx, slot)
++        self.lent_views[(layer_idx, slot)] = (v13, v2)
++        self.slot2log[layer_idx][slot] = EMPTY
++
++    def take_back_slot(self, layer_idx: int, slot: int) -> int:
++        """The slot's expert goes back to the CPU (host tables; push_tables
++        before the next forward). Returns the expert it held or -1."""
++        old = self.slot2log[layer_idx][slot]
++        assert old != ABSENT, (layer_idx, slot)
++        self._set(layer_idx, slot, ABSENT)
++        del self.lent_views[(layer_idx, slot)]
++        return old
++
++    def fill_empty(self, counts: torch.Tensor, seed_rank: Optional[torch.Tensor]) -> int:
++        """Fill every EMPTY slot with the hottest non-residents of its layer
++        (counts [L, E] on the host; ties by the seed map's order). Host tables
++        only; the caller pushes them."""
++        n = 0
++        for li in sorted(self.layers):
++            empty = [s_ for s_, e in enumerate(self.slot2log[li]) if e == EMPTY]
++            if not empty:
++                continue
++            score = counts[li].double()
++            if seed_rank is not None:
++                score = score + (self.E - seed_rank[li].double()) / (self.E + 1) * 1e-3
++            res = [e for e in self.slot2log[li] if e >= 0]
++            if res:
++                score[torch.tensor(res)] = float("-inf")
++            for s_, c in zip(empty, torch.topk(score, len(empty)).indices.tolist()):
++                self._set(li, s_, c)
++                self.fill(li, s_, c)
++                n += 1
++        return n
++
++    def seed(self, placement: Optional[str]) -> None:
++        """Initial residents: the map's first N per layer (filled from the
++        banks), or logical 0..N-1 (what the loader put there)."""
++        t0 = time.time()
++        p2l = json.load(open(placement))["physical_to_logical_map"] if placement else None
++        for li in sorted(self.layers):
++            for s in range(self.N):
++                e = int(p2l[li][s]) if p2l else s
++                self._set(li, s, e)
++                if p2l and e != s:
++                    self.fill(li, s, e)
++        self.push_tables()
++        torch.cuda.current_stream(self.device).synchronize()
++        self.ready = True
++        if self._async():
++            self._start_worker()
++        _log(f"rank {self.rank}: {len(self.layers)} layers x {self.N} slots seeded from "
++             f"{placement or 'logical order'} in {time.time() - t0:.1f} s ({self.bytes / 1e9:.2f} GB copied); "
++             f"interval {INTERVAL}, max {MAX_SWAPS} swaps/layer, decay {DECAY}, margin {MARGIN}")
++        self.bytes = 0
++
++    # -- policy, between steps --------------------------------------------------
++
++    def before_forward(self, forward_batch) -> None:
++        # decode steps, and under MTP the target's verify steps (the decode of a
++        # speculative serve; is_decode() alone never ran the policy there)
++        mode = forward_batch.forward_mode
++        if not self.ready or not (mode.is_decode() or mode.is_target_verify()):
++            return
++        self.step += 1
++        if self.step % INTERVAL:
++            return
++        t0 = time.time()
++        # the counts come through a pinned buffer one round late, so the policy
++        # never waits for the forward stream (a .cpu() here would block on the
++        # step in flight)
++        if self._counts_event is not None and not self._counts_event.query():
++            return
++        counts = self._counts_host.clone() if self._counts_event is not None else None
++        self._counts_host.copy_(self.counts, non_blocking=True)
++        self.counts.mul_(DECAY)
++        if self._counts_event is None:
++            self._counts_event = torch.cuda.Event()
++        self._counts_event.record(torch.cuda.current_stream(self.device))
++        if counts is None:
++            return
++        # all layers at once: coldest residents vs hottest non-residents. An
++        # EMPTY slot scores -1 (filled by any candidate seen at all), an ABSENT
++        # one +inf (never chosen); without lent slots res has neither
++        res = torch.tensor(self.slot2log)  # [L, S]
++        score_res = counts.gather(1, res.clamp(min=0))
++        score_res = torch.where(res == EMPTY, torch.full_like(score_res, -1.0), score_res)
++        score_res = torch.where(res <= ABSENT, torch.full_like(score_res, float("inf")), score_res)
++        mask = torch.ones((counts.shape[0], counts.shape[1] + 1), dtype=torch.bool)
++        mask.scatter_(1, torch.where(res >= 0, res, torch.full_like(res, counts.shape[1])), False)
++        mask = mask[:, :-1]
++        cand_score, cand_idx = torch.topk(torch.where(mask, counts, torch.full_like(counts, -1.0)), MAX_SWAPS, dim=1)
++        order = torch.argsort(score_res, dim=1)[:, :MAX_SWAPS]  # coldest slots first
++        rs = score_res.gather(1, order)
++        do = ((cand_score > 0) & (cand_score > MARGIN * rs)).to(torch.int64).cumprod(1).bool()
++        swaps = 0
++        landed = self._apply_landed()
++        queued = []
++        for li, j in do.nonzero().tolist():
++            if li not in self.layers:
++                continue
++            s_, c = int(order[li, j]), int(cand_idx[li, j])
++            if self._async():
++                # the old expert leaves now (its routes go to the CPU); the new one lands later
++                self._set(li, s_, PENDING)
++                queued.append((li, s_, c))
++            else:
++                self._set(li, s_, c)
++                self.fill(li, s_, c)
++            swaps += 1
++        if swaps or landed:
++            self.push_tables()
++            if self._async():
++                # a swap's copy follows this table change on the GPU (and the forward in flight before it):
++                # the event is recorded before the worker can see the swaps
++                ev = torch.cuda.Event()
++                ev.record(torch.cuda.current_stream(self.device))
++                self._after = ev
++        for item in queued:
++            self._q.put(item)
++        self.rounds += 1
++        self.swaps += swaps
++        self.swap_s += time.time() - t0
++        if self.rounds == 1 or (LOG_EVERY and self.rounds % LOG_EVERY == 0) or self.rounds % 64 == 0:
++            resident = sum(float(counts[li][torch.tensor([e for e in self.slot2log[li] if e >= 0], dtype=torch.long)].sum())
++                           for li in self.layers)
++            total = float(counts.sum())
++            _log(f"rank {self.rank}: round {self.rounds} (step {self.step}): {swaps} swaps this round, "
++                 f"{self.swaps} total, {self.bytes / 1e9:.2f} GB, {self.swap_s * 1e3 / self.rounds:.1f} ms/round; "
++                 f"GPU share of recent routes {resident / max(total, 1):.3f}"
++                 + (f"; go {self._go.is_set()}, queued {self._q.qsize()}, landed-waiting {len(self._done)}, "
++                    f"stages free {self._stages.qsize()}, worker {self._n_swapped} swaps: read "
++                    f"{self._t_read * 1e3 / max(1, self._n_swapped):.0f} wait {self._t_wait * 1e3 / max(1, self._n_swapped):.0f} "
++                    f"issue {self._t_issue * 1e3 / max(1, self._n_swapped):.0f} ms each" if self._async() else ""))
++
++
++    def after_restore(self) -> None:
++        """After the prefill lend put the weights back: a mirror that sources a hot slot from its load-time expert
++        (the GGUF mirror, kt_lend KT_PREFILL_LEND_MIRROR=gguf) has undone the swaps, so every slot holding another
++        expert is filled again; on the current stream, behind the restore's copies."""
++        if not self.ready or SOURCE != "file":
++            return
++        t0, n = time.time(), 0
++        for li in self.layers:
++            for s_, e in enumerate(self.slot2log[li]):
++                if e >= 0 and e != s_ and s_ < self.N:
++                    self.fill(li, s_, e)
++                    n += 1
++        if self._async():
++            # pending copies follow the restore and these refills
++            ev = torch.cuda.Event()
++            ev.record(torch.cuda.current_stream(self.device))
++            self._after = ev
++            self._go.set()
++        if n and (self.rounds <= 1 or LOG_EVERY):
++            _log(f"rank {self.rank}: {n} swapped slots filled again after a prefill window in {time.time() - t0:.2f} s")
++
++    # -- asynchronous swaps -----------------------------------------------------
++
++    def _async(self) -> bool:
++        return ASYNC and SOURCE == "file"
++
++    def _start_worker(self) -> None:
++        if self._worker is not None:
++            return
++        n13 = max(l.w13_qweight.data[0].numel() for _, l in self.layers.values())
++        n2 = max(l.w2_qweight.data[0].numel() for _, l in self.layers.values())
++        for _ in range(STAGES):
++            self._stages.put((torch.empty(n13, dtype=torch.uint8, pin_memory=True),
++                              torch.empty(n2, dtype=torch.uint8, pin_memory=True)))
++        self._side = torch.cuda.Stream(device=self.device)
++        self._worker = threading.Thread(target=self._work, name="kt-hot-swap", daemon=True)
++        self._worker.start()
++        _log(f"rank {self.rank}: swaps on a worker thread and a side stream, {STAGES} staging buffers "
++             f"({STAGES * (n13 + n2) / 1e6:.0f} MB pinned)")
++
++    def _work(self) -> None:
++        try:
++            # off kt-kernel's spinning compute threads: the cores kept for the expert cache's readers
++            # (serve.sh sets KT_GGUF_PREFETCH_CPUS); starved among them, a swap took ~0.7 s (10-25)
++            cpus = os.environ.get("KT_HOT_SWAP_CPUS") or os.environ.get("KT_GGUF_PREFETCH_CPUS")
++            if cpus:
++                try:
++                    os.sched_setaffinity(0, {int(c) for c in cpus.split(",") if c.strip()})
++                except (OSError, ValueError) as ex:
++                    _log(f"rank {self.rank}: swap worker affinity {cpus!r} not set: {ex}")
++            torch.cuda.set_device(self.device)
++            self._work_loop()
++        except Exception:
++            import traceback
++
++            _log(f"rank {self.rank}: swap worker died:\n{traceback.format_exc()}")
++
++    def _work_loop(self) -> None:
++        first = True
++        while True:
++            item = self._q.get()
++            if item is None:
++                return
++            li, s_, e = item
++            t0 = time.time()
++            method, layer = self.layers[li]
++            # stages come back as their copies land (recycling them only at the policy's rounds held the
++            # worker to 8 swaps a round: ~0.6 s a swap, 10-25)
++            while self._inflight and self._inflight[0][0].query():
++                self._stages.put(self._inflight.popleft()[1])
++            if self._stages.empty() and self._inflight:
++                ev0, stage0 = self._inflight.popleft()
++                ev0.synchronize()
++                self._stages.put(stage0)
++            st13, st2 = self._stages.get()
++            t1 = time.time()
++            try:
++                got = self._pread_rows(li, e, method, layer, st13, st2)
++                if got is None:
++                    g, u, d = self._file_rows(li, e, method, layer)
++                    n13, n2 = g.numel() + u.numel(), d.numel()
++                    st13[:g.numel()].copy_(g.reshape(-1))
++                    st13[g.numel():n13].copy_(u.reshape(-1))
++                    st2[:n2].copy_(d.reshape(-1))
++                else:
++                    n13, n2 = got
++            except Exception as ex:  # a read that failed leaves the slot pending: logged, never computed
++                _log(f"rank {self.rank}: swap read failed for layer {li} expert {e}: {ex}")
++                self._stages.put((st13, st2))
++                continue
++            t2 = time.time()
++            self._t_read += t2 - t1
++            self._go.wait()
++            t3 = time.time()
++            with self._lock:
++                if not self._go.is_set():
++                    # a window began between the wait and the lock: back to the queue's head
++                    self._stages.put((st13, st2))
++                    self._q.put(item)
++                    continue
++                side = self._side
++                if self._after is not None:
++                    side.wait_event(self._after)
++                with torch.cuda.stream(side):
++                    w13, w2 = layer.w13_qweight.data, layer.w2_qweight.data
++                    w13[s_].view(-1)[:n13].copy_(st13[:n13], non_blocking=True)
++                    w2[s_].view(-1)[:n2].copy_(st2[:n2], non_blocking=True)
++                    ev = torch.cuda.Event()
++                    ev.record(side)
++                self._done.append((li, s_, e, ev))
++                self._inflight.append((ev, (st13, st2)))
++                self.bytes += n13 + n2
++            self._t_wait += t3 - t2
++            self._t_issue += time.time() - t3
++            self._n_swapped += 1
++            if first:
++                first = False
++                _log(f"rank {self.rank}: first swap (layer {li} slot {s_} <- expert {e}): stage {(t1 - t0) * 1e3:.0f} ms, "
++                     f"read {(t2 - t1) * 1e3:.0f} ms, waited {(t3 - t2) * 1e3:.0f} ms, copy issued")
++
++    def _apply_landed(self) -> int:
++        """Copies that have landed enter the tables (host side; the caller pushes). Returns how many."""
++        n = 0
++        while self._done:
++            li, s_, e, ev = self._done[0]
++            if not ev.query():
++                break
++            self._done.popleft()
++            if self.slot2log[li][s_] == PENDING:
++                self._set(li, s_, e)
++                n += 1
++            else:
++                _log(f"rank {self.rank}: layer {li} slot {s_} was {self.slot2log[li][s_]} when expert {e} landed")
++        return n
++
++    def _pause(self) -> None:
++        """No copy may land while the slots are lent to a prefill window (kt_lend calls window_start before it
++        unmaps the weights; after_restore releases): issued ones finish first. Pausing on every extend batch
++        instead left the cache paused for good after a short extend that opened no window (10-25)."""
++        if not self._async():
++            return
++        with self._lock:
++            self._go.clear()
++            if self._side is not None:
++                self._side.synchronize()
++
++
++_cache: Optional[HotCache] = None
++
++
++def after_restore() -> None:
++    if _cache is not None:
++        _cache.after_restore()
++
++
++def window_start() -> None:
++    """kt_lend, before the weights (the slots among them) are unmapped for a prefill window."""
++    if _cache is not None and _cache.ready:
++        _cache._pause()
++
++
++def register(method, layer) -> Optional[HotCache]:
++    """Called by the KT wrapper on its first decode apply of each layer; the
++    cache is built on the first call and seeded once every layer is known."""
++    global _cache
++    if not ENABLED:
++        return None
++    kt = method.kt_config
++    if _cache is None:
++        if kt.num_gpu_experts <= 0:
++            raise RuntimeError("KT_HOT_DYNAMIC=1 needs --kt-num-gpu-experts > 0")
++        _cache = HotCache(kt.num_layers, method.global_num_experts, kt.num_gpu_experts,
++                          layer.w13_qweight.device, method.tp_rank)
++    c = _cache
++    if kt.layer_idx not in c.layers:
++        c.layers[kt.layer_idx] = (method.gpu_method, layer)
++        if len(c.layers) == kt.num_layers:
++            c.seed(SEED)
++    return c if c.ready else None
++
++
++def before_forward(forward_batch) -> None:
++    if _cache is not None:
++        _cache.before_forward(forward_batch)
+diff --git a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
+index 5d098bf5..d6bf838f 100644
+--- a/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
++++ b/python/sglang/srt/layers/moe/kt_kv_hot_lend.py
+@@ -97,6 +97,13 @@ DYN_SWAPS = int(os.environ.get("KT_KV_HOT_DYN_SWAPS", "2") or 2)
+ DYN_HALF_LIFE = float(os.environ.get("KT_KV_HOT_DYN_HALF_LIFE", "256") or 256)
+ DYN_HYST = float(os.environ.get("KT_KV_HOT_DYN_HYST", "1.0") or 1.0)  # replace when new > victim x this
+ DYN_LOG = int(os.environ.get("KT_KV_HOT_DYN_LOG", "512") or 512)  # rounds between log lines
++# GGUF swaps loaded by a background pool into pinned staging
++DYN_ASYNC = os.environ.get("KT_KV_HOT_DYN_ASYNC", "1") == "1"
++DYN_ASYNC_CAP = max(1, int(os.environ.get("KT_KV_HOT_DYN_ASYNC_CAP", "24") or 24))
++DYN_ASYNC_THREADS = max(1, int(os.environ.get("KT_KV_HOT_DYN_ASYNC_THREADS", "2") or 2))
++# KT_KV_HOT_DYN_VERIFY=1: before a batch's slots enter the table, read them back and compare them byte for byte with
++# the expert's GGUF rows read straight from the file (a check: it waits for the GPU)
++DYN_VERIFY = os.environ.get("KT_KV_HOT_DYN_VERIFY", "0") == "1"
+ # KT_KV_HOT_DYNAMIC_RESIDENT=1 (with the dynamic slots): the N resident experts swap too.
+ # kt-kernel then loads every expert (no GPU mask), so an expert that leaves a resident row
+ # runs on the CPU; route sends the CPU -1 for every route the GPU takes. In a prefill
+@@ -115,7 +122,7 @@ except ImportError:  # the torch ops serve
+ if triton is not None:
+ 
+     @triton.jit
+-    def _route_kernel(ids_ptr, w_ptr, tbl_ptr, rtbl_ptr, cnt_ptr, cid_ptr, cw_ptr, sid_ptr, sw_ptr, row_ptr, n,
++    def _route_kernel(ids_ptr, w_ptr, tbl_ptr, utbl_ptr, rtbl_ptr, cnt_ptr, cid_ptr, cw_ptr, sid_ptr, sw_ptr, row_ptr, n,
+                       HAS_RES: tl.constexpr, MASK_ZERO: tl.constexpr, CPU_SKIP: tl.constexpr,
+                       BLOCK: tl.constexpr):
+         """One layer's routes in one launch: count each routed expert, look it up in the
+@@ -129,6 +136,7 @@ if triton is not None:
+         ec = tl.where(valid, e, 0)
+         tl.atomic_add(cnt_ptr + ec, tl.where(valid, 1.0, 0.0), mask=valid)
+         s = tl.load(tbl_ptr + ec, mask=valid, other=-1)
++        u = tl.load(utbl_ptr + ec, mask=valid, other=-1)  # any rank's slot (this rank's table on one rank)
+         if HAS_RES:
+             r = tl.load(rtbl_ptr + ec, mask=valid, other=-1)
+             res = valid & (r >= 0)
+@@ -137,7 +145,7 @@ if triton is not None:
+         else:
+             res = valid & (s < -1)  # never
+             lent = valid & (s >= 0)
+-        gpu = lent | res
++        gpu = res | (valid & (u >= 0))
+         tl.store(cid_ptr + offs, tl.where(gpu, CPU_SKIP, e).to(cid_ptr.dtype.element_ty), mask=m)
+         tl.store(cw_ptr + offs, tl.where(gpu, 0.0, w).to(cw_ptr.dtype.element_ty), mask=m)
+         if MASK_ZERO:
+@@ -160,7 +168,7 @@ def _route_fused(L, ids, w):
+     if n:
+         tbl, cnt = STATE["tbl"][L.idx], STATE["cnt"][L.idx]
+         _route_kernel[(triton.cdiv(n, 128),)](
+-            ids, w, tbl, STATE["rtbl"][L.idx] if DYN_RES else tbl, cnt, cid, cw, sid, sw,
++            ids, w, tbl, STATE["utbl"][L.idx], STATE["rtbl"][L.idx] if DYN_RES else tbl, cnt, cid, cw, sid, sw,
+             rows if DYN_RES else cid, n, HAS_RES=DYN_RES, MASK_ZERO=_MASK_ZERO,
+             CPU_SKIP=-1 if DYN_RES else 0, BLOCK=128)
+     return cid, cw, sid, sw, rows
+@@ -221,6 +229,7 @@ def make_shadow(wrapper, layer, hidden_size: int, intermediate_size_per_partitio
+         # lends the KV pool's pages its own way (KT_HOT_KV_LEND)
+         raise RuntimeError("KT_KV_HOT_LEND=1 with KT_HOT_DYNAMIC=1: use KT_HOT_KV_LEND for the dynamic cache")
+     shadow = copy.copy(layer)
++    shadow.__dict__["kt_hot_slots"] = True  # the slots, not the resident experts (kt_gguf_hot.py under EP)
+     shadow.__dict__["_parameters"] = {}
+     shadow.__dict__["_buffers"] = {}
+     shadow.__dict__["_modules"] = {}
+@@ -307,7 +316,8 @@ def split(wrapper, layer) -> None:
+     shadow, method, made = sh
+     x = _banks()
+     loads = wrapper.__dict__.pop("_kt_kv_hot_loads", 0)
+-    if loads == 0:
++    gguf = getattr(method, "reader", None) is not None and hasattr(method, "fill_experts")
++    if loads == 0 and not gguf:
+         # a loader that never hands these experts to the layer's weight loader
+         # (one that skips the CPU experts' tensors) leaves the shadow empty: its
+         # slots would compute nothing for the routes they take
+@@ -343,7 +353,11 @@ def split(wrapper, layer) -> None:
+     if kt_fill_global_expert_params is not None:
+         kt_fill_global_expert_params(shadow, src=layer)
+     with torch.cuda.device(dev):
+-        if hasattr(method, "process_weights_after_loading"):
++        if gguf:
++            # the X experts past the resident ones, from the GGUF
++            n0 = int(wrapper.num_gpu_experts)
++            method.fill_experts(shadow, torch.arange(n0, n0 + x, dtype=torch.int64))
++        elif hasattr(method, "process_weights_after_loading"):
+             method.process_weights_after_loading(shadow)
+     L = _Layer(wrapper, len(LAYERS))
+     found = _per_expert(shadow, x)
+@@ -384,12 +398,17 @@ def split(wrapper, layer) -> None:
+         _log(f"layer {L.idx}: the shadow keeps {left / 2**20:.1f} MiB on the GPU "
+              f"outside its slots: {held}")
+     L.shadow, L.method = shadow, method
++    if _ep(L):
++        # this rank's experts only (e % world == rank), in order, to start with
++        own = [e for e in range(L.n, L.e) if e % method.world == method.rank]
++        L.held = (own + [-1] * L.x)[: L.x]
+     LAYERS.append(L)
+     # the lent counts, made before any graph is captured (route reads them)
+     STATE["k"] = torch.zeros(len(LAYERS), dtype=torch.int64, device=dev)
+     if DYNAMIC:
+         # the slot table and the route counts, also made before any capture
+         STATE["tbl"] = torch.full((len(LAYERS), L.e), -1, dtype=torch.int64, device=dev)
++        STATE["utbl"] = torch.full((len(LAYERS), L.e), -1, dtype=torch.int64, device=dev) if _ep(L) else STATE["tbl"]
+         STATE["cnt"] = torch.zeros((len(LAYERS), L.e), dtype=torch.float32, device=dev)
+     if DYN_RES:
+         # the resident rows by role (None: not the packed layout the arenas give, so they
+@@ -401,7 +420,7 @@ def split(wrapper, layer) -> None:
+                 rows = None
+                 break
+             rows[key] = t
+-        L.res_t = rows if rows and len(rows) == 4 else None
++        L.res_t = rows if rows and (len(rows) == 4 or (len(rows) == 2 and _is_gguf(L))) else None
+         rtbl = torch.full((len(LAYERS), L.e), -1, dtype=torch.int64, device=dev)
+         if "rtbl" in STATE:
+             rtbl[: STATE["rtbl"].shape[0]] = STATE["rtbl"]
+@@ -459,6 +478,7 @@ def route(wrapper, dispatch_output):
+         ic = ids.long().clamp(min=0)
+         slot = STATE["tbl"][L.idx][ic].to(ids.dtype)
+         lent = (slot >= 0) & (ids >= 0)
++        any_lent = (STATE["utbl"][L.idx][ic] >= 0) & (ids >= 0)
+         if DYN_RES:
+             row = STATE["rtbl"][L.idx][ic].to(ids.dtype)
+             res = (row >= 0) & (ids >= 0)
+@@ -475,9 +495,10 @@ def route(wrapper, dispatch_output):
+             topk_ids=torch.where(gpu, torch.full_like(ids, -1), ids),
+             topk_weights=torch.where(gpu, torch.zeros_like(w), w)))
+     else:
++        any_lent = any_lent if DYNAMIC else lent
+         cpu = dispatch_output._replace(topk_output=topk._replace(
+-            topk_ids=torch.where(lent, torch.zeros_like(ids), ids),
+-            topk_weights=torch.where(lent, torch.zeros_like(w), w)))
++            topk_ids=torch.where(any_lent, torch.zeros_like(ids), ids),
++            topk_weights=torch.where(any_lent, torch.zeros_like(w), w)))
+     if _MASK_ZERO:
+         # a runner that cannot take -1 (Marlin): slot 0 at weight 0, which reads
+         # zeros when nothing is lent
+@@ -699,27 +720,229 @@ def _over_ranks(vals: List[int], op=torch.distributed.ReduceOp.MIN) -> List[int]
+     return t.tolist()
+ 
+ 
++def _world() -> int:
++    from sglang.srt.distributed.parallel_state import get_tp_group
++
++    return get_tp_group().world_size
++
++
++def _ep(L) -> bool:
++    """The slots hold whole experts, this rank's share (kt_gguf_hot.py under KT_GGUF_HOT_EP)."""
++    return bool(getattr(L.method, "ep", False))
++
++
++def _union() -> None:
++    """Under EP: utbl from every rank's slot table (an all-reduce, the same forward on every rank), so rank 0's
++    CPU skips the routes any rank's slots take."""
++    if not DYNAMIC or not LAYERS or not _ep(LAYERS[0]):
++        return
++    from sglang.srt.distributed.parallel_state import get_tp_group
++
++    held = (STATE["tbl"] >= 0).to(torch.int32)
++    torch.distributed.all_reduce(held, op=torch.distributed.ReduceOp.MAX, group=get_tp_group().device_group)
++    STATE["utbl"].copy_(torch.where(held > 0, 0, -1))
++
++
++def _is_gguf(L: _Layer) -> bool:
++    """The slots' method is the GGUF hot method (kt_gguf_hot.py): raw GGUF rows, a reader for more."""
++    return getattr(L.method, "reader", None) is not None and hasattr(L.method, "fill_experts")
++
++
+ def _roles(L: _Layer):
+     """{(w13|w2, is scale): slot name} when the shadow holds exactly the packed
+     weights and the e8m0 scales of the two projections (bytes: uint8 or int8
+-    weights, uint8 or float8_e8m0fnu scales), else None."""
++    weights, uint8 or float8_e8m0fnu scales), else None. GGUF slots: the two
++    weight tensors alone."""
+     r = {}
+     for _, nm in L.names:
+         key = ("w13" if nm.startswith("w13") else "w2" if nm.startswith("w2") else None, "scale" in nm)
+         if key[0] is None or key in r or L.slots[nm].element_size() != 1:
+             return None
+         r[key] = nm
++    if _is_gguf(L):
++        return r if len(r) == 2 and ("w13", False) in r and ("w2", False) in r else None
+     return r if len(r) == 4 else None
+ 
+ 
+-def _to_dev(rows, dev) -> torch.Tensor:
++_GGUF_PEEK = None
++
++
++def _gguf_rows(L: _Layer, e: int):
++    """Expert e's rows for this rank (gate, up, down) as CPU uint8 tensors: from kt-kernel's GGUF expert
++    cache when resident there, else read from the file through the method's reader."""
++    global _GGUF_PEEK
++    m = L.method
++    li, N, rank = L.layer_idx, m.N, getattr(m, "slice_rank", m.rank)
++    if _GGUF_PEEK is None:
++        try:
++            import kt_kernel.kt_kernel_ext as _ext
++
++            _GGUF_PEEK = (getattr(_ext, "kt_gguf_cache_peek", None), getattr(_ext, "kt_gguf_cache_unpin", None))
++        except ImportError:
++            _GGUF_PEEK = (None, None)
++    peek, unpin = _GGUF_PEEK
++    if peek is not None and m.world == 1:
++        ptrs = peek(li, e)
++        if ptrs is not None:
++            import ctypes
++
++            w13 = L.slots[DYN["roles"][L.idx][("w13", False)]] if L.idx in DYN.get("roles", {}) else None
++            rb13 = (w13.shape[-1] if w13 is not None else L.sz[[nm for _, nm in L.names if nm.startswith("w13")][0]] // (2 * N))
++            per = N * rb13
++            g = torch.empty(per, dtype=torch.uint8)
++            u = torch.empty(per, dtype=torch.uint8)
++            w2nm = [nm for _, nm in L.names if nm.startswith("w2")][0]
++            per2 = L.sz[w2nm]
++            d = torch.empty(per2, dtype=torch.uint8)
++            ctypes.memmove(g.data_ptr(), ptrs[0], per)
++            ctypes.memmove(u.data_ptr(), ptrs[1], per)
++            ctypes.memmove(d.data_ptr(), ptrs[2], per2)
++            unpin(li, e)
++            return g.view(N, -1), u.view(N, -1), d.view(-1, per2 // L.slots[w2nm].shape[-2] if False else d.numel() // L.slots[w2nm].shape[-1]), True
++    idx = torch.tensor([e], dtype=torch.int64)
++    g = m.reader.slice(li, "gate", N, rank, idx)[0]
++    u = m.reader.slice(li, "up", N, rank, idx)[0]
++    d = m.reader.slice(li, "down", N, rank, idx)[0]
++    return g, u, d, False
++
++
++def _gguf_load(L: _Layer, e: int, dst) -> None:
++    if not _DYN_TIMING:
++        return _gguf_load_impl(L, e, dst)
++    t0 = time.perf_counter()
++    _gguf_load_impl(L, e, dst)
++    _DYN_T["load"] += time.perf_counter() - t0
++    _DYN_T["loads"] += 1
++
++
++def _gguf_load_impl(L: _Layer, e: int, dst) -> None:
++    """Expert e into dst, the slot layout of the GGUF method (w13 [2N, rb]: gate rows then up rows; w2
++    [K, rb2]); on the current stream (the caller's side stream for swaps)."""
++    g, u, d, _ = _gguf_rows(L, e)
++    N = L.method.N
++    w13, w2 = dst[("w13", False)], dst[("w2", False)]
++    w13[:N].copy_(g.view(N, -1), non_blocking=True)
++    w13[N:].copy_(u.view(N, -1), non_blocking=True)
++    w2.copy_(d.view(w2.shape), non_blocking=True)
++
++
++class _AsyncGGUF:
++    """A batch of GGUF swaps, their rows copied out of kt-kernel's cache into a
++    pinned staging pool by background threads, then queued to their slots by the scheduler's thread."""
++
++    pool = None  # one pinned uint8 tensor, DYN_ASYNC_CAP items of `item` bytes
++    item = 0
++    ex = None
++
++    @classmethod
++    def ready(cls, swaps) -> bool:
++        if not DYN_ASYNC or not swaps:
++            return False
++        for L, w, _, _, _ in swaps:
++            if w != 0 or not _is_gguf(L) or (getattr(L.method, "world", 1) != 1 and not _ep(L)):
++                return False
++        if cls.pool is None:
++            from concurrent.futures import ThreadPoolExecutor
++
++            item = 0
++            for M in LAYERS:
++                if not _is_gguf(M) or M.idx not in DYN.get("roles", {}):
++                    continue
++                r = DYN["roles"][M.idx]
++                item = max(item, M.slots[r[("w13", False)]][0].numel() + M.slots[r[("w2", False)]][0].numel())
++            if not item:
++                return False
++            cls.item = (item + 4095) // 4096 * 4096
++            cls.pool = torch.empty(DYN_ASYNC_CAP * cls.item, dtype=torch.uint8, pin_memory=True)
++            cls.ex = ThreadPoolExecutor(max_workers=DYN_ASYNC_THREADS, thread_name_prefix="kt-hot-swap")
++            _log(f"dynamic GGUF swaps load in the background: {DYN_ASYNC_THREADS} threads, "
++                 f"{DYN_ASYNC_CAP} x {cls.item / 2**20:.1f} MiB of pinned staging")
++        return True
++
++    @classmethod
++    def _rows(cls, L: _Layer, e: int, k: int) -> None:
++        """Expert e's gate, up and down rows into staging item k (gate | up | down, the slot's byte order)."""
++        global _GGUF_PEEK
++        r = DYN["roles"][L.idx]
++        w13, w2 = L.slots[r[("w13", False)]][0], L.slots[r[("w2", False)]][0]
++        per, per2 = w13.numel() // 2, w2.numel()
++        buf = cls.pool[k * cls.item: k * cls.item + 2 * per + per2]
++        if _GGUF_PEEK is None:
++            try:
++                import kt_kernel.kt_kernel_ext as _ext
++
++                _GGUF_PEEK = (getattr(_ext, "kt_gguf_cache_peek", None), getattr(_ext, "kt_gguf_cache_unpin", None))
++            except ImportError:
++                _GGUF_PEEK = (None, None)
++        peek, unpin = _GGUF_PEEK
++        # under EP the cache holds TP slices (kt-kernel splits each expert over its NUMA pools): read the file
++        ptrs = peek(L.layer_idx, e) if peek is not None and not _ep(L) else None
++        if ptrs is not None:
++            import ctypes
++
++            base = buf.data_ptr()
++            ctypes.memmove(base, ptrs[0], per)
++            ctypes.memmove(base + per, ptrs[1], per)
++            ctypes.memmove(base + 2 * per, ptrs[2], per2)
++            unpin(L.layer_idx, e)
++            return
++        m, N = L.method, L.method.N
++        rank = getattr(m, "slice_rank", m.rank)
++        idx = torch.tensor([e], dtype=torch.int64)
++        buf[:per].copy_(m.reader.slice(L.layer_idx, "gate", N, rank, idx)[0].reshape(-1))
++        buf[per:2 * per].copy_(m.reader.slice(L.layer_idx, "up", N, rank, idx)[0].reshape(-1))
++        buf[2 * per:].copy_(m.reader.slice(L.layer_idx, "down", N, rank, idx)[0].reshape(-1))
++
++    @classmethod
++    def verify(cls, swaps) -> None:
++        """Each swapped slot against the expert's rows read from the GGUF file (not through the cache)."""
++        torch.cuda.synchronize()
++        bad = []
++        for L, _, i, _, e in swaps:
++            r = DYN["roles"][L.idx]
++            w13, w2 = L.slots[r[("w13", False)]][i], L.slots[r[("w2", False)]][i]
++            m, N = L.method, w13.shape[0] // 2
++            idx = torch.tensor([e], dtype=torch.int64)
++            rank = getattr(m, "slice_rank", m.rank)
++            want = (m.reader.slice(L.layer_idx, "gate", N, rank, idx)[0].reshape(-1),
++                    m.reader.slice(L.layer_idx, "up", N, rank, idx)[0].reshape(-1),
++                    m.reader.slice(L.layer_idx, "down", N, rank, idx)[0].reshape(-1))
++            have = (w13[:N].reshape(-1).cpu(), w13[N:].reshape(-1).cpu(), w2.reshape(-1).cpu())
++            diff = [int((a.view(torch.uint8) != b.view(torch.uint8)).sum()) for a, b in zip(have, want)]
++            if any(diff):
++                bad.append((L.layer_idx, i, e, diff))
++        DYN["verified"] = DYN.get("verified", 0) + len(swaps)
++        DYN["verify_bad"] = DYN.get("verify_bad", 0) + len(bad)
++        if bad or DYN["verified"] <= len(swaps) or DYN["verified"] % 500 < len(swaps):
++            _log(f"dynamic GGUF swaps verified: {DYN['verified']} slots, {DYN['verify_bad']} differing"
++                 + (f"; this batch (layer, slot, expert, differing bytes gate/up/down): {bad[:4]}" if bad else ""))
++
++    @classmethod
++    def submit(cls, swaps):
++        return [cls.ex.submit(cls._rows, L, e, k) for k, (L, _, _, _, e) in enumerate(swaps)]
++
++    @classmethod
++    def queue(cls, swaps) -> None:
++        """On the current (side) stream: staging items to their slots."""
++        for k, (L, _, i, _, e) in enumerate(swaps):
++            r = DYN["roles"][L.idx]
++            w13, w2 = L.slots[r[("w13", False)]][i], L.slots[r[("w2", False)]][i]
++            per, per2 = w13.numel() // 2, w2.numel()
++            buf = cls.pool[k * cls.item: k * cls.item + 2 * per + per2]
++            N = w13.shape[0] // 2
++            w13[:N].view(-1).copy_(buf[:per], non_blocking=True)
++            w13[N:].view(-1).copy_(buf[per:2 * per], non_blocking=True)
++            w2.view(-1).copy_(buf[2 * per:], non_blocking=True)
++
++
++def _to_dev(rows, dev):
+     """A small int64 table update through pinned memory: no wait for the stream (a pageable copy waits)."""
+     return torch.tensor(rows, dtype=torch.int64).pin_memory().to(dev, non_blocking=True)
+ 
+ 
+ def _pending(swaps, dev):
+-    """The table entries a round's swaps make, split by table on the host: applying them needs no boolean
+-    mask of a device tensor, whose element count waits for the stream."""
++    """The table entries a batch of swaps makes, split by table on the host: applying them needs no boolean mask,
++    whose element count waited for the side stream's copies (10-26: most of a round's host time)."""
+     out = []
+     for which in (0, 1):
+         rows = [(L.idx, e, i) for L, w, i, _, e in swaps if w == which]
+@@ -733,6 +956,8 @@ def _arena_load(L: _Layer, e: int, dst, order: int) -> None:
+     (gate, up, down packed e2m1; their fp32 group scales) into dst, the slot
+     layout: w13 [2N, K/2] with gate rows first (order 0) or up rows first (1), w2
+     [K, N/2], e8m0 scale bytes. On the current stream."""
++    if _is_gguf(L):
++        return _gguf_load(L, e, dst)
+     from sglang.srt.layers.moe import kt_stream_prefill
+ 
+     st = kt_stream_prefill._instance
+@@ -841,7 +1066,24 @@ def _dyn_setup(dev) -> None:
+     L = LAYERS[0]
+     roles = _roles(L)
+     st = getattr(kt_stream_prefill, "_instance", None)
+-    if st is None or (getattr(st, "_mxc", None) is None and L.layer_idx not in getattr(st, "_arenas", {})):
++    if _is_gguf(L):
++        if roles is None:
++            why = f"slot tensors {[(nm, str(L.slots[nm].dtype)) for _, nm in L.names]} are not the GGUF hot layout"
++        else:
++            DYN["roles"] = {M.idx: _roles(M) for M in LAYERS}
++            good = True
++            for j in range(min(2, L.b)):
++                dst = {key: torch.empty_like(L.slots[nm][j]) for key, nm in roles.items()}
++                _gguf_load(L, L.n + j, dst)
++                torch.cuda.synchronize(dev)
++                for key, nm in roles.items():
++                    bad = int((dst[key].view(torch.uint8).cpu() != L.banks[nm][j].view(torch.uint8)).sum())
++                    if bad:
++                        good = False
++                        why = f"GGUF rows of expert {L.n + j} differ from the bank ({nm}: {bad} bytes)"
++            if good:
++                order = 0
++    elif st is None or (getattr(st, "_mxc", None) is None and L.layer_idx not in getattr(st, "_arenas", {})):
+         why = "no zero-copy arenas (KT_GPU_STREAM_ZEROCOPY=1 with KT_EXPERT_SHM=1)"
+     elif roles is None:
+         why = f"slot tensors {[(nm, str(L.slots[nm].dtype)) for _, nm in L.names]} are not packed MXFP4 bytes"
+@@ -884,6 +1126,10 @@ def _dyn_setup(dev) -> None:
+         L = LAYERS[0]
+         if not DYN["on"]:
+             ok, why = 0, "the dynamic slots are off"
++        elif _is_gguf(L):
++            # the prefill lend unmaps the GGUF resident rows and writes
++            # their load-time experts back (a swapped row crashed a back-to-back prefill, 10-25)
++            ok, why = 0, "GGUF hot slots: the prefill lend restores the resident rows to their load-time experts"
+         elif L.res_t is None:
+             ok, why = 0, "the resident tensors are not the packed layout"
+         else:
+@@ -980,7 +1226,67 @@ def res_guard() -> None:
+         rtbl[L.idx, : L.n] = torch.arange(L.n, device=dev)
+ 
+ 
++# KT_KV_HOT_DYN_TIMING=1, the host time of the rounds
++_DYN_TIMING = os.environ.get("KT_KV_HOT_DYN_TIMING", "0") == "1"
++_DYN_T = {"n": 0, "swap_rounds": 0, "sum": 0.0, "max": 0.0, "swap_sum": 0.0, "load": 0.0, "loads": 0}
++
++
+ def _dyn_round(dev) -> None:
++    if not _DYN_TIMING:
++        return _dyn_round_impl(dev)
++    t0 = time.perf_counter()
++    swaps0 = DYN.get("swaps", 0)
++    if os.environ.get("KT_KV_HOT_DYN_PROFILE", "0") == "1" and DYN.get("calls", 0) % DYN_EVERY == DYN_EVERY - 1:
++        import cProfile
++
++        prof = _DYN_T.get("prof")
++        if prof is None:
++            prof = _DYN_T["prof"] = cProfile.Profile()
++        prof.enable()
++        _dyn_round_impl(dev)
++        prof.disable()
++    else:
++        _dyn_round_impl(dev)
++    if DYN.get("calls", 0) % DYN_EVERY:
++        return  # not a round
++    dt = time.perf_counter() - t0
++    T = _DYN_T
++    T["n"] += 1
++    T["sum"] += dt
++    T["max"] = max(T["max"], dt)
++    if DYN.get("swaps", 0) > swaps0:
++        T["swap_rounds"] += 1
++        T["swap_sum"] += dt
++    if T["n"] % DYN_LOG == 0:
++        if _DYN_T.get("sec"):
++            _log("dynamic round sections (ms in all): " + ", ".join(f"{k} {v * 1e3:.0f}" for k, v in _DYN_T["sec"].items()))
++            _DYN_T["sec"] = {}
++        _log(f"dynamic round timing: {T['n']} rounds, {T['swap_rounds']} with swaps; host {T['sum'] * 1e3:.0f} ms in all "
++             f"({T['sum'] / T['n'] * 1e3:.2f} ms a round, {T['swap_sum'] / max(1, T['swap_rounds']) * 1e3:.2f} ms a round "
++             f"with swaps, largest {T['max'] * 1e3:.1f} ms); of it in {T['loads']} expert loads {T['load'] * 1e3:.0f} ms "
++             f"({T['load'] / max(1, T['loads']) * 1e3:.2f} ms a load)")
++        if T.get("prof") is not None:
++            import io
++            import pstats
++
++            out = io.StringIO()
++            pstats.Stats(T["prof"], stream=out).sort_stats("cumulative").print_stats(18)
++            _log("dynamic round profile:\n" + out.getvalue())
++            T["prof"] = None
++        T.update(n=0, swap_rounds=0, sum=0.0, max=0.0, swap_sum=0.0, load=0.0, loads=0)
++
++
++def _ck(name: str) -> None:
++    if _DYN_TIMING:
++        t = time.perf_counter()
++        last = _DYN_T.get("ck_t")
++        if last is not None and name != "start":
++            _DYN_T.setdefault("sec", {})
++            _DYN_T["sec"][name] = _DYN_T["sec"].get(name, 0.0) + t - last
++        _DYN_T["ck_t"] = t
++
++
++def _dyn_round_impl(dev) -> None:
+     """Every DYN_EVERY decode forwards, outside the graph: last round's copies enter
+     the table, last round's counts become scores, and each layer swaps held experts
+     for better-scored ones (out of the table now, copied in on the side stream)."""
+@@ -990,13 +1296,36 @@ def _dyn_round(dev) -> None:
+     cur = torch.cuda.current_stream(dev)
+     tbl = STATE["tbl"]
+     rtbl = STATE.get("rtbl")
++    _ck("start")
+     if DYN["pending"] is not None:
+         cur.wait_event(DYN["ev_copy"])
++        if DYN_VERIFY and DYN.get("pending_swaps"):
++            _AsyncGGUF.verify(DYN["pending_swaps"])
++        DYN["pending_swaps"] = None
+         for which, t in DYN["pending"]:  # split on the host
+             table = tbl if which == 0 else rtbl
+             if table is not None:  # (no resident rows' table without KT_KV_HOT_DYNAMIC_RESIDENT)
+                 table[t[:, 0], t[:, 1]] = t[:, 2]
+         DYN["pending"] = None
++    # a batch whose rows are staged goes to its slots now; its table entries the
++    # round after (pending, above)
++    _ck("apply pending")
++    busy = False
++    if DYN.get("prep") is not None:
++        busy = True
++        swaps_b, futs = DYN["prep"]
++        if all(f.done() for f in futs):
++            for f in futs:
++                f.result()
++            side = DYN["stream"]
++            with torch.cuda.stream(side):
++                side.wait_event(DYN["ev_unmap"])
++                _AsyncGGUF.queue(swaps_b)
++                DYN["ev_copy"].record(side)
++            DYN["pending"] = _pending(swaps_b, dev)
++            DYN["pending_swaps"] = swaps_b
++            DYN["prep"] = None
++    _ck("queue staged batch")
+     if DYN["ev_cnt"] is not None:
+         DYN["ev_cnt"].synchronize()
+         seen = DYN["buf"].numpy().astype(np.float64)
+@@ -1010,6 +1339,7 @@ def _dyn_round(dev) -> None:
+     STATE["cnt"].zero_()
+     DYN["ev_cnt"].record(cur)
+     DYN["rounds"] += 1
++    _ck("counts and scores")
+     if DYN["ev_cnt"] is not None and DYN.get("last") is not None:
+         # this round's routes against what the tables held through it
+         seen, res = DYN["last"], bool(DYN.get("res"))
+@@ -1017,7 +1347,8 @@ def _dyn_round(dev) -> None:
+             on = [e for e in L.held[: L.k] if e >= 0] + (L.res_now if res else [])
+             DYN["hit"] = DYN.get("hit", 0.0) + float(seen[L.idx, on].sum())
+             DYN["all"] = DYN.get("all", 0.0) + float(seen[L.idx, 0 if res else L.n:].sum())
+-    budget = DYN_SWAPS * DYN_EVERY
++    _ck("hit accounting")
++    budget = 0 if busy else DYN_SWAPS * DYN_EVERY  # none while a batch is out
+     swaps = []  # (layer, 0: slot / 1: resident row, its index, expert out, expert in)
+     for L in LAYERS:
+         k = L.k
+@@ -1034,10 +1365,12 @@ def _dyn_round(dev) -> None:
+ 
+         hs, changed, n = {has(p) for p in places}, set(), 0
+         for e in np.argsort(-sc, kind="stable").tolist():
+-            if n >= budget or sc[e] <= 0:
++            if n >= budget or sc[e] <= 0 or (DYN_ASYNC and _is_gguf(L) and len(swaps) >= DYN_ASYNC_CAP):
+                 break
+             if (e < L.n and not res) or e in hs:
+                 continue
++            if _ep(L) and e % L.method.world != L.method.rank:
++                continue  # another rank's expert
+             opts = [p for p in places if p not in changed]
+             if not opts:
+                 break
+@@ -1058,6 +1391,7 @@ def _dyn_round(dev) -> None:
+                 L.res_held[p[1]] = e
+             changed.add(p)
+             n += 1
++    _ck("decide")
+     if swaps:
+         for which, table in ((0, tbl), (1, rtbl)):
+             out = [(L.idx, old) for L, w, _, old, _ in swaps if w == which and old >= 0]
+@@ -1067,6 +1401,13 @@ def _dyn_round(dev) -> None:
+                 t = _to_dev([i * table.shape[1] + e for i, e in out], dev)
+                 table.view(-1).index_fill_(0, t, -1)
+         DYN["ev_unmap"].record(cur)
++    if swaps and _AsyncGGUF.ready(swaps):
++        # the rows load in the background; a later round queues them. The last
++        # batch's staging-to-slot copies must be done before the pool is written again (long done: a round ago)
++        DYN["ev_copy"].synchronize()
++        DYN["prep"] = (swaps, _AsyncGGUF.submit(swaps))
++        DYN["swaps"] += len(swaps)
++    elif swaps:
+         side = DYN["stream"]
+         with torch.cuda.stream(side):
+             side.wait_event(DYN["ev_unmap"])
+@@ -1089,6 +1430,8 @@ def _dyn_round(dev) -> None:
+              f"({(DYN['swaps'] - DYN['swaps_logged']) / (DYN_LOG * DYN_EVERY * max(len(LAYERS), 1)):.3f} "
+              f"a forward and layer)")
+         DYN["seen"], DYN["swaps_logged"] = None, DYN["swaps"]
++    _union()
++    _ck("unmap, submit, log")
+ 
+ 
+ def _hook() -> None:
+@@ -1161,6 +1504,11 @@ def tick(runner) -> None:
+         spare_now = torch.cuda.mem_get_info(dev)[0] - (SPARE_FLOOR_MB << 20)
+         min_bytes = max(1, min_bytes - max(0, spare_now))
+     got = m.decode_lend(runner, RESERVE, min_bytes)
++    if _world() > 1 and not _over_ranks([1 if got > 0 else 0])[0]:
++        # a rank with nothing to lend (cards that differ): none lends, so every rank takes the same steps
++        if got > 0:
++            m.hot_release("another rank had nothing to lend")
++        return
+     if got <= 0:
+         return
+     budget = got - (MARGIN_MB << 20)
+@@ -1172,10 +1520,13 @@ def tick(runner) -> None:
+         if free > budget:
+             spare, budget = free - budget, free
+     ks = _plan(budget)
++    ep = _ep(LAYERS[0])
+     # rank 0's routing decides what the CPU skips, so every rank's slots must take
+     # the same routes: the slot counts are the smallest over the ranks (the spare
+-    # memory differs between the cards; the free pages do not)
+-    ks = _over_ranks(ks)
++    # memory differs between the cards; the free pages do not). Under EP each rank's
++    # slots hold its own experts and the CPU skips the union: each rank keeps its own count
++    if not ep:
++        ks = _over_ranks(ks)
+     if DYNAMIC and DYN["on"] is None:
+         _dyn_setup(dev)
+         # the setup may have cut the slots to the banks
+@@ -1191,7 +1542,7 @@ def tick(runner) -> None:
+             ks = ks[:i] + [0] * (len(LAYERS) - i)
+             break
+     # a rank that could not map them all: the others give back what it lacks
+-    agreed = _over_ranks(ks)
++    agreed = ks if ep else _over_ranks(ks)
+     for L, k, a in zip(LAYERS, ks, agreed):
+         if a < k:
+             for _, nm in L.names:
+@@ -1206,6 +1557,7 @@ def tick(runner) -> None:
+         L.k = k
+     if DYNAMIC:
+         _dyn_table(dev)
++        _union()
+     kd = _k_dev(dev)
+     kd.copy_(torch.tensor(ks, dtype=torch.int64), non_blocking=True)
+     torch.cuda.synchronize(dev)
+@@ -1235,7 +1587,15 @@ def release(why: str) -> None:
+         # the slots leave the table; a round's copies in flight finish in the sync,
+         # and what they were for is in each layer's held list for the next lend
+         STATE["tbl"].fill_(-1)
++        if STATE["utbl"] is not STATE["tbl"]:
++            STATE["utbl"].fill_(-1)
+         DYN["pending"] = None
++        # a batch still loading is for slots about to go; its rows land in the
++        # staging pool only, and the next lend fills the slots from each layer's held list
++        if DYN.get("prep") is not None:
++            for f in DYN["prep"][1]:
++                f.result()
++            DYN["prep"] = None
+     torch.cuda.synchronize(dev)
+     for L in LAYERS:
+         if L.k:
+diff --git a/python/sglang/srt/layers/moe/kt_lend.py b/python/sglang/srt/layers/moe/kt_lend.py
+index 5079b6a1..3c9ac3f7 100644
+--- a/python/sglang/srt/layers/moe/kt_lend.py
++++ b/python/sglang/srt/layers/moe/kt_lend.py
+@@ -167,6 +167,272 @@ def _pinned_bounce(n: int):
+     return kt_pinned.bounce(n), bool(kt_pinned.ENABLED)
+ 
+ 
++MIRROR = os.environ.get("KT_PREFILL_LEND_MIRROR", "ram")  # ram | gguf | file
++MIRROR_DIR = os.environ.get("KT_PREFILL_LEND_MIRROR_DIR", os.path.expanduser("~/.cache/kt-lend"))
++MIRROR_THREADS = int(os.environ.get("KT_PREFILL_LEND_MIRROR_THREADS", "4"))
++_MPIECE = 4 << 20
++
++
++def _mirror_bounces() -> None:
++    import concurrent.futures as cf
++
++    maxspan = max(STATE["spans"])
++    STATE["mirror"].update(
++        bounces=[_pinned_empty(((maxspan + 4095) // 4096 + 2) * 4096) for _ in range(2)],
++        pool=cf.ThreadPoolExecutor(max_workers=MIRROR_THREADS),
++        reads={},
++    )
++
++
++def _mirror_open_file(host: torch.Tensor) -> None:
++    """Write the pinned mirror to a file (O_DIRECT reads later)."""
++    import atexit
++
++    os.makedirs(MIRROR_DIR, exist_ok=True)
++    path = os.path.join(MIRROR_DIR, f"mirror-{os.getpid()}-r{_rank()}.bin")
++    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_DIRECT, 0o600)
++    total = host.numel()
++    mv = memoryview(host.numpy())
++    tail = total % 4096
++    body = total - tail
++    t0 = time.perf_counter()
++    off = 0
++    while off < body:
++        w = os.pwritev(fd, [mv[off : off + min(_MPIECE, body - off)]], off)
++        if w <= 0:
++            raise IOError(f"mirror write failed at {off}")
++        off += w
++    if tail:
++        pad = torch.empty(4096, dtype=torch.uint8, pin_memory=True)
++        pad[:tail].copy_(host[body:])
++        os.pwritev(fd, [memoryview(pad.numpy())], body)
++    os.fsync(fd)
++    # one segment a layer: (bounce offset, bytes, "direct", (fd, file offset))
++    segs = {i: [(0, STATE["spans"][i], "direct", (fd, STATE["bases"][i]))] for i in range(len(STATE["spans"]))}
++    STATE["mirror"] = dict(mode="file", fd=fd, path=path, segs=segs, total=total)
++    _mirror_bounces()
++    atexit.register(_mirror_close)
++    _log(f"mirror of {total / 1e9:.3f} GB written to {path} in {time.perf_counter() - t0:.1f} s; "
++         f"the pinned copy is freed, two bounces of {max(STATE['spans']) >> 20} MiB stay")
++
++
++def _mirror_open_gguf(host: torch.Tensor) -> None:
++    """Every lent parameter matched to the GGUF tensor(s) holding its bytes, verified; the rest pinned."""
++    import glob
++
++    import numpy as np
++    from gguf import GGUFReader
++    from sglang.srt.server_args import get_global_server_args
++
++    gdir = os.environ.get("KT_GGUF_V41_DENSE") or get_global_server_args().kt_weight_path
++    shards = sorted(glob.glob(os.path.join(gdir, "*.gguf"))) if os.path.isdir(gdir) else [gdir]
++    t0 = time.perf_counter()
++    heads = {}  # first 4 KiB of a tensor's bytes -> (path, data offset, bytes, mmap array)
++    exps = {}  # expert tensors by name: (path, data offset, bytes, [E, rows, cols], mmap array)
++    readers = []
++    for path in shards:
++        r = GGUFReader(path)
++        readers.append(r)
++        for t in r.tensors:
++            if ".ffn_" in t.name and "_exps" in t.name:
++                exps[t.name] = (path, int(t.data_offset), int(t.n_bytes), [int(x) for x in t.shape][::-1], np.asarray(t.data))
++                continue
++            if int(t.n_bytes) < (1 << 20):
++                continue
++            a = np.asarray(t.data).reshape(-1)
++            heads.setdefault(a[:4096].tobytes(), (path, int(t.data_offset), int(t.n_bytes), a))
++    hv = host.numpy()
++    fds = {}
++    segs = {}
++    residual_parts = []  # (layer, bounce offset, bytes, host offset)
++    matched = unmatched = 0
++    for i, (lay, base) in enumerate(zip(STATE["layouts"], STATE["bases"])):
++        segs[i] = []
++        for item in lay:
++            if item[0] != "param":
++                continue
++            off, n = item[4], item[5]
++            pos = 0
++            parts = []
++            while pos < n:
++                hit = heads.get(hv[base + off + pos : base + off + pos + 4096].tobytes())
++                if hit is None or hit[2] > n - pos:
++                    break
++                path, doff, nb, a = hit
++                # the whole tensor's bytes against the mirror's
++                if not np.array_equal(a, hv[base + off + pos : base + off + pos + nb]):
++                    break
++                parts.append((off + pos, nb, path, doff))
++                pos += nb
++            if pos == n and parts:
++                for (o, nb, path, doff) in parts:
++                    if path not in fds:
++                        fds[path] = os.open(path, os.O_RDONLY)
++                    segs[i].append((o, nb, "direct", (fds[path], doff)))
++                matched += n
++                continue
++            # hot GGUF experts on the GPU (kt_gguf_hot.py): w13_qweight [E, 2N, rb] is gate then up rows of
++            # experts 0..E-1 (the base set a window puts back), w2_qweight [E, K, rb] their down rows
++            hot = _mirror_hot_segments(item, i, base + off, hv, exps)
++            if hot is not None:
++                for (o, nb, path, doff) in hot:
++                    if path not in fds:
++                        fds[path] = os.open(path, os.O_RDONLY)
++                    segs[i].append((off + o, nb, "direct", (fds[path], doff)))
++                matched += n
++                continue
++            if True:
++                residual_parts.append((i, off, n, base + off))
++                unmatched += n
++                if len(residual_parts) <= 6:
++                    _log(f"mirror: no GGUF source for layer {i} {item[1]} ({item[3]}, {n >> 20} MiB)")
++    residual = _pinned_empty(max(1, unmatched))
++    rpos = 0
++    for (i, off, n, hoff) in residual_parts:
++        residual[rpos : rpos + n].copy_(host[hoff : hoff + n])
++        segs[i].append((off, n, "pinned", rpos))
++        rpos += n
++    del readers, heads
++    STATE["mirror"] = dict(mode="gguf", fds=fds, segs=segs, residual=residual, total=host.numel())
++    _mirror_bounces()
++    _log(f"mirror from the GGUF: {matched / 1e9:.3f} GB of lent bytes matched to the shards' tensors, "
++         f"{unmatched / 1e6:.1f} MB kept pinned, matched in {time.perf_counter() - t0:.1f} s; "
++         f"the pinned copy is freed, two bounces of {max(STATE['spans']) >> 20} MiB stay")
++
++
++def _mirror_hot_why(name: str, layer_idx: int, e: int, path, a, h) -> None:
++    """The first hot slot that did not match its GGUF expert, once per launch: where the bytes differ."""
++    import numpy as np
++
++    if STATE.get("mirror_hot_why_logged"):
++        return
++    STATE["mirror_hot_why_logged"] = True
++    d = np.flatnonzero(a != h)
++    first = int(d[0]) if d.size else -1
++    _log(f"mirror: hot slot of layer {layer_idx} {name} expert {e} vs {path.split('/')[-1]}: {d.size} of {a.size} bytes differ, "
++         f"first at {first}, slot bytes zero {int((h == 0).sum())}/{h.size}, file bytes zero {int((a == 0).sum())}/{a.size}, "
++         f"slot head {h[:8].tolist()} file head {a[:8].tolist()}")
++
++
++def _mirror_hot_segments(item, layer_idx: int, hoff: int, hv, exps):
++    """Segments (param offset, bytes, path, file offset) of a hot-expert parameter, verified; None if not one."""
++    import numpy as np
++
++    name = item[1]
++    if not (name.endswith("w13_qweight") or name.endswith("w2_qweight")):
++        return None
++    try:
++        gate = exps[f"blk.{layer_idx}.ffn_gate_exps.weight"]
++        up = exps[f"blk.{layer_idx}.ffn_up_exps.weight"]
++        down = exps[f"blk.{layer_idx}.ffn_down_exps.weight"]
++    except KeyError:
++        return None
++    n = item[5]
++    segs = []
++    if name.endswith("w13_qweight"):
++        _, N, rb = gate[3][0], gate[3][1], gate[2] // (gate[3][0] * gate[3][1])
++        per = N * rb
++        E = n // (2 * per)
++        if E * 2 * per != n:
++            return None
++        o = 0
++        for e in range(E):
++            for (path, doff, nb, shape, a) in (gate, up):
++                foff = e * per
++                if not np.array_equal(a.reshape(-1)[foff : foff + per], hv[hoff + o : hoff + o + per]):
++                    _mirror_hot_why(name, layer_idx, e, path, a.reshape(-1)[foff : foff + per], hv[hoff + o : hoff + o + per])
++                    return None
++                segs.append((o, per, path, doff + foff))
++                o += per
++    else:
++        _, K, rb = down[3][0], down[3][1], down[2] // (down[3][0] * down[3][1])
++        per = K * rb
++        E = n // per
++        if E * per != n:
++            return None
++        path, doff, nb, shape, a = down
++        for e in range(E):
++            foff = e * per
++            if not np.array_equal(a.reshape(-1)[foff : foff + per], hv[hoff + e * per : hoff + (e + 1) * per]):
++                _mirror_hot_why(name, layer_idx, e, path, a.reshape(-1)[foff : foff + per], hv[hoff + e * per : hoff + (e + 1) * per])
++                return None
++            segs.append((e * per, per, path, doff + foff))
++    return segs
++
++
++def _mirror_close() -> None:
++    m = STATE.pop("mirror", None)
++    if m is None or m.get("mode") != "file":
++        return
++    try:
++        os.close(m["fd"])
++        os.unlink(m["path"])
++    except OSError:
++        pass
++
++
++def _mirror_read_layer(i: int, k: int) -> None:
++    """Layer i's bytes into bounce k: file segments in 4 MiB pieces on the pool, pinned ones copied."""
++    m = STATE["mirror"]
++    bounce = m["bounces"][k]
++    mv = memoryview(bounce.numpy())
++    futs = []
++
++    def piece(fd, foff, boff, nb, direct):
++        if direct:
++            # O_DIRECT: a 4 KiB-aligned window holding the bytes, read to the bounce at the same misalignment
++            lo = foff // 4096 * 4096
++            hi = min(-(-(foff + nb) // 4096) * 4096, -(-m["total"] // 4096) * 4096)
++            dst = boff - (foff - lo)
++            got = 0
++            while got < hi - lo:
++                r = os.preadv(fd, [mv[dst + got : dst + (hi - lo)]], lo + got)
++                if r <= 0:
++                    raise IOError(f"short mirror read at {lo + got}")
++                got += r
++        else:
++            got = 0
++            while got < nb:
++                r = os.preadv(fd, [mv[boff + got : boff + nb]], foff + got)
++                if r <= 0:
++                    raise IOError(f"short GGUF read at {foff + got}")
++                got += r
++
++    for (o, nb, kind, src) in m["segs"][i]:
++        if kind == "pinned":
++            bounce[4096 + o : 4096 + o + nb].copy_(m["residual"][src : src + nb])
++            continue
++        fd, foff = src
++        direct = m["mode"] == "file"
++        for a in range(0, nb, _MPIECE):
++            futs.append(m["pool"].submit(piece, fd, foff + a, 4096 + o + a, min(_MPIECE, nb - a), direct))
++    for f in futs:
++        f.result()
++
++
++def _mirror_view(i: int, k: int, n: int) -> torch.Tensor:
++    """The first n bytes of layer i as laid out in bounce k (the layer starts at byte 4096 of the bounce)."""
++    return STATE["mirror"]["bounces"][k][4096 : 4096 + n]
++
++
++def _mirror_submit(i: int) -> None:
++    """Layer i's bytes start reading into bounce i % 2 (whose last copy to the device must be done)."""
++    m = STATE["mirror"]
++    if i in m["reads"] or i >= len(STATE["spans"]):
++        return
++    k = i % 2
++    ev = STATE.get("pf_ready", [None, None])[k]
++    if ev is not None and STATE.get("pf_bounce_used", [False, False])[k]:
++        ev.synchronize()
++    m["reads"][i] = m["pool"].submit(_mirror_read_layer, i, k)
++
++
++def _mirror_wait(i: int) -> None:
++    m = STATE["mirror"]
++    _mirror_submit(i)
++    m["reads"].pop(i).result()
++
++
+ def _pinned_empty(n: int) -> torch.Tensor:
+     """The host mirror: THP + cudaHostRegister with kt_pinned (KT_FAST_PINNED=1)."""
+     try:
+@@ -286,9 +552,10 @@ def bind_model(model) -> None:
+         lay, off, slack = [], 0, 0
+         for name, p in layer.named_parameters():
+             if isinstance(p, torch.nn.parameter.UninitializedParameter):
+-                slack += _align(
+-                    _nbytes(p)
+-                )  # GGUF qweight: made by the load, taken in after it
++                if not os.environ.get("KT_GGUF_V41_DENSE"):
++                    slack += _align(
++                        _nbytes(p)
++                    )  # GGUF qweight: made by the load, taken in after it
+                 continue
+             if (
+                 p.device.type != "cuda"
+@@ -310,8 +577,10 @@ def bind_model(model) -> None:
+         return
+     device = entries[0][0].get_parameter(entries[0][1][0][1]).device
+     dev_spans = []
++    gguf_dense = bool(os.environ.get("KT_GGUF_V41_DENSE"))
++    STATE["plain"] = set(range(len(entries))) if gguf_dense else set()
+     for idx, (layer, lay, span) in enumerate(entries):
+-        with _tms().region(tag=TAG_WEIGHTS):
++        with contextlib.nullcontext() if gguf_dense else _tms().region(tag=TAG_WEIGHTS):
+             dspan = torch.empty(span, dtype=torch.uint8, device=device)
+         for item in lay:
+             _place(dspan, item).copy_(layer.get_parameter(item[1]))
+@@ -352,9 +621,11 @@ def _pack_resident(layers) -> None:
+         (layer, name, p)
+         for layer in layers
+         for name, p in layer.named_parameters()
+-        if p.device.type == "cuda"
++        # (kt-lend-gguf) the name first, uninitialized GGUF parameters never touched
++        if any(w in name for w in RESIDENT)
++        and _ready(p)
++        and p.device.type == "cuda"
+         and p.is_contiguous()
+-        and any(w in name for w in RESIDENT)
+     ]
+     if not found:
+         return
+@@ -430,7 +701,7 @@ def _owners_after_load(layer, lay):
+             inner = [
+                 (n, p.data_ptr() - lo)
+                 for n, p in params.items()
+-                if p.is_cuda and lo <= p.data_ptr() < hi and p.is_contiguous()
++                if _ready(p) and p.is_cuda and lo <= p.data_ptr() < hi and p.is_contiguous()
+             ]
+             if any(n in lent for n, _ in inner):
+                 found.append((mod, attr, val, inner))
+@@ -560,7 +831,8 @@ def _relayout(i: int, counts) -> None:
+     # of memory with KT_PREFILL_LEND_PFONLY (10-15)
+     held = full.numel()
+     shrink = dec < span and pf_held >= (1 << 20)
+-    in_place = dec <= held and not shrink
++    in_place = dec <= held and not shrink and i not in STATE.get("plain", ())
++    STATE.get("plain", set()).discard(i)
+     if in_place:
+         dspan = full[:dec]
+     else:
+@@ -604,6 +876,7 @@ def after_module(module) -> None:
+         return
+     full = STATE["dev_full"][i]
+     lo, hi = full.data_ptr(), full.data_ptr() + full.numel()
++    full = None
+     if all(
+         lo <= q.data_ptr() < hi
+         for n, q in STATE["layers"][i].named_parameters()
+@@ -656,6 +929,10 @@ def after_load() -> None:
+         nbytes=total,
+         dec_nbytes=sum(d.numel() for d in STATE["dev_spans"]),
+     )
++    if MIRROR in ("file", "gguf"):
++        (_mirror_open_file if MIRROR == "file" else _mirror_open_gguf)(host)
++        STATE["host"] = None
++        del host
+     maxspan = max(STATE["spans"])
+     if STATE["slots"][0].numel() < maxspan:
+         STATE["slots"] = None
+@@ -1019,11 +1296,17 @@ def before_forward(forward_batch) -> None:
+             m.hot_release("window start")
+         # free memory in decode, the KV pool and the graphs made: what is gone
+         # from it when the weights come back was left behind by this prefill
++        if os.environ.get("KT_GGUF_V41_DENSE"):
++            torch.cuda.empty_cache()  # the step without the decode's cached blocks
+         STATE["dec_free"] = torch.cuda.mem_get_info(dev)[0]
+         STATE.setdefault("dec_free0", STATE["dec_free"])
+         if DEBUG and not STATE.get("history"):
+             torch.cuda.memory._record_memory_history(max_entries=500000)
+             STATE["history"] = True
++        # KT_HOT_DYNAMIC=1: no swap copy may land on a slot while it is lent
++        from sglang.srt.layers.moe import kt_hot_cache
++
++        kt_hot_cache.window_start()
+         # Overlap scheduling may leave decode readers on these spans.
+         # TMS pause unmaps them without waiting for outstanding GPU work.
+         torch.cuda.synchronize(dev)
+@@ -1222,10 +1505,34 @@ def end_window() -> None:
+                 kt_kv_prefill_lend.swa_lend("end of window")
+         _check_room(dev)
+         _tms().resume(TAG_WEIGHTS)
+-        for base, span, dspan in zip(
+-            STATE["bases"], STATE["spans"], STATE["dev_spans"]
+-        ):
+-            dspan.copy_(STATE["host"][base : base + dspan.numel()], non_blocking=True)
++        if STATE.get("mirror") is not None:
++            m = STATE["mirror"]
++            for f in m["reads"].values():  # a read-ahead still landing in a bounce
++                f.result()
++            m["reads"].clear()
++            cur = torch.cuda.current_stream(dev)
++            evs = [None, None]
++            for i, dspan in enumerate(STATE["dev_spans"]):
++                k = i % 2
++                if evs[k] is not None:
++                    evs[k].synchronize()
++                _mirror_read_layer(i, k)
++                dspan.copy_(_mirror_view(i, k, dspan.numel()), non_blocking=True)
++                evs[k] = torch.cuda.Event()
++                evs[k].record(cur)
++            for ev in evs:
++                if ev is not None:
++                    ev.synchronize()
++            STATE["pf_bounce_used"] = [False, False]
++        else:
++            for base, span, dspan in zip(
++                STATE["bases"], STATE["spans"], STATE["dev_spans"]
++            ):
++                dspan.copy_(STATE["host"][base : base + dspan.numel()], non_blocking=True)
++        # KT_HOT_DYNAMIC=1: the slots a mirror restored to their load-time experts get their residents back
++        from sglang.srt.layers.moe import kt_hot_cache
++
++        kt_hot_cache.after_restore()
+         STATE["phase"] = "decode"
+         STATE["to_decode"] += 1
+         if STATE["to_decode"] in (1, 10, 100, 1000):
+@@ -1279,9 +1586,16 @@ def _prefetch(i: int) -> None:
+         if STATE["pf_done"][k] is not None:
+             cs.wait_event(STATE["pf_done"][k])
+         n = STATE.get("active", {}).get(i, span)  # the idle tail stays out
+-        STATE["slots"][k][:n].copy_(STATE["host"][base : base + n], non_blocking=True)
++        if STATE.get("mirror") is not None:
++            _mirror_wait(i)
++            STATE["slots"][k][:n].copy_(_mirror_view(i, k, n), non_blocking=True)
++            STATE.setdefault("pf_bounce_used", [False, False])[k] = True
++        else:
++            STATE["slots"][k][:n].copy_(STATE["host"][base : base + n], non_blocking=True)
+         STATE["pf_ready"][k].record(cs)
+     STATE["pf_issued"].add(i)
++    if STATE.get("mirror") is not None:
++        _mirror_submit(i + 1)
+ 
+ 
+ def _enter_hook(module, args):
+diff --git a/python/sglang/srt/layers/moe/kt_prefill_plan.py b/python/sglang/srt/layers/moe/kt_prefill_plan.py
+index a2b878d9..fc51b065 100644
+--- a/python/sglang/srt/layers/moe/kt_prefill_plan.py
++++ b/python/sglang/srt/layers/moe/kt_prefill_plan.py
+@@ -36,6 +36,10 @@ CARRY = int(float(_cost[3]) * (1 << 20)) if len(_cost) >= 4 else 0
+ LIVE = os.environ.get("KT_PREFILL_PLAN_LIVE", "1") == "1"
+ DELTA = int(os.environ.get("KT_PREFILL_PLAN_DELTA_MB", "0") or 0) << 20
+ ALIGN = int(os.environ.get("KT_PREFILL_PLAN_ALIGN", "1024"))
++# a GGUF pack (KT_GGUF_V41_DENSE) only: the chunks may run TAIL_STEPS aligned steps over the
++# launch chunk, and the free memory is read without torch's cached blocks
++_GGUF = bool(os.environ.get("KT_GGUF_V41_DENSE"))
++TAIL_STEPS = int(os.environ.get("KT_PREFILL_PLAN_TAIL_STEPS", "2" if _GGUF else "0"))
+ # the chunk this setup is known to take without a plan (the lend's hint): what a
+ # request gets while there is no free-memory step to plan with (the first window
+ # of a launch without KT_PREFILL_PLAN_DELTA_MB); unset, the launch chunk
+@@ -135,6 +139,10 @@ def _free_now(scheduler) -> int:
+         # buffers grown to a larger chunk: 131K planned at 13,312 rows ran out)
+         mine = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+     elif delta is not None:
++        # the blocks a decode left in torch's cache go back at the window's start (its empty_cache):
++        # measured without them, as the step was
++        if _GGUF:
++            torch.cuda.empty_cache()
+         mine = torch.cuda.mem_get_info()[0] + delta
+     else:
+         mine = -1
+@@ -226,11 +234,23 @@ def chunk_for(scheduler, chunk: int) -> int:
+ 
+     # the fewest chunks whose equal size, in whole ALIGN steps, fits (the step
+     # rounds a chunk up: 35,000 in three is 11,667 rows, 12,288 once aligned)
++    # over the launch chunk by up to TAIL_STEPS aligned steps when that spares a chunk (a
++    # chunk of the streamed prefill sweeps every expert once; a tail chunk pays the same)
++    slack = chunk + ALIGN * TAIL_STEPS
+     for n in range(1, 257):
+         c = math.ceil(rem / n)
+-        c = min(chunk, max(ALIGN, -(-c // ALIGN) * ALIGN))
++        c = max(ALIGN, -(-c // ALIGN) * ALIGN)
++        if not TAIL_STEPS:
++            c = min(chunk, c)
++        elif c > slack:
++            continue
++        elif c > chunk and math.ceil(rem / chunk) <= n:
++            c = chunk  # over the launch chunk without sparing a chunk: the launch chunk
+         if fits(c, n) or c <= ALIGN:
+             break
++    else:
++        if TAIL_STEPS:
++            c = min(chunk, ALIGN)
+     n = max(1, math.ceil(rem / c))  # the launch chunk may cap it (V4.1's SWA pool)
+     if len(NEED) > 4096:
+         NEED.clear()
+diff --git a/python/sglang/srt/layers/moe/kt_stream_prefill.py b/python/sglang/srt/layers/moe/kt_stream_prefill.py
+index ebf8bc1e..1505d721 100644
+--- a/python/sglang/srt/layers/moe/kt_stream_prefill.py
++++ b/python/sglang/srt/layers/moe/kt_stream_prefill.py
+@@ -1996,8 +1996,19 @@ def hot_reference_check(method, layer, x, physical_ids, topk_weights, gpu_out, s
+ EARLY_INIT = os.environ.get("KT_GPU_STREAM_EARLY_INIT", "0") == "1"
+ 
+ 
++def _gguf_edition():
++    """The GGUF streamer module for a LLAMAFILE method."""
++    if os.environ.get("KT_GGUF_STREAM_SOURCE", "") in ("nvme", "bank"):
++        from sglang.srt.layers.moe import kt_stream_prefill_gguf_nvme as m
++    else:
++        from sglang.srt.layers.moe import kt_stream_prefill_gguf as m
++    return m
++
++
+ def stream_prefill_init_early(method, layer) -> None:
+     global _instance, _failed
++    if method.kt_config.method == "LLAMAFILE":
++        return _gguf_edition().stream_prefill_init_early(method, layer)
+     if not EARLY_INIT or STREAM_THRESHOLD <= 0 or _failed or _instance is not None:
+         return
+     rank = get_parallel().tp_rank
+@@ -2030,9 +2041,11 @@ def _in_lend_window() -> bool:
+     return kt_lend.phase() == "prefill"
+ 
+ 
+-def stream_prefill_for(method, layer, num_tokens: int) -> Optional[KTStreamPrefill]:
++def stream_prefill_for(method, layer, num_tokens: int):
+     """The per-rank streamer when this call qualifies, else None."""
+     global _instance, _failed
++    if method.kt_config.method == "LLAMAFILE":
++        return _gguf_edition().stream_prefill_for(method, layer, num_tokens)
+     if STREAM_THRESHOLD <= 0 or _failed:
+         return None
+     if num_tokens < STREAM_THRESHOLD and not (IN_WINDOW and _in_lend_window()):
+diff --git a/python/sglang/srt/layers/moe/kt_stream_prefill_gguf.py b/python/sglang/srt/layers/moe/kt_stream_prefill_gguf.py
+new file mode 100644
+index 00000000..134b55cb
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/kt_stream_prefill_gguf.py
+@@ -0,0 +1,559 @@
++"""GPU-streamed prefill for KT CPU experts, GGUF edition (--kt-method LLAMAFILE).
++
++Above KT_GPU_STREAM_PREFILL tokens a MoE layer's CPU experts are not computed
++on the CPU: each rank DMAs its TP part of the experts' raw GGUF blocks, G at a
++time, from a pinned host bank into a device slot, dequantizes them to bf16 on
++the device (kt_gguf_dequant.py: IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL /
++Q2_0) and runs FlashInfer's bf16 CUTLASS MoE on bf16 activations (W16), as
++the V4.1 tree's KT_GPU_STREAM_W16 does for MXFP4. Two slots double-buffer
++DMA against dequant + compute; each (token count, group, type triple) is one
++CUDA graph.
++
++The host bank of a layer is this rank's slice of the intermediate dimension
++(rows [N*r, N*(r+1)) of gate/up, the same columns of down) for every expert,
++in physical expert order (the router's ids after the placement remap), cut
++out of the GGUF mmap once and kept pinned: about half the expert bytes of the
++checkpoint per rank. Built at load when KT_GPU_STREAM_EARLY_INIT=1, else on a
++layer's first streamed call.
++
++Env (shared with the NVFP4 edition): KT_GPU_STREAM_PREFILL, KT_GPU_STREAM_GROUP,
++KT_GPU_STREAM_TIMING, KT_GPU_STREAM_EARLY_INIT, KT_STREAM_GRAPH_KEEP,
++KT_GPU_STREAM_SELFTEST=2 (reference check of the first streamed layer).
++"""
++import os
++import time
++import traceback
++from typing import Dict, Optional
++
++import torch
++
++from sglang.srt.distributed.parallel_state import (
++    get_tensor_model_parallel_rank,
++    get_tensor_model_parallel_world_size,
++)
++from sglang.srt.layers.moe import kt_gguf_dequant as DQ
++
++STREAM_THRESHOLD = int(os.environ.get("KT_GPU_STREAM_PREFILL", "0") or 0)
++GROUP_SIZE = int(os.environ.get("KT_GPU_STREAM_GROUP", "8") or 8)
++TIMING = os.environ.get("KT_GPU_STREAM_TIMING") == "1"
++GRAPH_KEEP = int(os.environ.get("KT_STREAM_GRAPH_KEEP", "8"))
++EARLY_INIT = os.environ.get("KT_GPU_STREAM_EARLY_INIT", "0") == "1"
++# Chunks shorter than the prefill chunk run padded to the next multiple of
++# ROW_STEP rows (ids -1, weights 0), so graphs and inputs exist for a few row
++# counts only and the lend's accounting of the scratch holds.
++ROW_STEP = int(os.environ.get("KT_GPU_STREAM_ROW_STEP", "2048") or 0)
++
++
++def _chunk_rows() -> int:
++    try:
++        from sglang.srt.server_args import get_global_server_args
++
++        return int(get_global_server_args().chunked_prefill_size or 0)
++    except Exception:
++        return 0
++
++
++def _scratch_empty(shape, dtype, device, per_chunk=False):
++    try:
++        from sglang.srt.layers.moe import kt_lend
++
++        return kt_lend.scratch_empty(shape, dtype, device, per_chunk=per_chunk)
++    except ImportError:
++        return torch.empty(shape, dtype=dtype, device=device)
++
++
++def _scratch_region():
++    try:
++        from sglang.srt.layers.moe import kt_lend
++
++        return kt_lend.scratch_region()
++    except ImportError:
++        import contextlib
++
++        return contextlib.nullcontext()
++
++
++def _log(msg: str):
++    print(f"[kt-stream-gguf {time.strftime('%H:%M:%S')}] {msg}", flush=True)
++
++
++def _align64(n: int) -> int:
++    return (n + 63) & ~63
++
++
++class _Slot:
++    def __init__(self, G: int, strides, device):
++        # flat per projection; a layer views its n x part_bytes in the head
++        self.raw = [_scratch_empty((G * st,), torch.uint8, device) for st in strides]
++        self.dma_done = torch.cuda.Event()
++        self.compute_done = torch.cuda.Event()
++        self.compute_used = False
++
++
++class _Geometry:
++    """Expert types and this rank's part bytes per layer, from the GGUF headers."""
++
++    def __init__(self, path: str, N: int, K: int, world: int):
++        from kt_kernel.utils.loader import GGUFLoader
++
++        self.loader = GGUFLoader(path)
++        cfg = self.loader.get_model_config()
++        self.E = int(cfg["num_experts"])
++        self.N, self.K, self.world = N, K, world
++        if N * world != int(cfg["moe_intermediate_size"]):
++            raise RuntimeError(f"KT_GPU_STREAM_PREFILL (GGUF): N={N} x {world} ranks != intermediate {cfg['moe_intermediate_size']}")
++        if int(cfg["hidden_size"]) != K:
++            raise RuntimeError(f"KT_GPU_STREAM_PREFILL (GGUF): hidden {cfg['hidden_size']} != {K}")
++        self.layers = []
++        i = 0
++        while self.loader.has_tensor(f"blk.{i}.ffn_gate_exps.weight"):
++            self.layers.append(i)
++            i += 1
++        if not self.layers:
++            raise RuntimeError("KT_GPU_STREAM_PREFILL (GGUF): no blk.N.ffn_gate_exps.weight in the GGUF")
++        self.types: Dict[int, tuple] = {}
++        self.part_bytes: Dict[int, tuple] = {}
++        for layer_idx in self.layers:
++            types = tuple(int(self.loader.get_ggml_type(f"blk.{layer_idx}.ffn_{p}_exps.weight"))
++                          for p in ("gate", "up", "down"))
++            for t in types:
++                if t not in DQ.BLOCK_INFO:
++                    raise RuntimeError(f"KT_GPU_STREAM_PREFILL (GGUF): layer {layer_idx} uses ggml type {t}, no GPU dequantizer")
++            gb, gs = DQ.BLOCK_INFO[types[0]]
++            ub, us = DQ.BLOCK_INFO[types[1]]
++            db, ds = DQ.BLOCK_INFO[types[2]]
++            if K % gb or K % ub or N % db:
++                raise RuntimeError(f"KT_GPU_STREAM_PREFILL (GGUF): layer {layer_idx} blocks {gb}/{ub}/{db} vs K={K} N={N}")
++            self.types[layer_idx] = types
++            self.part_bytes[layer_idx] = (N * (K // gb) * gs, N * (K // ub) * us, K * (N // db) * ds)
++        self.strides = [_align64(max(pb[pi] for pb in self.part_bytes.values())) for pi in range(3)]
++
++
++_geometry: Optional[_Geometry] = None
++
++
++def _geometry_for(path: str, N: int, K: int, world: int) -> _Geometry:
++    global _geometry
++    if _geometry is None or _geometry.loader is None:
++        _geometry = _Geometry(path, N, K, world)
++    return _geometry
++
++
++# device index -> dict(slots, w13, w2, T, gin): made before SGLang sizes its KV
++# pool (preallocate() from the resident method's create_moe_runner), in the
++# lend's scratch so the chunk hint counts them.
++_prealloc = {}
++
++
++def preallocate(layer):
++    if STREAM_THRESHOLD <= 0:
++        return
++    from sglang.srt.server_args import get_global_server_args
++
++    args = get_global_server_args()
++    device = torch.device(f"cuda:{torch.cuda.current_device()}")
++    key = device.index
++    if key in _prealloc:
++        return
++    N, K = layer.intermediate_size_per_partition, layer.hidden_size
++    geo = _geometry_for(args.kt_weight_path, N, K, get_tensor_model_parallel_world_size())
++    G = GROUP_SIZE
++    slots = [_Slot(G, geo.strides, device) for _ in range(2)]
++    w13 = _scratch_empty((G, 2 * N, K), torch.bfloat16, device)
++    w2 = _scratch_empty((G, K, N), torch.bfloat16, device)
++    T = _chunk_rows()
++    gin = None
++    if T > 0:
++        topk, f32 = layer.top_k, torch.float32
++        gin = {
++            "x": _scratch_empty((T, K), torch.bfloat16, device, per_chunk=True),
++            "ids": _scratch_empty((T, topk), torch.int32, device, per_chunk=True),
++            "w": _scratch_empty((T, topk), f32, device, per_chunk=True),
++            "acc": _scratch_empty((T, K), torch.bfloat16, device, per_chunk=True),
++            "out": _scratch_empty((T, K), torch.bfloat16, device, per_chunk=True),
++        }
++    _prealloc[key] = {"slots": slots, "w13": w13, "w2": w2, "T": T, "gin": gin}
++    mb = (sum(geo.strides) * G * 2 + (w13.numel() + w2.numel()) * 2
++          + (sum(t.numel() * t.element_size() for t in gin.values()) if gin else 0)) / 1e6
++    _log(f"preallocated 2 slots, bf16 group buffers and inputs for {T} rows ({mb:.0f} MB) on {device} before the KV pool")
++
++
++class KTStreamPrefillGGUF:
++    """Process-wide (per rank) streaming state, shared by every MoE layer."""
++
++    def __init__(self, method, layer):
++        from flashinfer.fused_moe import cutlass_fused_moe
++        from flashinfer.fused_moe.core import ActivationType
++        from sglang.srt.environ import envs
++        from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import _activation_type
++
++        self.rank = get_tensor_model_parallel_rank()
++        self.world = get_tensor_model_parallel_world_size()
++        self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
++        self.N = layer.intermediate_size_per_partition
++        self.K = layer.hidden_size
++        self.G = GROUP_SIZE
++        self.top_k = layer.top_k
++        self.path = method.kt_config.weight_path
++        # KT_GGUF_STREAM_EP (on with more than one rank): every rank streams whole experts, a contiguous share of
++        # them, instead of a slice of every expert. A GGUF block of 256 values cannot be cut, and V4.1's
++        # intermediate 2304 split in two is 1152; the MoE output's all-reduce adds the shares as it adds slices.
++        self.ep = self.world > 1 and os.environ.get("KT_GGUF_STREAM_EP", "1") == "1"
++        if self.ep:
++            self.N = self.N * self.world
++        geo = _geometry_for(self.path, self.N, self.K, 1 if self.ep else self.world)
++        self.loader = geo.loader
++        self.E = geo.E
++        self._kt_layers = geo.layers
++        self._layer_types = geo.types
++        self._part_bytes = geo.part_bytes
++        self._strides = geo.strides
++        self._tp_size, self._tp_rank = layer.moe_tp_size, layer.moe_tp_rank
++        self._ep_size, self._ep_rank = layer.moe_ep_size, layer.moe_ep_rank
++        self.transfer_stream = torch.cuda.Stream(device=self.device)
++        self._cutlass_fused_moe = cutlass_fused_moe
++        self._activation_type = _activation_type(layer.moe_runner_config)
++        assert self._activation_type == ActivationType.Swiglu, self._activation_type
++        self._use_fused_finalize = envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
++        self._workspace = None
++        self._workspace_tokens = 0
++        self._graphs = {}
++        self._graph_use = {}
++        self._gin = {}
++        self._capture_stream = torch.cuda.Stream(device=self.device)
++        self._graph_pool = torch.cuda.graph_pool_handle()
++        # layer_idx -> pinned banks [3][E, part bytes]
++        self._banks: Dict[int, list] = {}
++        pre = _prealloc.get(self.device.index)
++        if pre is not None:
++            self.slots, self.w13_bf16, self.w2_bf16 = pre["slots"], pre["w13"], pre["w2"]
++            self._pre_T, self._pre_gin = pre["T"], pre["gin"]
++        else:
++            self.slots = [_Slot(self.G, self._strides, self.device) for _ in range(2)]
++            self.w13_bf16 = torch.empty((self.G, 2 * self.N, self.K), dtype=torch.bfloat16, device=self.device)
++            self.w2_bf16 = torch.empty((self.G, self.K, self.N), dtype=torch.bfloat16, device=self.device)
++            self._pre_T, self._pre_gin = 0, None
++        strides = self._strides
++        self.calls = 0
++        mb = (sum(strides) * self.G * 2 + (self.w13_bf16.numel() + self.w2_bf16.numel()) * 2) / 1e6
++        _log(f"rank {self.rank}: streamed GGUF prefill above {STREAM_THRESHOLD} tokens, G={self.G}, "
++             f"N={self.N} K={self.K} E={self.E}, {len(self._kt_layers)} layers, device buffers {mb:.0f} MB")
++
++    def _physical_to_logical(self, layer_idx: int) -> Optional[torch.Tensor]:
++        from sglang.srt.eplb.expert_location_dispatch import get_global_expert_location_metadata
++
++        meta = get_global_expert_location_metadata()
++        if meta is None:
++            return None
++        m = meta.physical_to_logical_map_cpu[layer_idx].to(torch.int64)
++        if torch.equal(m, torch.arange(m.numel(), dtype=torch.int64)):
++            return None
++        return m
++
++    def _bank(self, layer_idx: int):
++        """This rank's slice of every expert of the layer, pinned, physical order."""
++        b = self._banks.get(layer_idx)
++        if b is not None:
++            return b
++        t0 = time.time()
++        types, part_bytes = self._layer_types[layer_idx], self._part_bytes[layer_idx]
++        p2l = self._physical_to_logical(layer_idx)
++        E, N, K, r = self.E, self.N, self.K, self.rank
++        banks = []
++        for pi, proj in enumerate(("gate", "up", "down")):
++            data, qt = self.loader.get_undequanted_tensor_and_ggml_type(f"blk.{layer_idx}.ffn_{proj}_exps.weight")
++            blck, ts = DQ.BLOCK_INFO[types[pi]]
++            if proj != "down":
++                rowbytes = (K // blck) * ts
++                v = data.view(E, N * self.world, rowbytes)[:, N * r:N * (r + 1), :]
++            else:
++                v = data.view(E, K, (N * self.world) // blck, ts)[:, :, (N * r) // blck:(N * (r + 1)) // blck, :]
++            v = v.reshape(E, -1)
++            assert v.shape[1] == part_bytes[pi], (proj, v.shape, part_bytes[pi])
++            if p2l is not None:
++                v = v[p2l]
++            # pinned from the start (empty().pin_memory() made a pageable buffer and copied it)
++            h = torch.empty((E, part_bytes[pi]), dtype=torch.uint8, pin_memory=True)
++            h.copy_(v)
++            banks.append(h)
++            del data
++        b = self._banks[layer_idx] = banks
++        if TIMING or layer_idx == self._kt_layers[0]:
++            _log(f"rank {self.rank}: layer {layer_idx} bank {sum(part_bytes) * E / 1e9:.2f} GB pinned in {time.time() - t0:.1f} s"
++                 f" (types {types}{', placement map' if p2l is not None else ''})")
++        return b
++
++    def build_all_banks(self):
++        """Every layer's bank, KT_STREAM_BANK_THREADS (8) layers at a time: the
++        copies out of the GGUF mmap release the GIL, and one at a time ran at
++        ~0.5 GB/s (10-10)."""
++        t0 = time.time()
++        threads = int(os.environ.get("KT_STREAM_BANK_THREADS", "8"))
++        if threads > 1:
++            from concurrent.futures import ThreadPoolExecutor
++
++            with ThreadPoolExecutor(max_workers=threads) as ex:
++                list(ex.map(self._bank, self._kt_layers))
++        else:
++            for layer_idx in self._kt_layers:
++                self._bank(layer_idx)
++        gb = sum(sum(self._part_bytes[l]) * self.E for l in self._banks) / 1e9
++        _log(f"rank {self.rank}: {len(self._banks)} layer banks, {gb:.1f} GB pinned, built in {time.time() - t0:.0f} s")
++
++    # -- staging ---------------------------------------------------------------
++
++    def _stage(self, layer_idx: int, gi: int, base: int, n: int, stats):
++        banks = self._bank(layer_idx)
++        part_bytes = self._part_bytes[layer_idx]
++        slot = self.slots[gi % 2]
++        t0 = time.perf_counter()
++        with torch.cuda.stream(self.transfer_stream):
++            if slot.compute_used:
++                self.transfer_stream.wait_event(slot.compute_done)
++            for pi in range(3):
++                pb = part_bytes[pi]
++                slot.raw[pi][:n * pb].view(n, pb).copy_(banks[pi][base:base + n], non_blocking=True)
++            slot.dma_done.record(self.transfer_stream)
++        stats["dma_enq"] += time.perf_counter() - t0
++
++    # -- one group ---------------------------------------------------------------
++
++    def _group_body(self, layer, layer_idx: int, gi: int, base: int, n: int, g):
++        slot = self.slots[gi % 2]
++        types, pb = self._layer_types[layer_idx], self._part_bytes[layer_idx]
++        N, K = self.N, self.K
++        x, topk_weights, ids32, acc, out = g["x"], g["w"], g["ids"], g["acc"], g["out"]
++        # CUTLASS fc1 rows are [up; gate]
++        DQ.dequant_experts(slot.raw[1], pb[1], types[1], n, N, K, self.w13_bf16[:n, :N])
++        DQ.dequant_experts(slot.raw[0], pb[0], types[0], n, N, K, self.w13_bf16[:n, N:])
++        DQ.dequant_experts(slot.raw[2], pb[2], types[2], n, K, N, self.w2_bf16[:n])
++        local = torch.where((ids32 >= base) & (ids32 < base + n), ids32 - base, torch.full_like(ids32, -1))
++        out.zero_()
++        self._cutlass_fused_moe(
++            input=x,
++            token_selected_experts=local,
++            token_final_scales=topk_weights,
++            fc1_expert_weights=self.w13_bf16[:n],
++            fc2_expert_weights=self.w2_bf16[:n],
++            output_dtype=torch.bfloat16,
++            quant_scales=None,
++            input_sf=None,
++            tp_size=self._tp_size,
++            tp_rank=self._tp_rank,
++            ep_size=self._ep_size,
++            ep_rank=self._ep_rank,
++            activation_type=self._activation_type,
++            tune_max_num_tokens=self._tune_tokens,
++            output=out,
++            use_fused_finalize=self._use_fused_finalize,
++            workspace_buffer=self._workspace,
++        )
++        acc.add_(out)
++
++    def _reference_check(self, method, layer_idx, x, ids, w, acc):
++        """This rank's partial output for the streamed experts from a torch
++        dequantization of the bank (bf16 weights, fp32 math) against acc."""
++        torch.cuda.current_stream(self.device).synchronize()
++        banks = self._bank(layer_idx)
++        types, part_bytes = self._layer_types[layer_idx], self._part_bytes[layer_idx]
++        N, K = self.N, self.K
++        first = 0 if getattr(method.gpu_method, "streams_hot_experts", False) else method.num_gpu_experts
++        ref = torch.zeros_like(acc, dtype=torch.float32)
++        ids64 = ids.to(torch.int64)
++        xf = x.float()
++        used = 0
++        w_g = torch.empty((1, N, K), dtype=torch.bfloat16, device=self.device)
++        w_u = torch.empty((1, N, K), dtype=torch.bfloat16, device=self.device)
++        w_d = torch.empty((1, K, N), dtype=torch.bfloat16, device=self.device)
++        for e in range(first, self.E):
++            rows, cols = torch.where(ids64 == e)
++            if rows.numel() == 0:
++                continue
++            used += 1
++            for pi, (dst, r_, c_) in enumerate(((w_g, N, K), (w_u, N, K), (w_d, K, N))):
++                raw = banks[pi][e:e + 1].to(self.device)
++                DQ.dequant_experts(raw, part_bytes[pi], types[pi], 1, r_, c_, dst)
++            h = xf[rows]
++            a = torch.nn.functional.silu(h @ w_g[0].float().t()) * (h @ w_u[0].float().t())
++            o = (a @ w_d[0].float().t()) * w[rows, cols].float().unsqueeze(1)
++            ref.index_add_(0, rows, o)
++        d = (acc.float() - ref).abs()
++        cos = torch.nn.functional.cosine_similarity(acc.float().flatten(), ref.flatten(), dim=0).item()
++        _log(f"rank{self.rank} refcheck layer{layer_idx} T={x.shape[0]} experts_used={used}: cos={cos:.5f} "
++             f"max|acc-ref|={d.max().item():.4f} mean={d.mean().item():.5f} ref_mean|.|={ref.abs().mean().item():.5f}")
++
++    # -- graphs ---------------------------------------------------------------
++
++    def _graph_inputs(self, T: int, x, physical_ids, topk_weights):
++        g = self._gin.get(T)
++        n = x.shape[0]
++        if g is None and self._pre_gin is not None and self._pre_T >= T:
++            g = {k: v[:T] for k, v in self._pre_gin.items()}
++            self._gin[T] = g
++        if g is None:
++            f32 = torch.float32
++            g = {
++                "x": torch.zeros((T, self.K), dtype=torch.bfloat16, device=self.device),
++                "ids": torch.empty((T, physical_ids.shape[1]), dtype=torch.int32, device=self.device),
++                "w": torch.empty((T, physical_ids.shape[1]), dtype=f32, device=self.device),
++                "acc": torch.zeros((T, self.K), dtype=torch.bfloat16, device=self.device),
++                "out": torch.empty((T, self.K), dtype=torch.bfloat16, device=self.device),
++            }
++            self._gin[T] = g
++        g["x"][:n].copy_(x)
++        g["ids"][:n].copy_(physical_ids)
++        g["w"][:n].copy_(topk_weights)
++        if n < T:
++            # padding rows: no expert in any group, nothing added to acc
++            g["x"][n:].zero_()
++            g["ids"][n:].fill_(-1)
++            g["w"][n:].zero_()
++        g["acc"].zero_()
++        return g
++
++    def _trim_graphs(self):
++        top = max(self._graph_use)
++        old = [t for t in self._graph_use if t != top]
++        if len(old) <= GRAPH_KEEP:
++            return
++        drop = set(old[: len(old) - GRAPH_KEEP])
++        torch.cuda.synchronize(self.device)
++        for k in [k for k in self._graphs if k[0] in drop]:
++            del self._graphs[k]
++        for t in drop:
++            del self._graph_use[t]
++            self._gin.pop(t, None)
++
++    def _graph_for(self, layer, layer_idx: int, T: int, gi: int, base: int, n: int, g):
++        key = (T, gi, n, self._layer_types[layer_idx])
++        graph = self._graphs.get(key)
++        self._graph_use.pop(T, None)
++        self._graph_use[T] = None
++        if graph is None:
++            t0 = time.perf_counter()
++            cs = self._capture_stream
++            cs.wait_stream(torch.cuda.current_stream(self.device))
++            gw = dict(g)
++            gw["acc"] = torch.zeros_like(g["acc"])
++            with torch.cuda.stream(cs):
++                self._group_body(layer, layer_idx, gi, base, n, gw)
++            cs.synchronize()
++            del gw
++            graph = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(graph, pool=self._graph_pool, stream=cs):
++                self._group_body(layer, layer_idx, gi, base, n, g)
++            torch.cuda.current_stream(self.device).wait_stream(cs)
++            self._graphs[key] = graph
++            self._trim_graphs()
++            if TIMING and gi == 0:
++                _log(f"rank{self.rank} captured group graph T={T} gi={gi} n={n} types={key[3]} in {(time.perf_counter()-t0)*1e3:.0f} ms")
++        return graph
++
++    # -- one layer ----------------------------------------------------------
++
++    def run(self, method, layer, dispatch_output, physical_ids: torch.Tensor) -> torch.Tensor:
++        """Sum of the streamed experts' outputs for this layer, [tokens, hidden]."""
++        from sglang.srt.utils.common import next_power_of_2
++
++        x = dispatch_output.hidden_states
++        rows = x.shape[0]
++        T = rows
++        if ROW_STEP > 0 and self._pre_T > 0 and rows < self._pre_T and not getattr(self, "accumulates_into", False):
++            T = min(self._pre_T, -(-rows // ROW_STEP) * ROW_STEP)
++        layer_idx = method.kt_config.layer_idx
++        self._tune_tokens = next_power_of_2(T)
++        if self._workspace is None or self._workspace_tokens < T:
++            from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
++            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
++                _workspace_max_tokens,
++                get_shared_cutlass_workspace,
++                preallocate_shared_cutlass_workspace,
++            )
++
++            T_ws = _workspace_max_tokens(T)
++            nbytes = cutlass_fused_moe_workspace_size(
++                T_ws, self.K, self.N, self.G, physical_ids.shape[1],
++                x_dtype=torch.bfloat16, weight_dtype=torch.bfloat16, output_dtype=torch.bfloat16,
++                activation_type=self._activation_type,
++                tp_size=self._tp_size, tp_rank=self._tp_rank, ep_size=self._ep_size, ep_rank=self._ep_rank,
++                use_fused_finalize=self._use_fused_finalize, device=x.device)
++            self._workspace = get_shared_cutlass_workspace(nbytes, x.device)
++            if self._workspace is None:
++                with _scratch_region():
++                    self._workspace = preallocate_shared_cutlass_workspace(nbytes, x.device)
++            self._workspace_tokens = T_ws
++            _log(f"rank{self.rank} cutlass workspace {nbytes/1e6:.0f} MB for {T_ws} tokens x {self.G} experts")
++        topk_weights = dispatch_output.topk_output.topk_weights
++        first = 0 if getattr(method.gpu_method, "streams_hot_experts", False) else method.num_gpu_experts
++        if hasattr(self, "_groups"):
++            groups = self._groups(method)  # the NVMe edition: under KT_GGUF_STREAM_EP, this rank's share
++        else:
++            groups = [(b, min(self.G, self.E - b)) for b in range(first, self.E, self.G)]
++        stats = {"dma_enq": 0.0, "graph_enq": 0.0}
++        t0 = time.perf_counter()
++        self._bank(layer_idx)
++        t_a = time.perf_counter()
++        g = self._graph_inputs(T, x, physical_ids, topk_weights)
++        t_b = time.perf_counter()
++        cur = torch.cuda.current_stream(self.device)
++        self._stage(layer_idx, 0, groups[0][0], groups[0][1], stats)
++        t_c = time.perf_counter()
++        for gi, (base, n) in enumerate(groups):
++            slot = self.slots[gi % 2]
++            graph = self._graph_for(layer, layer_idx, T, gi, base, n, g)
++            t1 = time.perf_counter()
++            cur.wait_event(slot.dma_done)
++            graph.replay()
++            slot.compute_done.record(cur)
++            slot.compute_used = True
++            stats["graph_enq"] += time.perf_counter() - t1
++            if gi + 1 < len(groups):
++                self._stage(layer_idx, gi + 1, groups[gi + 1][0], groups[gi + 1][1], stats)
++        self.calls += 1
++        if TIMING:
++            t_d = time.perf_counter()
++            cur.synchronize()
++            t_e = time.perf_counter()
++            _log(f"rank{self.rank} layer{layer_idx} tokens={rows}/{T} groups={len(groups)} "
++                 f"dma_enq={stats['dma_enq']*1e3:.0f}ms graph_enq={stats['graph_enq']*1e3:.0f}ms "
++                 f"total={(t_e-t0)*1e3:.0f}ms (before inputs {(t_a-t0)*1e3:.0f}, inputs {(t_b-t_a)*1e3:.0f}, "
++                 f"stage0 {(t_c-t_b)*1e3:.0f}, loop {(t_d-t_c)*1e3:.0f}, final sync {(t_e-t_d)*1e3:.0f} ms)")
++        if os.environ.get("KT_GPU_STREAM_SELFTEST") == "2" and layer_idx == self._kt_layers[0]:
++            self._reference_check(method, layer_idx, x, physical_ids, topk_weights, g["acc"][:rows])
++        return g["acc"] if rows == T else g["acc"][:rows]
++
++
++_instance: Optional[KTStreamPrefillGGUF] = None
++_failed = False
++
++
++def stream_prefill_init_early(method, layer) -> None:
++    global _instance, _failed
++    if not EARLY_INIT or STREAM_THRESHOLD <= 0 or _failed or _instance is not None:
++        return
++    t0 = time.time()
++    try:
++        _instance = KTStreamPrefillGGUF(method, layer)
++        _instance.build_all_banks()
++    except Exception:
++        _failed = True
++        _log("early init failed:\n" + traceback.format_exc())
++        raise
++    _log(f"rank {_instance.rank}: GGUF streamer built at load time in {time.time() - t0:.0f} s")
++
++
++def stream_prefill_for(method, layer, num_tokens: int) -> Optional[KTStreamPrefillGGUF]:
++    global _instance, _failed
++    if STREAM_THRESHOLD <= 0 or _failed:
++        return None
++    if num_tokens < STREAM_THRESHOLD or torch.cuda.is_current_stream_capturing():
++        return None
++    if _instance is None:
++        _log(f"rank {get_tensor_model_parallel_rank()}: first qualifying call, layer {method.kt_config.layer_idx}, tokens={num_tokens}")
++        try:
++            _instance = KTStreamPrefillGGUF(method, layer)
++        except Exception:
++            _failed = True
++            _log("init failed:\n" + traceback.format_exc())
++            raise
++    return _instance
+diff --git a/python/sglang/srt/layers/moe/kt_stream_prefill_gguf_nvme.py b/python/sglang/srt/layers/moe/kt_stream_prefill_gguf_nvme.py
+new file mode 100644
+index 00000000..ddef98c3
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/kt_stream_prefill_gguf_nvme.py
+@@ -0,0 +1,772 @@
++"""GPU-streamed prefill for GGUF CPU experts fed from the GGUF files (NVMe), for hosts whose RAM cannot hold
++the experts (the 64 GB V4.1-1017 setup: 119 GB of IQ1_M / IQ2_XXS experts, 40 GiB of them in kt-kernel's own
++RAM cache).
++
++kt_stream_prefill_gguf.py (the Flash-Next edition) cuts every layer's experts out of the GGUF mmap into a pinned
++bank once (about the whole expert bytes in RAM) and DMAs groups of G experts from it into a device slot. This
++edition keeps its banks out: a reader pool fills a ring of pinned group buffers straight from the GGUF files
++with O_DIRECT reads (no page cache: under a memory limit the page cache evicted read-ahead before use, 10-24),
++in the order the layers are called, one layer ahead; _stage DMAs from the ring buffer instead of the bank. The
++device side (two slots, dequant to bf16, FlashInfer's bf16 CUTLASS MoE, one CUDA graph per group shape) is the
++parent's; IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS, which kt_gguf_dequant.py's Triton kernels do not cover, are
++dequantized with sgl_kernel.ggml_dequantize (matches gguf-py's reference to bf16 rounding, 10-24).
++
++Rates measured with one SN5100-class NVMe and one 16 GB SM120 card: NVMe 5.2-6.3 GB/s with 4-8
++parallel sequential streams, pinned H2D 27.9 GB/s, sgl_kernel IQ1_M dequant 65 GB/s of raw bytes, bf16 GEMM 9.2
++TFLOPS: a 6144-token chunk is bound by the NVMe read of the layer's experts (~2.97 GB a layer, ~20 s a chunk),
++a 12288-token chunk by the GEMMs.
++
++Env: KT_GGUF_STREAM_SOURCE=nvme selects this edition (kt_stream_prefill.py's LLAMAFILE dispatch);
++KT_GGUF_STREAM_READERS (8) reader threads, on KT_IO_CPUS when set; KT_GGUF_STREAM_RING (6) pinned group buffers; the parent's
++KT_GPU_STREAM_PREFILL / KT_GPU_STREAM_GROUP / KT_GPU_STREAM_TIMING apply.
++"""
++import collections
++import ctypes
++import os
++import sys
++import threading
++import time
++import traceback
++from concurrent.futures import ThreadPoolExecutor
++from typing import Dict, List, Optional, Tuple
++
++import torch
++
++from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
++from sglang.srt.layers.moe import kt_gguf_dequant as DQ
++from sglang.srt.layers.moe import kt_stream_prefill_gguf as P
++
++# ggml types kt_gguf_dequant.py has no Triton kernel for: (block elements, block bytes); dequantized by sgl_kernel
++GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ1_S, GGML_IQ1_M = 16, 17, 19, 29
++SGL_TYPES = {GGML_IQ2_XXS: (256, 66), GGML_IQ2_XS: (256, 74), GGML_IQ1_S: (256, 50), GGML_IQ1_M: (256, 56)}
++for _t, _info in SGL_TYPES.items():
++    DQ.BLOCK_INFO.setdefault(_t, _info)  # _Geometry accepts them; _group_body below routes them to sgl_kernel
++
++READERS = int(os.environ.get("KT_GGUF_STREAM_READERS", "8"))
++# KT_GGUF_STREAM_MMQ=1: the experts stay in their GGUF blocks on the GPU and llama.cpp's MMQ (kt_gguf_moe_mmq,
++# int8 tiles in shared memory) multiplies them; nothing is dequantized to bf16 (no 566 MB of group buffers)
++SYNC_DMA = os.environ.get("KT_GGUF_STREAM_SYNC_DMA", "0") == "1"  # diagnostic: wait for every group's copies
++MMQ_PROFILE = int(os.environ.get("KT_GGUF_STREAM_MMQ_PROFILE", "0") or 0)  # diagnostic: time the body's pieces on this many layers
++# KT_GGUF_STREAM_DIRECT=0: buffered reads (the page cache serves repeated prefills on a host whose RAM holds the
++# experts; under a memory limit the cache evicted read-ahead before use, hence O_DIRECT by default)
++DIRECT = os.environ.get("KT_GGUF_STREAM_DIRECT", "1") == "1"
++# KT_GGUF_STREAM_TIMELINE=<layers>: events around every group's H2D and body on the first layers, read after
++# the layer (no sync inside): H2D and body totals, the wall from the first copy to the last body, the gaps
++TIMELINE = int(os.environ.get("KT_GGUF_STREAM_TIMELINE", "0") or 0)
++SWITCH_MS = float(os.environ.get("KT_GGUF_STREAM_SWITCH_MS", "1") or 0)  # Python's thread switch interval while streaming
++# KT_GGUF_STREAM_FROM_CACHE=1: experts resident in kt-kernel's GGUF expert cache (KT_GGUF_EXPERT_CACHE_GIB) are
++# copied from its RAM instead of read from the NVMe; under a 64 GB
++# limit the cache holds about a third of the experts and the NVMe (6.6 GB/s, 3.6 GB a layer) is the prefill's wall
++FROM_CACHE = os.environ.get("KT_GGUF_STREAM_FROM_CACHE", "1") == "1"
++MMQ_ON = os.environ.get("KT_GGUF_STREAM_MMQ", "0") == "1"
++RING = int(os.environ.get("KT_GGUF_STREAM_RING", "6"))
++ALIGN = 4096
++
++
++def _ep_weights(world: int) -> List[float]:
++    """Each rank's share of the streamed experts: KT_GGUF_STREAM_EP_WEIGHTS ("3,2"), else its GPU's SM count
++    (rank r on CUDA device r). Cards that differ in architecture as well may want the variable."""
++    spec = os.environ.get("KT_GGUF_STREAM_EP_WEIGHTS", "")
++    if spec:
++        w = [float(x) for x in spec.split(",")]
++        if len(w) == world and all(x > 0 for x in w):
++            return w
++        _log(f"KT_GGUF_STREAM_EP_WEIGHTS={spec!r} is not {world} positive numbers: by SM count")
++    return [float(torch.cuda.get_device_properties(r).multi_processor_count) for r in range(world)]
++
++
++def _pin_io_thread() -> None:
++    """Run this reader on KT_IO_CPUS ("a,b,c-d", serve.sh sets it): the CPUs every thread that reads the drive
++    shares, apart from the ones computing the experts. Unset: not pinned."""
++    spec = os.environ.get("KT_IO_CPUS", "")
++    cpus = set()
++    for part in filter(None, (p.strip() for p in spec.split(","))):
++        lo, _, hi = part.partition("-")
++        cpus.update(range(int(lo), int(hi or lo) + 1))
++    if cpus:
++        try:
++            os.sched_setaffinity(0, cpus)
++        except OSError as ex:
++            _log(f"reader affinity {spec!r} not set: {ex}")
++
++
++def _log(msg: str):
++    P._log("[nvme] " + msg)
++
++
++class _TensorMap:
++    """Expert tensors of every layer: name -> (shard path, byte offset of the data, bytes)."""
++
++    def __init__(self, path: str):
++        import glob
++
++        import gguf
++
++        self.where: Dict[str, Tuple[str, int, int]] = {}
++        files = sorted(glob.glob(os.path.join(path, "*.gguf"))) if os.path.isdir(path) else [path]
++        for f in files:
++            r = gguf.GGUFReader(f)
++            for t in r.tensors:
++                if ".ffn_" in t.name and "_exps." in t.name:
++                    self.where[t.name] = (f, int(t.data_offset), int(t.n_bytes))
++        if not self.where:
++            raise RuntimeError(f"KT_GGUF_STREAM_SOURCE=nvme: no ffn_*_exps tensors under {path}")
++        self._fds: Dict[str, int] = {}
++        self._lock = threading.Lock()
++
++    def fd(self, f: str) -> int:
++        with self._lock:
++            d = self._fds.get(f)
++            if d is None:
++                d = self._fds[f] = os.open(f, os.O_RDONLY | (os.O_DIRECT if DIRECT else 0))
++            return d
++
++
++class _RingBuf:
++    """One group's raw bytes of the three projections, pinned, with room for the O_DIRECT alignment."""
++
++    def __init__(self, strides, G: int):
++        self.buf = [torch.empty(G * st + 2 * ALIGN, dtype=torch.uint8, pin_memory=True) for st in strides]
++        self.head = [0, 0, 0]
++        self.futs = []
++        self.key = None
++        self.peeked = None  # (layer_idx, base, [pointers or None per expert]) while its cache pins are held
++
++
++def _read_into(tm: _TensorMap, f: str, off: int, nbytes: int, buf: torch.Tensor) -> int:
++    """Read [off, off + nbytes) of file f into buf with O_DIRECT (aligned superset); returns the byte in buf
++    where off lands."""
++    lo = off // ALIGN * ALIGN
++    hi = -(-(off + nbytes) // ALIGN) * ALIGN
++    n = hi - lo
++    assert n <= buf.numel(), (n, buf.numel())
++    mv = memoryview(buf.numpy())[:n]
++    fd = tm.fd(f)
++    need = off + nbytes - lo  # the aligned tail past the file's end (a shard's last tensor) is not there to read
++    got = 0
++    while got < need:
++        k = os.preadv(fd, [mv[got:]], lo + got)
++        if k <= 0:
++            raise IOError(f"short O_DIRECT read of {f} at {lo + got}: {k} (need {need}, got {got})")
++        got += k
++    return off - lo
++
++
++class _SglDequant:
++    """sgl_kernel.ggml_dequantize for the types kt_gguf_dequant.py has no Triton kernel for."""
++
++    def _dequant(self, raw: torch.Tensor, pb: int, qt: int, n: int, rows: int, cols: int, out: torch.Tensor):
++        if qt in SGL_TYPES:
++            from sgl_kernel import ggml_dequantize
++
++            blck, ts = SGL_TYPES[qt]
++            rowbytes = cols // blck * ts
++            w = raw[:n * pb].view(n * rows, rowbytes)
++            out.copy_(ggml_dequantize(w, qt, n * rows, cols, torch.bfloat16).view(n, rows, cols))
++        else:
++            DQ.dequant_experts(raw, pb, qt, n, rows, cols, out)
++
++    def _group_body(self, layer, layer_idx: int, gi: int, base: int, n: int, g):
++        slot = self.slots[gi % 2]
++        types, pb = self._layer_types[layer_idx], self._part_bytes[layer_idx]
++        N, K = self.N, self.K
++        x, topk_weights, ids32, acc, out = g["x"], g["w"], g["ids"], g["acc"], g["out"]
++        # CUTLASS fc1 rows are [up; gate]
++        self._dequant(slot.raw[1], pb[1], types[1], n, N, K, self.w13_bf16[:n, :N])
++        self._dequant(slot.raw[0], pb[0], types[0], n, N, K, self.w13_bf16[:n, N:])
++        self._dequant(slot.raw[2], pb[2], types[2], n, K, N, self.w2_bf16[:n])
++        local = torch.where((ids32 >= base) & (ids32 < base + n), ids32 - base, torch.full_like(ids32, -1))
++        out.zero_()
++        self._cutlass_fused_moe(
++            input=x,
++            token_selected_experts=local,
++            token_final_scales=topk_weights,
++            fc1_expert_weights=self.w13_bf16[:n],
++            fc2_expert_weights=self.w2_bf16[:n],
++            output_dtype=torch.bfloat16,
++            quant_scales=None,
++            input_sf=None,
++            tp_size=self._tp_size,
++            tp_rank=self._tp_rank,
++            ep_size=self._ep_size,
++            ep_rank=self._ep_rank,
++            activation_type=self._activation_type,
++            tune_max_num_tokens=self._tune_tokens,
++            output=out,
++            use_fused_finalize=self._use_fused_finalize,
++            workspace_buffer=self._workspace,
++        )
++        acc.add_(out)
++
++
++# the routes of a group go through the MMQ kernels this many at a time: the gathered rows, gate, up and down
++# (about 60 KB a route) stay the same size however long the chunk (0: a group's routes at once)
++MMQ_ROUTES = int(os.environ.get("KT_GGUF_STREAM_MMQ_ROUTES", "8192") or 0)
++# the eager MMQ body adds into the wrapper's output instead of a chunk-sized accumulator of its own
++INTO = os.environ.get("KT_GGUF_STREAM_INTO", "1") == "1"
++
++
++class _MmqGroup:
++    """The group body on raw GGUF blocks, run eagerly (no CUDA graph: the routes to a group are gathered
++    exactly, which needs their count on the host; a dozen launches a group against ~15 s a chunk is nothing):
++    gate and up as one-route MoE matmuls on the gathered rows, V4.1's SwiGLU clamp, down the same, the weighted
++    rows added back to the accumulator by token."""
++
++    def _mmq_init(self, layer):
++        from sglang.srt.layers.moe import kt_gguf_moe_mmq as MMQ
++
++        self._mmq = MMQ
++        # the slots come sorted by expert (the per-layer argsort): the extension's sorted entry skips the ids helper
++        self._mmq_sorted = hasattr(MMQ, "moe_mmq_sorted") and os.environ.get("KT_GGUF_STREAM_MMQ_SORTED", "1") == "1"
++        lim = getattr(getattr(layer, "moe_runner_config", None), "swiglu_limit", None)
++        self._mmq_limit = float(lim) if lim else None
++        # slots with room for the bytes the kernel reads past the last row (zeroed at staging)
++        self.slots = [P._Slot(self.G, [st + 512 for st in self._strides], self.device) for _ in range(2)]
++        # the dequant body's bf16 expansion (566 MB) and its CUTLASS workspace (2 GB at 16K rows) are never used
++        # here: drop the one, satisfy the parent's guard for the other
++        self.w13_bf16 = self.w2_bf16 = None
++        self._workspace, self._workspace_tokens = torch.empty(0, dtype=torch.uint8, device=self.device), 1 << 40
++        _log(f"rank {self.rank}: MMQ group body (raw GGUF blocks, eager, swiglu limit {self._mmq_limit})")
++
++    def _mmq_graph_inputs(self, T: int, x, physical_ids, topk_weights):
++        """The per-chunk-size inputs in the lend scratch: no graph holds them, so they go with the window (the
++        default pool kept 3 x 117 MB a chunk size across windows, 10-25); the scratch keeps their addresses and
++        every call rewrites their contents."""
++        t_in = time.perf_counter()
++        try:
++            return self._mmq_graph_inputs_(T, x, physical_ids, topk_weights)
++        finally:
++            self._t_inputs = time.perf_counter() - t_in
++
++    def _mmq_graph_inputs_(self, T: int, x, physical_ids, topk_weights):
++        n = x.shape[0]
++        # the body is eager and gathers its routes exactly: no padding rows, and the caller's tensors as they are
++        into = getattr(self, "_into", None)
++        acc = into
++        if acc is None:
++            acc = self._gin.get(n)
++            if acc is None:
++                # one size at a time: the scratch is mapped again at every window's start, and every size ever
++                # seen kept in it made that mapping fail under a 16 GB card with hot experts -- torch_memory_saver's
++                # resume ran out of memory and the first touch of the unmapped slot was an illegal address (10-25)
++                self._gin.clear()
++                acc = P._scratch_empty((n, self.K), torch.bfloat16, self.device)
++                self._gin[n] = acc
++            acc.zero_()
++        g = {"x": x, "ids": physical_ids if physical_ids.dtype == torch.int32 else physical_ids.to(torch.int32),
++             "w": topk_weights, "acc": acc}
++        return self._mmq_sort(g)
++
++    def _mmq_sort(self, g):
++        # the routes sorted by expert, once a layer: every group takes a slice whose bounds the host knows
++        # from one transfer here, so the group bodies enqueue without a sync each (torch.nonzero a group
++        # stalled the host until that group's DMA had landed, which serialized DMA and compute: a layer took
++        # ~900 ms for ~125 ms of kernels and ~330 ms of copies, 10-25)
++        flat = g["ids"].reshape(-1)
++        E = self.E
++        key = torch.where(flat < 0, torch.full_like(flat, E), flat)  # routes to no expert last
++        order = torch.argsort(key, stable=True)
++        counts = torch.bincount(key, minlength=E + 1)[:E]
++        bounds = torch.zeros(E + 1, dtype=torch.int64, device=flat.device)
++        torch.cumsum(counts, 0, out=bounds[1:])
++        g["mmq_order"] = order
++        g["mmq_e"] = key.index_select(0, order).to(torch.int32)
++        g["mmq_bounds32"] = bounds.to(torch.int32)
++        t_sync = time.perf_counter()
++        g["mmq_bounds"] = bounds.tolist()  # the one host sync of the layer: it also drains the layer's attention and
++        self._presync = time.perf_counter() - t_sync  # dense work enqueued before (the timeline reports the wait)
++        return g
++
++    def _mmq_group_body(self, layer, layer_idx: int, gi: int, base: int, n: int, g):
++        slot = self.slots[gi % 2]
++        bounds = g["mmq_bounds"]
++        lo, hi = bounds[base], bounds[base + n]
++        if hi == lo:
++            return
++        step = MMQ_ROUTES if MMQ_ROUTES > 0 else hi - lo
++        for blo in range(lo, hi, step):
++            self._mmq_routes(layer_idx, gi, base, n, g, slot, blo, min(hi, blo + step))
++
++    def _mmq_routes(self, layer_idx: int, gi: int, base: int, n: int, g, slot, lo: int, hi: int):
++        """Routes lo..hi of the sorted list (all of them to experts base..base+n) through gate, up and down."""
++        types, pb = self._layer_types[layer_idx], self._part_bytes[layer_idx]
++        N, K = self.N, self.K
++        x, topk_weights, ids32, acc = g["x"], g["w"], g["ids"], g["acc"]
++        T, topk = ids32.shape
++        r = g["mmq_order"][lo:hi]
++        t = torch.div(r, topk, rounding_mode="floor")
++        sidx = r - t * topk
++        e = (g["mmq_e"][lo:hi] - base).view(-1, 1)
++        prof = MMQ_PROFILE and layer_idx < MMQ_PROFILE
++        if prof:
++            ev = [torch.cuda.Event(enable_timing=True) for _ in range(7)]
++            ev[0].record()
++        xc = x.index_select(0, t)
++        if prof:
++            ev[1].record()
++        blck = lambda qt: (DQ.BLOCK_INFO.get(qt) or SGL_TYPES[qt])
++        rb = [cols // blck(types[pi])[0] * blck(types[pi])[1] for pi, cols in ((0, K), (1, K), (2, N))]
++        wg = slot.raw[0][:n * pb[0]].view(n, N, rb[0])
++        wu = slot.raw[1][:n * pb[1]].view(n, N, rb[1])
++        wd = slot.raw[2][:n * pb[2]].view(n, K, rb[2])
++        if self._mmq_sorted:
++            # the block's own bounds: each expert's range clipped to lo..hi
++            b32 = (g["mmq_bounds32"][base:base + n + 1] - lo).clamp_(0, hi - lo)
++            e1 = e.view(-1)
++            gate = self._mmq.moe_mmq_sorted(xc, wg, e1, b32, types[0], N).view(-1, N)
++            if prof:
++                ev[2].record()
++            up = self._mmq.moe_mmq_sorted(xc, wu, e1, b32, types[1], N).view(-1, N)
++        else:
++            gate = self._mmq.moe_mmq(xc, wg, e, types[0], N, False).view(-1, N)
++            if prof:
++                ev[2].record()
++            up = self._mmq.moe_mmq(xc, wu, e, types[1], N, False).view(-1, N)
++        if prof:
++            ev[3].record()
++        if self._mmq_limit is not None:
++            gate.clamp_(max=self._mmq_limit)
++            up.clamp_(-self._mmq_limit, self._mmq_limit)
++        h = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
++        if prof:
++            ev[4].record()
++        if self._mmq_sorted:
++            down = self._mmq.moe_mmq_sorted(h, wd, e1, b32, types[2], K).view(-1, K)
++        else:
++            down = self._mmq.moe_mmq(h, wd, e, types[2], K, False).view(-1, K)
++        if prof:
++            ev[5].record()
++        down.mul_(topk_weights[t, sidx].to(torch.float32).unsqueeze(1))
++        acc.index_add_(0, t, down.to(acc.dtype))
++        if prof:
++            ev[6].record()
++            ev[6].synchronize()
++            ms = [ev[i].elapsed_time(ev[i + 1]) for i in range(6)]
++            _log(f"rank {self.rank}: mmq body layer {layer_idx} group {gi}: {r.numel()} routes of {n} experts "
++                 f"(types {types}): gather {ms[0]:.2f} gate {ms[1]:.2f} up {ms[2]:.2f} silu {ms[3]:.2f} "
++                 f"down {ms[4]:.2f} scale+add {ms[5]:.2f} ms")
++
++
++class _Eager:
++    def __init__(self, fn):
++        self.fn = fn
++
++    def replay(self):
++        self.fn()
++
++
++class KTStreamPrefillGGUFBank(_SglDequant, P.KTStreamPrefillGGUF):
++    """The pinned-bank edition (experts in RAM) with the sgl_kernel dequant: KT_GGUF_STREAM_SOURCE=bank."""
++
++
++class KTStreamPrefillGGUFNVMe(_MmqGroup, _SglDequant, P.KTStreamPrefillGGUF):
++    def __init__(self, method, layer):
++        super().__init__(method, layer)
++        if MMQ_ON:
++            _MmqGroup._mmq_init(self, layer)
++        self._tl = {}
++        self._tm = _TensorMap(self.path)
++        self._pool = ThreadPoolExecutor(
++            max_workers=READERS, thread_name_prefix="kt-gguf-nvme", initializer=_pin_io_thread
++        )
++        self._peek = self._unpin = None
++        self._cache_bytes = 0
++        if FROM_CACHE:
++            try:
++                import kt_kernel.kt_kernel_ext as _ext
++
++                self._peek, self._unpin = getattr(_ext, "kt_gguf_cache_peek", None), getattr(_ext, "kt_gguf_cache_unpin", None)
++            except ImportError:
++                pass
++            if self._peek is None:
++                _log(f"rank {self.rank}: kt_kernel_ext has no kt_gguf_cache_peek: every expert read from the files")
++        # a reader's preadv ends on a Python turn: the forward's thread holds the GIL between its enqueues,
++        # and the default 5 ms turn held every read's completion that long
++        if SWITCH_MS > 0:
++            sys.setswitchinterval(SWITCH_MS / 1e3)
++        self._ring: List[_RingBuf] = [_RingBuf(self._strides, self.G) for _ in range(RING)]
++        self._free: collections.deque = collections.deque(self._ring)
++        self._ready: Dict[Tuple[int, int], _RingBuf] = {}
++        self._cv = threading.Condition()
++        self._plan: collections.deque = collections.deque()  # (layer_idx, gi, base, n) still to read
++        self._queued: set = set()  # (layer_idx, gi) planned or ready, not yet taken
++        # the layer the model called after each one last time: what to read ahead (the call order of a
++        # V4.1 prefill is not 0..39 in one pass; it is learned, not assumed)
++        self._next_after: Dict[int, int] = {}
++        self._prev_layer: Optional[int] = None
++        self._calls_logged = 0
++        self._stop = False
++        self._feeder = threading.Thread(target=self._feed, name="kt-gguf-nvme-feeder", daemon=True)
++        self._feeder.start()
++        self._bytes = 0
++        self._t_read = 0.0
++        mb = sum(st * self.G + 2 * ALIGN for st in self._strides) * RING / 1e6
++        _log(f"rank {self.rank}: experts read from the GGUF files on demand, {READERS} readers, "
++             f"ring of {RING} groups ({mb:.0f} MB pinned); no banks")
++
++    # -- the plan: groups in the order the layers are called --------------------------------------
++
++    def _groups(self, method) -> List[Tuple[int, int]]:
++        first = 0 if getattr(method.gpu_method, "streams_hot_experts", False) else method.num_gpu_experts
++        lo, hi = first, self.E
++        if self.ep:
++            # this rank's contiguous share of the experts, in whole groups, in proportion to its GPU's weight
++            n_groups = -(-(self.E - first) // self.G)
++            w = _ep_weights(self.world)
++            cut = [round(n_groups * sum(w[:r]) / sum(w)) for r in range(self.world + 1)]
++            lo = first + cut[self.rank] * self.G
++            hi = min(self.E, first + cut[self.rank + 1] * self.G)
++        return [(b, min(self.G, hi - b)) for b in range(lo, hi, self.G)]
++
++    def _plan_layer(self, layer_idx: int, groups, front: bool = False) -> None:
++        """Queue the layer's groups not already queued or ready; front: before everything else planned."""
++        with self._cv:
++            new = [(layer_idx, gi, base, n) for gi, (base, n) in enumerate(groups) if (layer_idx, gi) not in self._queued]
++            if not new:
++                return
++            self._queued.update((e[0], e[1]) for e in new)
++            if front:
++                self._plan.extendleft(reversed(new))
++            else:
++                self._plan.extend(new)
++            self._dispatch_locked()
++            self._cv.notify_all()
++
++    def _drop_others(self, layer_idx: int) -> int:
++        """Under the lock: unqueue planned groups and give back ready buffers of other layers (a read-ahead that
++        guessed the next layer wrong would otherwise hold the ring). Returns how many buffers came back."""
++        keep = collections.deque(e for e in self._plan if e[0] == layer_idx)
++        for e in self._plan:
++            if e[0] != layer_idx:
++                self._queued.discard((e[0], e[1]))
++        self._plan = keep
++        back = 0
++        for key in [k for k in self._ready if k[0] != layer_idx]:
++            rb = self._ready.pop(key)
++            self._queued.discard(key)
++            for fut in rb.futs:
++                fut.cancel()
++            rb.key, rb.futs = None, []
++            self._free.append(rb)
++            back += 1
++        if back:
++            self._cv.notify_all()
++        return back
++
++    def _dispatch_locked(self) -> int:
++        """Under the lock: every planned group a free ring buffer can take gets its three reads submitted.
++        Called by whoever holds the lock (the forward's thread at a give-back or a plan, the feeder otherwise):
++        a feeder thread alone dispatched one group per GIL turn while the forward's thread enqueued flat out,
++        ~5 ms a group, and the readers sat idle 90% of a layer (10-25)."""
++        n_disp = 0
++        while not self._stop and self._plan and self._free:
++            layer_idx, gi, base, n = self._plan.popleft()
++            rb = self._free.popleft()
++            rb.key = (layer_idx, gi)
++            rb.futs = []
++            rb.peeked = None
++            if self._peek is not None:
++                ptrs = [self._peek(layer_idx, base + j) for j in range(n)]
++                if any(p_ is not None for p_ in ptrs):
++                    rb.peeked = (layer_idx, base, ptrs)
++            for pi, proj in enumerate(("gate", "up", "down")):
++                f, off, _ = self._tm.where[f"blk.{layer_idx}.ffn_{proj}_exps.weight"]
++                pb = self._part_bytes[layer_idx][pi]
++                if rb.peeked is None:
++                    rb.futs.append(self._pool.submit(self._read_one, rb, pi, f, off + base * pb, n * pb))
++                else:
++                    rb.futs.append(self._pool.submit(self._read_mixed, rb, pi, f, off + base * pb, pb, n, rb.peeked[2]))
++            old = self._ready.get(rb.key)
++            if old is not None:
++                # the same group planned twice: the earlier buffer would be lost with its reads
++                _log(f"group {rb.key} read twice; the first copy goes back")
++                self._free.append(old)
++            self._ready[rb.key] = rb
++            n_disp += 1
++        if n_disp:
++            self._cv.notify_all()
++        return n_disp
++
++    def _feed(self) -> None:
++        """Dispatches whenever a plan and a free buffer meet and no one else did it."""
++        while not self._stop:
++            with self._cv:
++                while not self._stop and (not self._plan or not self._free):
++                    self._cv.wait()
++                if self._stop:
++                    return
++                self._dispatch_locked()
++
++    def _read_mixed(self, rb: _RingBuf, pi: int, f: str, off: int, pb: int, n: int, ptrs) -> None:
++        """The group's projection pi: runs of experts absent from the cache read from the file (aligned, into
++        their place), the resident ones copied from the cache's RAM."""
++        t0 = time.perf_counter()
++        buf = rb.buf[pi]
++        lo = off // ALIGN * ALIGN
++        rb.head[pi] = off - lo
++        j = 0
++        while j < n:
++            if ptrs[j] is not None:
++                j += 1
++                continue
++            j0 = j
++            while j < n and ptrs[j] is None:
++                j += 1
++            r_off = off + j0 * pb
++            r_lo = r_off // ALIGN * ALIGN
++            _read_into(self._tm, f, r_off, (j - j0) * pb, buf[r_lo - lo:])
++            self._bytes += (j - j0) * pb
++        base_ptr = buf.data_ptr() + (off - lo)
++        for j, p_ in enumerate(ptrs):
++            if p_ is not None:
++                ctypes.memmove(base_ptr + j * pb, p_[pi], pb)
++                self._cache_bytes += pb
++        self._t_read += time.perf_counter() - t0
++
++    def _read_one(self, rb: _RingBuf, pi: int, f: str, off: int, nbytes: int) -> None:
++        t0 = time.perf_counter()
++        rb.head[pi] = _read_into(self._tm, f, off, nbytes, rb.buf[pi])
++        self._t_read += time.perf_counter() - t0
++        self._bytes += nbytes
++
++    def _take(self, layer_idx: int, gi: int) -> _RingBuf:
++        with self._cv:
++            waited = 0.0
++            while (layer_idx, gi) not in self._ready:
++                if not self._free and all(k[0] != layer_idx for k in self._ready):
++                    # the ring is full of another layer's groups (a wrong read-ahead): they go back
++                    back = self._drop_others(layer_idx)
++                    _log(f"group ({layer_idx}, {gi}) wanted, the ring held other layers' groups: {back} given back")
++                if not self._cv.wait(timeout=30.0):
++                    waited += 30.0
++                    _log(f"waiting {waited:.0f} s for group ({layer_idx}, {gi}): ready {sorted(self._ready)}, "
++                         f"free {len(self._free)}, plan head {list(self._plan)[:3]} ({len(self._plan)} queued)")
++            rb = self._ready.pop((layer_idx, gi))
++            self._queued.discard((layer_idx, gi))
++        for fut in rb.futs:
++            fut.result()
++        if rb.peeked is not None:
++            layer_idx, base, ptrs = rb.peeked
++            for j, p_ in enumerate(ptrs):
++                if p_ is not None:
++                    self._unpin(layer_idx, base + j)
++            rb.peeked = None
++        return rb
++
++    def _graph_inputs(self, T: int, x, physical_ids, topk_weights):
++        if MMQ_ON:
++            return self._mmq_graph_inputs(T, x, physical_ids, topk_weights)
++        return super()._graph_inputs(T, x, physical_ids, topk_weights)
++
++    def _graph_for(self, layer, layer_idx: int, T: int, gi: int, base: int, n: int, g):
++        if MMQ_ON:
++            if TIMELINE and layer_idx < TIMELINE:
++                def body():
++                    a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++                    a.record()
++                    self._mmq_group_body(layer, layer_idx, gi, base, n, g)
++                    b.record()
++                    self._tl.setdefault(gi, {})["body"] = (a, b)
++                return _Eager(body)
++            return _Eager(lambda: self._mmq_group_body(layer, layer_idx, gi, base, n, g))
++        return super()._graph_for(layer, layer_idx, T, gi, base, n, g)
++
++    def _reference_check(self, method, layer_idx, x, ids, w, acc):
++        """KT_GPU_STREAM_SELFTEST=2 without banks: the used experts' bytes read from the GGUF, dequantized on the
++        device, V4.1's SwiGLU clamp applied (the CPU path's semantics), fp32 math, against acc."""
++        import numpy as np
++
++        torch.cuda.current_stream(self.device).synchronize()
++        types, part_bytes = self._layer_types[layer_idx], self._part_bytes[layer_idx]
++        N, K = self.N, self.K
++        first = 0 if getattr(method.gpu_method, "streams_hot_experts", False) else method.num_gpu_experts
++        lim = getattr(getattr(self, "_mmq_limit", None), "real", None)
++        if lim is None:
++            l = getattr(getattr(method, "moe_runner_config", None), "swiglu_limit", None) if hasattr(method, "moe_runner_config") else None
++            lim = float(l) if l else 10.0
++        ref = torch.zeros_like(acc, dtype=torch.float32)
++        ids64 = ids.to(torch.int64)
++        xf = x.float()
++        used = 0
++        bufs = [torch.empty((1, N, K), dtype=torch.bfloat16, device=self.device),
++                torch.empty((1, N, K), dtype=torch.bfloat16, device=self.device),
++                torch.empty((1, K, N), dtype=torch.bfloat16, device=self.device)]
++        for e in range(first, self.E):
++            rows, cols = torch.where(ids64 == e)
++            if rows.numel() == 0:
++                continue
++            used += 1
++            for pi, proj in enumerate(("gate", "up", "down")):
++                f, off, _ = self._tm.where[f"blk.{layer_idx}.ffn_{proj}_exps.weight"]
++                pb = part_bytes[pi]
++                buf = np.empty(pb, dtype=np.uint8)
++                fd = os.open(f, os.O_RDONLY)
++                got = 0
++                while got < pb:
++                    k = os.preadv(fd, [memoryview(buf)[got:]], off + e * pb + got)
++                    got += k
++                os.close(fd)
++                raw = torch.from_numpy(buf).to(self.device)
++                r_, c_ = (N, K) if pi < 2 else (K, N)
++                self._dequant(raw, pb, types[pi], 1, r_, c_, bufs[pi])
++            h = xf[rows]
++            gate = (h @ bufs[0][0].float().t()).clamp(max=lim)
++            up = (h @ bufs[1][0].float().t()).clamp(-lim, lim)
++            a = torch.nn.functional.silu(gate) * up
++            o = (a @ bufs[2][0].float().t()) * w[rows, cols].float().unsqueeze(1)
++            ref.index_add_(0, rows, o)
++        d = (acc.float() - ref).abs()
++        cos = torch.nn.functional.cosine_similarity(acc.float().flatten(), ref.flatten(), dim=0).item()
++        _log(f"rank{self.rank} refcheck layer{layer_idx} T={x.shape[0]} experts_used={used} (swiglu limit {lim}): cos={cos:.5f} "
++             f"max|acc-ref|={d.max().item():.4f} mean={d.mean().item():.5f} ref_mean|.|={ref.abs().mean().item():.5f}")
++
++    def _give_back(self, rb: _RingBuf) -> None:
++        rb.key, rb.futs = None, []
++        with self._cv:
++            self._free.append(rb)
++            self._dispatch_locked()
++            self._cv.notify_all()
++
++    # -- the parent's bank API, served from the ring ----------------------------------------------
++
++    def _bank(self, layer_idx: int):
++        return None
++
++    def build_all_banks(self):
++        _log(f"rank {self.rank}: nothing to build (experts stream from the files)")
++
++    def _stage(self, layer_idx: int, gi: int, base: int, n: int, stats):
++        part_bytes = self._part_bytes[layer_idx]
++        slot = self.slots[gi % 2]
++        t0 = time.perf_counter()
++        rb = self._take(layer_idx, gi)
++        stats["read_wait"] = stats.get("read_wait", 0.0) + time.perf_counter() - t0
++        with torch.cuda.stream(self.transfer_stream):
++            if slot.compute_used:
++                self.transfer_stream.wait_event(slot.compute_done)
++            if TIMELINE and layer_idx < TIMELINE:
++                a = torch.cuda.Event(enable_timing=True)
++                a.record(self.transfer_stream)
++                b = torch.cuda.Event(enable_timing=True)
++                self._tl.setdefault(gi, {})["h2d"] = (a, b)
++                self._tl[gi]["read_wait"] = time.perf_counter() - t0
++            for pi in range(3):
++                pb, h = part_bytes[pi], rb.head[pi]
++                slot.raw[pi][:n * pb].view(n, pb).copy_(rb.buf[pi][h:h + n * pb].view(n, pb), non_blocking=True)
++                if MMQ_ON:  # the bytes the MMQ kernel reads past the last row: zero (a stale float scale is a NaN)
++                    slot.raw[pi][n * pb:n * pb + 512].zero_()
++            slot.dma_done.record(self.transfer_stream)
++            if TIMELINE and layer_idx < TIMELINE:
++                self._tl[gi]["h2d"][1].record(self.transfer_stream)
++        if SYNC_DMA:
++            slot.dma_done.synchronize()  # KT_GGUF_STREAM_SYNC_DMA=1: a faulting copy is reported here
++        # the buffer goes back once its DMA is done: the previous group's DMA on the other slot is older
++        prev = getattr(self, "_staged", None)
++        self._staged = (rb, slot)
++        if prev is not None:
++            prev[1].dma_done.synchronize()
++            self._give_back(prev[0])
++        stats["dma_enq"] += time.perf_counter() - t0
++
++    def _flush_staged(self) -> None:
++        prev = getattr(self, "_staged", None)
++        if prev is not None:
++            prev[1].dma_done.synchronize()
++            self._give_back(prev[0])
++            self._staged = None
++        tl = getattr(self, "_tl", None)
++        if tl:
++            torch.cuda.synchronize(self.device)
++            gis = sorted(tl)
++            first = tl[gis[0]]["h2d"][0]
++            h2d = sum(tl[g]["h2d"][0].elapsed_time(tl[g]["h2d"][1]) for g in gis if "h2d" in tl[g])
++            body = sum(tl[g]["body"][0].elapsed_time(tl[g]["body"][1]) for g in gis if "body" in tl[g])
++            last = max((tl[g]["body"][1] for g in gis if "body" in tl[g]), key=lambda e: first.elapsed_time(e))
++            wall = first.elapsed_time(last)
++            rw = sum(tl[g].get("read_wait", 0.0) for g in gis) * 1e3
++            # the gap before each body: from its H2D's end to its start
++            gaps = [tl[g]["h2d"][1].elapsed_time(tl[g]["body"][0]) for g in gis if "h2d" in tl[g] and "body" in tl[g]]
++            _log(f"rank {self.rank}: timeline {len(gis)} groups: inputs {getattr(self, '_t_inputs', 0.0) * 1e3:.0f} ms host "
++                 f"(of it the sync {getattr(self, '_presync', 0.0) * 1e3:.0f}), since the layer's call {(time.perf_counter() - self._t_call) * 1e3:.0f} ms, "
++                 f"H2D {h2d:.0f} ms, bodies {body:.0f} ms, wall first copy -> last body "
++                 f"{wall:.0f} ms, host read waits {rw:.0f} ms, H2D-end -> body-start gaps mean {sum(gaps) / max(1, len(gaps)):.1f} max {max(gaps) if gaps else 0:.1f} ms")
++            self._tl = {}
++
++    # -- one layer: plan this layer and the next, then the parent's loop -------------------------------
++
++    @property
++    def accumulates_into(self) -> bool:
++        """run(..., into=output) adds this rank's streamed experts into output and returns it."""
++        return MMQ_ON and INTO
++
++    def run(self, method, layer, dispatch_output, physical_ids: torch.Tensor, into=None) -> torch.Tensor:
++        self._into = into if self.accumulates_into else None
++        layer_idx = method.kt_config.layer_idx
++        groups = self._groups(method)
++        if self._prev_layer is not None:
++            self._next_after[self._prev_layer] = layer_idx
++        self._prev_layer = layer_idx
++        self._plan_layer(layer_idx, groups, front=True)
++        # read ahead the layer that followed this one last time (none known on the first pass)
++        nxt = self._next_after.get(layer_idx)
++        t0 = time.perf_counter()
++        self._t_call = t0
++        b0, r0, c0 = self._bytes, self._t_read, self._cache_bytes
++        try:
++            acc = super().run(method, layer, dispatch_output, physical_ids)
++        finally:
++            self._into = None
++            self._flush_staged()
++        if nxt is not None:
++            self._plan_layer(nxt, groups)
++        if P.TIMING:
++            torch.cuda.current_stream(self.device).synchronize()
++            dt = time.perf_counter() - t0
++            _log(f"rank{self.rank} layer{layer_idx} {(self._bytes - b0) / 1e9:.2f} GB read "
++                 f"({(self._bytes - b0) / max(1e-6, dt) / 1e9:.1f} GB/s of wall), {(self._cache_bytes - c0) / 1e9:.2f} GB from the cache, "
++                 f"reader time {self._t_read - r0:.1f} s over {READERS} threads, wall {dt:.2f} s")
++        return acc
++
++
++EDITION = os.environ.get("KT_GGUF_STREAM_SOURCE", "nvme")
++_CLASS = KTStreamPrefillGGUFBank if EDITION == "bank" else KTStreamPrefillGGUFNVMe
++_instance = None
++_failed = False
++
++
++def stream_prefill_init_early(method, layer) -> None:
++    global _instance, _failed
++    if not P.EARLY_INIT or P.STREAM_THRESHOLD <= 0 or _failed or _instance is not None:
++        return
++    try:
++        _instance = _CLASS(method, layer)
++        if EDITION == "bank":
++            _instance.build_all_banks()
++    except Exception:
++        _failed = True
++        _log("early init failed:\n" + traceback.format_exc())
++        raise
++
++
++def stream_prefill_for(method, layer, num_tokens: int):
++    global _instance, _failed
++    if P.STREAM_THRESHOLD <= 0 or _failed:
++        return None
++    if _instance is not None and getattr(_instance, "_calls_logged", 120) < 120:
++        # the first calls' order and widths, to see how a prefill walks the layers (KT_GPU_STREAM_TIMING)
++        _instance._calls_logged += 1
++        if P.TIMING:
++            _log(f"call layer {method.kt_config.layer_idx} rows {num_tokens}"
++                 f"{'' if num_tokens >= P.STREAM_THRESHOLD else ' (below the threshold, CPU)'}")
++    if num_tokens < P.STREAM_THRESHOLD or torch.cuda.is_current_stream_capturing():
++        return None
++    if _instance is None:
++        _log(f"rank {get_tensor_model_parallel_rank()}: first qualifying call, layer {method.kt_config.layer_idx}, "
++             f"tokens={num_tokens}")
++        try:
++            _instance = _CLASS(method, layer)
++        except Exception:
++            _failed = True
++            _log("init failed:\n" + traceback.format_exc())
++            raise
++    return _instance
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index a27e0aea..15c4c443 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -1924,6 +1924,9 @@ class ModelRunner:
+             from sglang.srt.layers import lazy_rope_table
+ 
+             lazy_rope_table.ensure(forward_batch)
++            from sglang.srt.layers.moe import kt_hot_cache
++
++            kt_hot_cache.before_forward(forward_batch)
+             output = self._forward_raw(forward_batch, pp_proxy_tensors)
+             if self.enable_elastic_ep:
+                 output = self._maybe_rebalance_after_rank_fault(

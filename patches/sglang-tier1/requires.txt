@@ -10,3 +10,4 @@ expert-cache: loading placement prefill-lend stream-prefill kv-vmm kv-lend-plan 
 hicache: kv-vmm prefill-lend kv-lend-plan
 rope-tables: wo-a-fp8 vision-on-demand kv-vmm prefill-lend
 embed-on-host: wo-a-fp8 vision-on-demand kv-vmm prefill-lend rope-tables
+gguf-lend: wo-a-fp8 vision-on-demand loading placement kv-vmm prefill-lend stream-prefill kv-lend-plan hot-lend stream-mmq cpu-gpu-overlap expert-cache rope-tables

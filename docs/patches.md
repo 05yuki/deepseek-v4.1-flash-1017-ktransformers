@@ -5,7 +5,8 @@
 | tier | file | applies to |
 |---|---|---|
 | 0 | `patches/sglang-tier0/NN-*.patch` | sgl-project/sglang main at `58484246`, one concern each |
-| 1 | `patches/sglang-tier1/NN-*.patch` | the same, after tier 0: one patch per feature ([tier1.md](tier1.md)) |
+| 0.5 | `patches/sglang-tier0.5/01-gguf.patch` | the same, after tier 0, at every tier: the GGUF format ([gguf.md](gguf.md)) |
+| 1 | `patches/sglang-tier1/NN-*.patch` | the same, after tiers 0 and 0.5: one patch per feature ([tier1.md](tier1.md)) |
 | 2 | `patches/sglang-tier2-no-p2p.patch` | the same, after tier 1 |
 | 1 | `patches/kt-kernel-tree.patch` | kvcache-ai/ktransformers `95009ea` (below tier 1 it is built as pinned) |
 | 1 | `patches/kt-kernel-llama-cpp.patch` | ktransformers' `third_party/llama.cpp` submodule |
@@ -13,12 +14,17 @@
 | 1 | `patches/llama-mmq.patch` | 33 files of llama.cpp `23b0202`, for the `stream-mmq` feature (`lib/llama-mmq.sh` fetches them and checks them against `patches/llama-mmq.sha256`) |
 | 1 | `patches/kt-kernel-cpu-handoff.patch` | after the tree patch, with the `cpu-gpu-overlap` feature |
 | 1 | `patches/kt-kernel-expert-cache.patch` | after the tree patch, with the `expert-cache` feature |
+| 1 | `patches/kt-kernel-gguf.patch`, `patches/kt-llamafile-iq2xs.patch` | after the tree patch (and the two above): kt-kernel's LLAMAFILE backend for a GGUF pack's experts |
 | - | `patches/sglang-dsv4-o-fp8-qdq.py`, `patches/dsv4_o_fp8_qdq.py` | another SGLang tree, on their own (tier 0 already has them) |
 | - | `patches/sglang-optional/NN-*.patch` | the full stack, by hand; `setup.sh` never applies them (below) |
 
 - **Tier 0** is what DeepSeek-V4.1-Flash-1017 needs to run correctly on the KTransformers
   hybrid MoE, on any GPU, and nothing else. KTransformers `95009ea` needs no change for it: its AVX2
   MXFP4 experts, the SwiGLU clamp and the loader are there.
+- **Tier 0.5** is the GGUF format on tier 0 ([gguf.md](gguf.md)): a GGUF pack's dense weights, its
+  hot experts on the GPU, its dequantizers and SM75. It goes in at every tier, and nothing in it runs
+  for the MXFP4 checkpoint. Serving a GGUF pack needs tier 1 (kt-kernel's GGUF backend and the
+  `gguf-lend` feature).
 - **Tier 1** is speed and memory on any GPU this SGLang runs DeepSeek-V4 on; the streamed
   prefill computes through FlashInfer's bf16 CUTLASS MoE (SM89 or newer). It needs the
   kt-kernel patch (shared expert memory). `serve.sh` turns its features on from tier 1.
