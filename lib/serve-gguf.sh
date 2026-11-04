@@ -494,7 +494,16 @@ done
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-$(IFS=';'; echo "${arch_list[*]}")+PTX}"
 export FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-${arch_a_list[*]}}"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+# no toolkit on this machine: the one setup.sh assembled from NVIDIA's wheels (build/cuda-home)
+if [[ -x "$here/build/cuda-home/bin/nvcc" ]]; then
+  source "$here/lib/cuda-home.sh"
+  [[ -z "$(cuda_home_unusable "$CUDA_HOME")" ]] || export CUDA_HOME="$here/build/cuda-home"
+fi
 export PATH="$CUDA_HOME/bin:$venv/bin:$PATH"
+# setup.sh with PREBUILT=: kt-kernel's hwloc comes from prebuilt/lib
+if [[ -d "$here/prebuilt/lib" ]]; then
+  export LD_LIBRARY_PATH="$here/prebuilt/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 # compiled-kernel caches kept in this checkout: another checkout's torch builds
 # do not match, and two of them sharing a directory wait on each other's locks
 export SGLANG_CACHE_DIR="${SGLANG_CACHE_DIR:-$here/.cache/sglang}"
