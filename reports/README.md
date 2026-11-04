@@ -6,6 +6,8 @@ A checkout with local changes writes `-dirty` after the tag, and such a report i
 
 | tag | machine | answer | tool calls | NLL minus reference | 35K prompt from the cache | decode median | first 35K prefill | report |
 |---|---|---|---|---|---|---|---|---|
+| 2026-11-05-0048 | 2 × RTX 5070 Ti, 2 × EPYC 7452, Ubuntu 26.04 | pass | 4 of 4 | +0.0031 (SE 0.0034) | 1.9 s again | 52.1 tok/s | 21.2 s | [report](2026-11-05-0048/rtx5070ti-x2-epyc7452-u2604.md) |
+| 2026-11-05-0048 | 1 × RTX 5070 Ti, 2 × EPYC 7452, Ubuntu 26.04 | pass | 4 of 4 | -0.0007 (SE 0.0046) | 2.0 s again | 38.2 tok/s | 29.0 s | [report](2026-11-05-0048/rtx5070ti-x1-epyc7452-u2604.md) |
 | 2026-11-04-1912 | 2 × RTX 5070 Ti, 2 × EPYC 7452, Ubuntu 26.04 | pass | 4 of 4 | +0.0028 (SE 0.0045) | 1.9 s again | 53.8 tok/s | 21.2 s | [report](2026-11-04-1912/rtx5070ti-x2-epyc7452-u2604.md) |
 | 2026-11-04-1912 | 1 × RTX 5070 Ti, 2 × EPYC 7452, Ubuntu 26.04 | pass | 4 of 4 | -0.0039 (SE 0.0048) | 2.0 s again | 37.9 tok/s | 29.0 s | [report](2026-11-04-1912/rtx5070ti-x1-epyc7452-u2604.md) |
 | 2026-11-04-1106 | 2 × RTX 5070 Ti, 2 × EPYC 7452, Ubuntu 26.04 | pass | 4 of 4 | +0.0014 (SE 0.0045) | 1.9 s again | 53.9 tok/s | 22.6 s | [report](2026-11-04-1106/rtx5070ti-x2-epyc7452-u2604.md) |
