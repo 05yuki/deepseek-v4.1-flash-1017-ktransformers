@@ -61,7 +61,7 @@ The GGUF has no vision tower, so the model is served as text only.
 - **Disk:** NVMe, about 260 GB for IQ2_XXS (138 GB of shards and the 111 GB Engram file).
   The engram rows, the experts RAM does not hold and the prefill's experts are read from it.
 - **Software:** what the MXFP4 checkpoint needs ([requirements.md](requirements.md)), with a CUDA toolkit: `setup.sh` builds the GGUF kernels for the GPU it runs on.
-  The prebuilt archive has no GGUF pieces.
+  The prebuilt archive's kt-kernel has the GGUF backend; the GGUF CUDA kernels are not in it, so `GGUF=<dir> ./setup.sh` builds them.
 - **Host settings:** `vm.min_free_kbytes = 8388608` and swap off.
 
 `GGUF=<dir> ./setup.sh` also writes `state/gguf-<dir name>/`:
