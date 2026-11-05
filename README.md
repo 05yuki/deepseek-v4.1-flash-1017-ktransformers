@@ -26,6 +26,8 @@ The SGLang patches are the commits of branch `dsv41-1017-main` of
 a commit ([docs/patches.md](docs/patches.md)).
 A patch that SGLang merges is dropped at the next move.
 
+## Quick start
+
 ```
 hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir /models/dsv41-1017
 MODEL=/models/dsv41-1017 ./setup.sh
@@ -38,42 +40,45 @@ Or all of it in one command:
 ./run.sh
 ```
 
-`run.sh` runs `setup.sh`, downloads the checkpoint into `./models/` when it is not there, and starts `serve.sh`.
-`MODEL=<dir>` uses a checkpoint already downloaded.
-It remembers the directory in `state/run.env`, so the next `./run.sh` only starts the server.
-
-`MODEL=/models/dsv41-1017 tools/check.sh` starts the server once, sends one short request,
-checks that an answer comes back, and stops the server: the one command that says a setup works.
-
-`MODEL=<dir> tools/qualify.sh` checks a machine end to end and writes one Markdown report.
-It takes about 15 minutes after the server is up ([docs/qualification.md](docs/qualification.md)).
-Reports are filed by tag in [reports/](reports/README.md), and one from another GPU or CPU is welcome.
+- `run.sh` runs `setup.sh`, downloads the checkpoint into `./models/` when it is not there, and starts `serve.sh`.
+  `MODEL=<dir>` uses a checkpoint already downloaded.
+  The directory is remembered in `state/run.env`, so the next `./run.sh` only starts the server.
+- `MODEL=<dir> tools/check.sh` starts the server once, sends one short request, checks the answer and stops the server.
+  It is the one command that says a setup works.
+- `MODEL=<dir> tools/qualify.sh` checks a machine end to end and writes one Markdown report, in about 15 minutes
+  ([docs/qualification.md](docs/qualification.md)).
+  Reports are filed by tag in [reports/](reports/README.md); one from another GPU or CPU is welcome.
+- A prebuilt archive for each tag skips every build: `PREBUILT=<archive> ./setup.sh` ([docs/setup.md](docs/setup.md#prebuilt-pieces)).
 
 The server speaks SGLang's OpenAI-compatible API on `127.0.0.1:8080`.
-It returns tool calls and the model's thinking in their own fields, and keeps a prefix cache with a copy in host memory.
-Serving more than one request at a time and other machines: [docs/serving.md](docs/serving.md).
+Tool calls and the model's thinking come back in their own fields.
+A prefix cache keeps a copy in host memory.
+More than one request at a time, and other machines: [docs/serving.md](docs/serving.md).
 
 ## What it needs
 
 In short, from [docs/requirements.md](docs/requirements.md):
 
-- **RAM:** a 512 GB class machine, or one socket with 256 GB; 64 GB with a GGUF pack. With the MXFP4 checkpoint the server uses about 420 GiB, most of it the CPU experts.
+- **RAM:** a 512 GB class machine, or one socket with 256 GB, or 64 GB with a GGUF pack.
+  The MXFP4 checkpoint takes about 420 GiB, most of it the CPU experts.
 - **GPU:** NVIDIA SM89 (RTX 40) or newer, 16 GB a card, one or two cards.
-- **Disk:** about 500 GB on NVMe. The checkpoint is 476 GiB, and its engram rows are read from it while serving.
-- **Software:** Linux, gcc/g++, the libnuma and hwloc headers, and a CUDA 13 toolkit; without one, setup.sh fetches NVIDIA's toolkit wheels.
+- **Disk:** about 500 GB on NVMe.
+  The checkpoint is 476 GiB, and its engram rows are read from it while serving.
+- **Software:** Linux, gcc/g++, the libnuma and hwloc headers, and a CUDA 13 toolkit.
+  Without a toolkit, `setup.sh` fetches NVIDIA's toolkit wheels.
 - **Host settings,** as root: `transparent_hugepage/shmem_enabled` set to `advise`, `vm.min_free_kbytes = 8388608`, and swap off.
-
-A prebuilt archive for each tag skips every build at setup: `PREBUILT=<archive> ./setup.sh` ([docs/setup.md](docs/setup.md#prebuilt-pieces)).
 
 ## GGUF packs
 
 The same tree serves [ISTA-DASLab's GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) of the model.
-One 16 GB GPU and 64 GB of RAM are enough for it.
-`BUILD=IQ2_XXS ./run.sh` downloads the IQ2_XXS build and serves it.
-`GGUF=<dir> ./setup.sh` and `GGUF=<dir> ./serve.sh` take a build already downloaded.
-On the two-GPU machine below, the IQ2_XXS build decodes Japanese prose at 62.6 tok/s.
-On one of its GPUs under a 64 GB memory limit, it decodes Japanese prose at 25.7 tok/s and reads a 35,000-token prompt in 28 s.
-Its NLL is 0.327 above the reference, from the pack's quantization.
+
+- One 16 GB GPU and 64 GB of RAM are enough.
+- `BUILD=IQ2_XXS ./run.sh` downloads the IQ2_XXS build and serves it.
+  `GGUF=<dir> ./setup.sh` and `GGUF=<dir> ./serve.sh` take a build already downloaded.
+- Two GPUs and 512 GB: Japanese prose at 62.6 tok/s.
+- One GPU under a 64 GB memory limit: 25.7 tok/s, and a 35,000-token prompt read in 28 s.
+- Its NLL is 0.327 above the reference, from the pack's quantization.
+
 What it needs, how it runs and its results: [docs/gguf.md](docs/gguf.md).
 
 ## Results
@@ -110,25 +115,24 @@ Its mean NLL is 0.7192 on two GPUs and 0.7224 on one, against 0.7185 for the ref
 
 ## Fixes from dsv41-flash-dual-epyc
 
-Two fixes by f-wunderlich, from the earlier release's repo: `--kt-num-gpu-experts 0` starts
-with Marlin (#2, tier 0 for the MoE call and tier 1's `loading` for the loader). The SM120
-padding-page fix (#3) is no longer carried: SGLang main's sparse attention with FlashInfer
-0.7.2 runs a 48K-token prefill without it, with the same NLL.
+Two fixes by f-wunderlich came from the earlier release's repo.
+
+- `--kt-num-gpu-experts 0` starts with Marlin (#2): tier 0 for the MoE call, tier 1's `loading` for the loader.
+- The SM120 padding-page fix (#3) is no longer carried.
+  SGLang main's sparse attention with FlashInfer 0.7.2 runs a 48K-token prefill without it, with the same NLL.
 
 ## Not done
 
-- Results are on 2 × RTX 5070 Ti (SM120) with Zen 2 CPUs; SM89 was checked by a
-  contributor on one card ([docs/sm89.md](docs/sm89.md)).
-- CPUs with AVX-512 should work: the experts run on the AVX2 kernels, which those CPUs
-  also have.
-- More than two GPUs: `serve.sh` sets tensor parallelism from the GPUs it sees; not
-  tested.
-- Older NVIDIA GPUs: RTX 30 and A100 do not run; DeepSeek-V4's attention here needs SM89
-  or newer. With `SGLANG_MXFP4_MOE_FP32=0`, the MXFP4 Marlin path also needs SM90 or SM120.
+- Results are on 2 × RTX 5070 Ti (SM120) with Zen 2 CPUs.
+  SM89 was checked by a contributor on one card ([docs/sm89.md](docs/sm89.md)).
+- CPUs with AVX-512 should work: the experts run on the AVX2 kernels, which those CPUs also have.
+- More than two GPUs: `serve.sh` sets tensor parallelism from the GPUs it sees; not tested.
+- Older NVIDIA GPUs: RTX 30 and A100 do not run; DeepSeek-V4's attention here needs SM89 or newer.
+  With `SGLANG_MXFP4_MOE_FP32=0`, the MXFP4 Marlin path also needs SM90 or SM120.
 - AMD GPUs: not supported (kv-vmm and kt-kernel use CUDA).
 
 ## License
 
-Apache-2.0 (see `LICENSE`), except `engram-adapter/`, which is derived from 0xSero's
-engram adapter under the MIT License (see the headers of its files). The model weights
-are under DeepSeek's license (see the model card).
+Apache-2.0 (see `LICENSE`).
+`engram-adapter/` is derived from 0xSero's engram adapter under the MIT License (see the headers of its files).
+The model weights are under DeepSeek's license (see the model card).
