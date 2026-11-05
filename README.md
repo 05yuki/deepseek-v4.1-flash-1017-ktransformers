@@ -75,11 +75,20 @@ The same tree serves [ISTA-DASLab's GSQ-RCO GGUF](https://huggingface.co/ISTA-DA
 - One 16 GB GPU and 64 GB of RAM are enough.
 - `BUILD=IQ2_XXS ./run.sh` downloads the IQ2_XXS build and serves it.
   `GGUF=<dir> ./setup.sh` and `GGUF=<dir> ./serve.sh` take a build already downloaded.
-- Two GPUs and 512 GB: Japanese prose at 62.6 tok/s.
-- One GPU under a 64 GB memory limit: 25.7 tok/s, and a 35,000-token prompt read in 28 s.
 - Its NLL is 0.327 above the reference, from the pack's quantization.
 
-What it needs, how it runs and its results: [docs/gguf.md](docs/gguf.md).
+The IQ2_XXS build on the machine of [Results](#results); decode is Japanese prose, the median of four prompts.
+The 64 GB and 128 GB rows are one socket under a memory limit.
+
+| setup | decode | 35K prompt |
+|---|---|---|
+| two GPUs, two sockets, 512 GB | 62.6 tok/s | 34 s, 18 s the second time |
+| one GPU, one socket, 251 GiB | 43.5 tok/s | 17 s |
+| one GPU, 128 GB | 33.4 tok/s | 19 s |
+| one GPU, 64 GB | 25.7 tok/s | 28 s |
+
+An RTX 2070 8 GB with a Core i5-9600K and 64 GB decodes at 1.8 tok/s.
+Other kinds of text, the expert cache at each RAM size, and how each row was run: [docs/gguf.md](docs/gguf.md).
 
 ## Results
 
