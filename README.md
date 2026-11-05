@@ -1,28 +1,29 @@
 # DeepSeek-V4.1-Flash-1017 on SGLang + KTransformers (CPU/GPU hybrid inference)
 
-Run [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
-on one machine with a lot of RAM and ordinary GPUs, or on one socket with 256 GB
-([One socket, 256 GB](docs/results.md#one-socket-256-gb)).
-With a GGUF pack of the model, 64 GB of RAM and one 16 GB GPU are enough ([GGUF packs](#gguf-packs)).
-The 384 routed experts per layer
-run on the CPU in MXFP4 through [KTransformers](https://github.com/kvcache-ai/ktransformers)'
-kt-kernel. Attention, the hottest experts and the prefill run on the GPUs through
-[SGLang](https://github.com/sgl-project/sglang). The engram tables (about 200 GB) are
-read straight from the checkpoint on disk, with no extracted copy. The context is up
-to 1M tokens.
-The speed comes without a loss of accuracy: on 24 public-domain texts the served model scores
-within the standard error of DeepSeek's own `inference/model.py` ([Results](#results)).
-Every patch is kept only if the model's log-probabilities stay there.
+Run [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) on one machine.
 
-This repository is everything needed: patches against two public upstream commits, a
-setup script that builds them, a launcher that reads the machine it runs on, and tests.
+- 512 GB of RAM and one or two ordinary GPUs: 50.0 tok/s decode on two RTX 5070 Ti ([Results](#results)).
+- One socket with 256 GB: 20.2 tok/s ([One socket, 256 GB](docs/results.md#one-socket-256-gb)).
+- 64 GB of RAM and one 16 GB GPU, with a GGUF pack of the model ([GGUF packs](#gguf-packs)).
+- A context of up to 1M tokens.
+- The reference's accuracy: on 24 public-domain texts the served model scores within the standard
+  error of DeepSeek's own `inference/model.py`. A patch stays only while that holds.
+
+How it runs: the 384 routed experts a layer run on the CPU in MXFP4 through
+[KTransformers](https://github.com/kvcache-ai/ktransformers)' kt-kernel.
+Attention, the hottest experts and the prefill run on the GPUs through
+[SGLang](https://github.com/sgl-project/sglang).
+The engram tables (about 200 GB) are read from the checkpoint on disk, with no extracted copy.
+
+This repository is everything needed: patches against two public upstream commits, a setup
+script that builds them, a launcher that reads the machine it runs on, and tests.
 Each tag pins those commits: SGLang main at `58484246` and KTransformers `95009ea` today, with
 torch 2.14.1 on CUDA 13 wheels, FlashInfer 0.7.2 and CUDA toolkit 13.1.
-The recipe follows SGLang main.
-Every few weeks the patches move to a newer commit, are measured again, and go out under a new tag.
+The recipe follows SGLang main: every few weeks the patches move to a newer commit, are measured
+again, and go out under a new tag.
 The SGLang patches are the commits of branch `dsv41-1017-main` of
-[05yuki/sglang-upstream](https://github.com/05yuki/sglang-upstream/tree/dsv41-1017-main), exported
-one file a commit ([docs/patches.md](docs/patches.md)).
+[05yuki/sglang-upstream](https://github.com/05yuki/sglang-upstream/tree/dsv41-1017-main), one file
+a commit ([docs/patches.md](docs/patches.md)).
 A patch that SGLang merges is dropped at the next move.
 
 ```
