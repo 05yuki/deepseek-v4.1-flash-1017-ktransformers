@@ -2,8 +2,8 @@
 
 Run [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) on one machine.
 
-- 512 GB of RAM and one or two ordinary GPUs: 50.0 tok/s decode on two RTX 5070 Ti ([Results](#results)).
-- One socket with 256 GB: 20.2 tok/s ([One socket, 256 GB](docs/results.md#one-socket-256-gb)).
+- 512 GB of RAM and one or two ordinary GPUs ([Results](#results)).
+- One socket with 256 GB ([One socket, 256 GB](docs/results.md#one-socket-256-gb)).
 - 64 GB of RAM and one 16 GB GPU, with a GGUF pack of the model ([GGUF packs](#gguf-packs)).
 - A context of up to 1M tokens.
 - The reference's accuracy: on 24 public-domain texts the served model scores within the standard
