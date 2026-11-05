@@ -232,13 +232,12 @@ number here. `setup.sh` does not apply them; after it has run, one goes on by ha
 `git -C third_party/sglang apply --whitespace=nowarn patches/sglang-optional/NN-name.patch`.
 CI checks that each still applies.
 
-- `01-sm89-indexer-merge.patch`: two default-off switches scoped to SM89, `KT_IDX_LIVE_TOPK=1`
-  (the decode indexer's selection bounded by the device-side sequence lengths) and
-  `KT_SM89_FUSED_MERGE=1` (the portable attention fallback's merge and sink in one kernel).
-  Contributed in #7 by howl9003, with its parity fixtures `tools/test_live_topk.py`,
-  `tools/test_merge_sink.py` and `tools/test_fused_merge_wiring.py`
-  ([sm89-indexer-merge.md](sm89-indexer-merge.md)). It moves to tier 0 once each switch has
-  an A/B on an SM89 GPU (decode tok/s and the `tools/nll.py` check, with and without it).
+- `01-sm89-fused-merge.patch`: one default-off switch scoped to SM89, `KT_SM89_FUSED_MERGE=1`
+  (the portable attention fallback's merge and sink in one kernel). Contributed in #7 by
+  howl9003, with its parity fixtures `tools/test_merge_sink.py` and
+  `tools/test_fused_merge_wiring.py` ([sm89-fused-merge.md](sm89-fused-merge.md)). It moves to
+  tier 0 once the switch has an A/B on an SM89 GPU (decode tok/s and the `tools/nll.py` check,
+  with and without it).
 
 ## Tests
 

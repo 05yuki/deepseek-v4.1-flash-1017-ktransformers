@@ -1,0 +1,780 @@
+From 3b58675a04c4409bf3338e051d91bcdb7cfc84a6 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Thu, 5 Nov 2026 07:54:34 +0900
+Subject: [PATCH] live-topk: the decode indexer selects among the live
+ positions on SM89 and SM12x
+
+The non-paged decode indexer ran torch.topk, a sort and gathers over the graph
+capacity (1,048,580 columns at ratio 1 on a 1M pool) although only the first
+lens[b] columns are visible. live_topk.py builds the slots and selects on the
+device-side lengths, element for element equal to the torch path, so a
+captured graph stays replayable.
+
+The one-CTA selection kernels are howl9003's SM89 contribution (#7). Added here:
+rows with more than 8192 live columns (4096 candidate columns among blocks) are
+selected by one CTA per 4096 (1024) columns, with the radix histograms summed
+across the row's CTAs, so the cost stays below torch's at every length; the
+among-blocks picks are sorted by position instead of flagged over the row; and
+-inf candidates are never picked among blocks, as topk_among_blocks drops them.
+
+On by default on compute capability 8.9 and 12.x; KT_IDX_LIVE_TOPK=0 restores
+the torch path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
+---
+ .../kernels/ops/attention/dsv4/live_topk.py   | 649 ++++++++++++++++++
+ .../dsv4/v41_indexer/dense_blocks.py          |  13 +
+ .../attention/dsv4/v41_indexer/scoring.py     |  28 +-
+ 3 files changed, 685 insertions(+), 5 deletions(-)
+ create mode 100644 python/sglang/kernels/ops/attention/dsv4/live_topk.py
+
+diff --git a/python/sglang/kernels/ops/attention/dsv4/live_topk.py b/python/sglang/kernels/ops/attention/dsv4/live_topk.py
+new file mode 100644
+index 00000000..2d810651
+--- /dev/null
++++ b/python/sglang/kernels/ops/attention/dsv4/live_topk.py
+@@ -0,0 +1,649 @@
++"""Live-length top-k for the non-paged DeepSeek V4.1 decode indexer (SM89, SM12x).
++
++On by default on compute capability 8.9 and 12.x; KT_IDX_LIVE_TOPK=0 turns it off.
++The selection kernels come from howl9003's SM89 contribution (#7, 2026-10-22); the
++multi-CTA path for long rows and the among-blocks emission by sort were added here.
++
++The decode graph scores every indexer layer over the capture capacity ``L`` (1,048,580
++compressed positions at ratio 1 for a 1M pool) and then runs ``torch.topk``, ``sort``
++of the picks and a chain of gathers over all L columns, although only the first
++``lens[b]`` columns are visible and the rest are ``-inf``. These kernels do the same
++selection on the live columns only, reading the device-side lengths, so a captured
++graph stays replayable.
++
++Exactness (the output equals the torch path element for element):
++
++* torch's CUDA top-k (sbtopk and mbtopk gatherTopK) selects every element whose
++  order key is strictly above the k-th key, then the elements equal to the k-th key
++  in ascending scan order until k are taken. The order key is
++  ``TopKTypeConfig<float>::convert`` (sign-flipped bits, NaN largest), reproduced in
++  ``_ord_key``. The k-th key is found here by an MSB-first radix select over the
++  live columns; columns past ``lens`` hold -inf, which can only be selected when
++  fewer than k finite columns exist, and the torch path then maps them to -1.
++* Rows with more candidate columns than ``_SPLIT`` (``_SPLIT_BLOCKS`` among blocks)
++  are selected by CTAs of ``_CHUNK`` (``_CHUNK_BLOCKS``) columns: the radix
++  histograms are summed across the row's CTAs, then each CTA counts its keys above
++  and at the k-th, and a chunk's emission starts after the picks of the chunks
++  before it, so the picks, the tie rule and the order are those of one CTA.
++* write_decode sorts the picked positions ascending before mapping them to pool
++  slots; the emission pass below walks positions in ascending order, so its output
++  is already in that order.
++* topk_among_blocks scans candidates in the published block order (block rank,
++  then offset) and drops -inf picks: the among-blocks kernel ranks ties in that
++  flat order over the finite candidates, then sorts its at most k picks by position.
++  It reads only the first ``cdiv(lens, block_size)`` published blocks:
++  select_candidate_block_ids publishes its finite blocks first (block amax
++  descending, -1 after them), and only live blocks can be finite.
++* ``NPASS=2`` resolves the key on its top 16 bits. That is exact for the indexer's
++  scores because fp4_index_logits_decode rounds every logit through bf16 (the low
++  16 float bits are zero, so the low 16 key bits are a function of the sign).
++  ``NPASS=4`` (KT_IDX_LIVE_TOPK_FULLKEY=1) resolves all 32 bits for any fp32 input.
++"""
++
++from __future__ import annotations
++
++import functools
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++_BLOCK = 2048
++_SLOT_BLOCK = 1024
++# fp4_index_logits_decode tiles positions by 64 and loads the whole live tile.
++_LOGITS_TILE = 64
++# Rows with more candidate columns than _SPLIT use one CTA per _CHUNK columns
++# (the live positions on the full path, the published blocks' among blocks).
++_CHUNK = 4096
++_SPLIT = int(os.environ.get("KT_IDX_LIVE_TOPK_SPLIT", "8192"))
++_CHUNK_BLOCKS = 1024
++_SPLIT_BLOCKS = int(os.environ.get("KT_IDX_LIVE_TOPK_SPLIT_BLOCKS", "4096"))
++
++_ENABLED = os.environ.get("KT_IDX_LIVE_TOPK", "1") == "1"
++_NPASS = 4 if os.environ.get("KT_IDX_LIVE_TOPK_FULLKEY", "0") == "1" else 2
++
++
++@functools.lru_cache(maxsize=None)
++def _supported(device_index) -> bool:
++    major, minor = torch.cuda.get_device_capability(device_index)
++    return (major, minor) == (8, 9) or major == 12
++
++
++def live_topk_enabled(lmax: int, device: torch.device) -> bool:
++    """Static per captured graph: the switch and the GPU (the paged SM90 path and
++    the SM100 kernels have their own selection)."""
++    if not _ENABLED or device.type != "cuda" or lmax == 0:
++        return False
++    return _supported(device.index)
++
++
++@triton.jit
++def _ord_key(v):
++    # at::native::TopKTypeConfig<float>::convert
++    x = v.to(tl.uint32, bitcast=True)
++    neg = (x >> 31) != 0
++    k = tl.where(neg, x ^ 0xFFFFFFFF, x | 0x80000000)
++    return tl.where(v == v, k, tl.full(k.shape, 0xFFFFFFFF, tl.uint32))
++
++
++@triton.jit
++def _live_slots_kernel(
++    r2t_ptr,
++    req_ptr,
++    lens_ptr,
++    slots_ptr,
++    L,
++    stride_r2t,
++    stride_s,
++    ratio,
++    BLOCK: tl.constexpr,
++    TILE: tl.constexpr,
++):
++    # slots[b, j] = req_to_token[req[b], j * ratio] // ratio for j < lens[b], 0 up to the
++    # end of the last live TILE (what the logits kernel loads); nothing past it.
++    b = tl.program_id(0)
++    blk = tl.program_id(1)
++    n = tl.minimum(tl.load(lens_ptr + b).to(tl.int64), L)
++    n_round = tl.minimum((n + TILE - 1) // TILE * TILE, L)
++    offs = blk * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
++    if blk * BLOCK < n_round:
++        row = tl.load(req_ptr + b).to(tl.int64)
++        live = offs < n
++        a = tl.load(r2t_ptr + row * stride_r2t + offs * ratio, mask=live, other=0).to(tl.int64)
++        q = a // ratio
++        # torch floor_divide; a is a pool slot (>= 0), kept exact for any sign
++        q = tl.where(((a % ratio) != 0) & (a < 0), q - 1, q)
++        q = tl.where(live, q, 0)
++        tl.store(slots_ptr + b * stride_s + offs, q, mask=offs < n_round)
++
++
++@triton.jit
++def _emit_sequential(slots_ptr, out_ptr, b, n, K, stride_sl, stride_o, BLOCK: tl.constexpr):
++    # n <= K: every live position is picked; ascending, then -1.
++    offs0 = tl.arange(0, BLOCK)
++    for start in range(0, K, BLOCK):
++        j = start + offs0
++        s = tl.load(slots_ptr + b * stride_sl + j, mask=j < n, other=0)
++        v = tl.where(j < n, s.to(tl.int32), -1)
++        tl.store(out_ptr + b * stride_o + j, v, mask=j < K)
++
++
++@triton.jit
++def _live_topk_full_kernel(
++    scores_ptr,
++    slots_ptr,
++    lens_ptr,
++    out_ptr,
++    hist_ptr,
++    L,
++    K,
++    SPLIT,
++    stride_sc,
++    stride_sl,
++    stride_o,
++    NPASS: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    b = tl.program_id(0)
++    n = tl.minimum(tl.load(lens_ptr + b).to(tl.int32), L)
++    offs0 = tl.arange(0, BLOCK)
++    bins = tl.arange(0, 256)
++    if n > SPLIT:
++        # the multi-CTA kernels select this row; clear its histograms for them
++        for p in tl.static_range(NPASS):
++            tl.store(hist_ptr + (b * NPASS + p) * 256 + bins, tl.zeros([256], tl.int32))
++    elif n <= K:
++        _emit_sequential(slots_ptr, out_ptr, b, n, K, stride_sl, stride_o, BLOCK)
++    else:
++        need = K + 0 * n
++        prefix = tl.full([], 0, tl.uint32)
++        for p in tl.static_range(NPASS):
++            shift = 24 - 8 * p
++            h = tl.zeros([256], dtype=tl.int32)
++            for start in range(0, n, BLOCK):
++                j = start + offs0
++                m = j < n
++                v = tl.load(scores_ptr + b * stride_sc + j, mask=m, other=0.0)
++                key = _ord_key(v)
++                if p > 0:
++                    m = m & ((key >> (shift + 8)) == prefix)
++                d = ((key >> shift) & 0xFF).to(tl.int32)
++                h += tl.histogram(d, 256, mask=m)
++            if p == 0:
++                need = tl.minimum(need, tl.sum(h, 0))
++            c = tl.cumsum(h, 0, reverse=True)
++            dsel = tl.max(tl.where(c >= need, bins, -1), 0)
++            gt = tl.sum(tl.where(bins > dsel, h, 0), 0)
++            need = need - gt
++            prefix = (prefix << 8) | dsel.to(tl.uint32)
++        TOPSHIFT: tl.constexpr = 32 - 8 * NPASS
++        sel_carry = 0 * n
++        tie_carry = 0 * n
++        for start in range(0, n, BLOCK):
++            j = start + offs0
++            m = j < n
++            v = tl.load(scores_ptr + b * stride_sc + j, mask=m, other=0.0)
++            kp = _ord_key(v) >> TOPSHIFT
++            gtm = m & (kp > prefix)
++            eqm = m & (kp == prefix)
++            eqi = eqm.to(tl.int32)
++            rank = tie_carry + tl.cumsum(eqi, 0) - eqi
++            sel = gtm | (eqm & (rank < need))
++            seli = sel.to(tl.int32)
++            dst = sel_carry + tl.cumsum(seli, 0) - seli
++            s = tl.load(slots_ptr + b * stride_sl + j, mask=sel, other=0)
++            tl.store(out_ptr + b * stride_o + dst, s.to(tl.int32), mask=sel)
++            sel_carry += tl.sum(seli, 0)
++            tie_carry += tl.sum(eqi, 0)
++        # fewer than K finite picks cannot happen here (n > K live columns), but keep the
++        # torch layout: -1 after the picks up to K
++        for start in range(0, K, BLOCK):
++            j = start + offs0
++            tl.store(out_ptr + b * stride_o + j, tl.full([BLOCK], -1, tl.int32),
++                     mask=(j >= sel_carry) & (j < K))
++
++
++@triton.jit
++def _mc_resolve(hist_ptr, b, K, P: tl.constexpr, NPASS: tl.constexpr):
++    # the key prefix and the ties still needed after the row's first P digits
++    bins = tl.arange(0, 256)
++    need = K
++    prefix = tl.full([], 0, tl.uint32)
++    for p in tl.static_range(P):
++        h = tl.load(hist_ptr + (b * NPASS + p) * 256 + bins)
++        if p == 0:
++            need = tl.minimum(need, tl.sum(h, 0))
++        c = tl.cumsum(h, 0, reverse=True)
++        dsel = tl.max(tl.where(c >= need, bins, -1), 0)
++        need = need - tl.sum(tl.where(bins > dsel, h, 0), 0)
++        prefix = (prefix << 8) | dsel.to(tl.uint32)
++    return prefix, need
++
++
++@triton.jit
++def _mc_width(n, NB, BLOCKS: tl.constexpr, BS: tl.constexpr):
++    # the row's candidate columns: the live positions, or the published blocks' ones
++    if BLOCKS:
++        return tl.minimum(NB, (n + BS - 1) // BS) * BS
++    else:
++        return n
++
++
++@triton.jit
++def _mc_cols(scores_ptr, blocks_ptr, b, j, hi, n, stride_sc, stride_bl,
++             BLOCKS: tl.constexpr, BS: tl.constexpr):
++    # candidate columns j of the row: score, candidate mask, position
++    m = j < hi
++    if BLOCKS:
++        blk = tl.load(blocks_ptr + b * stride_bl + j // BS, mask=m, other=-1)
++        pos = blk * BS + j % BS
++        m = m & (blk >= 0) & (pos < n)
++    else:
++        pos = j
++    v = tl.load(scores_ptr + b * stride_sc + pos, mask=m, other=0.0)
++    if BLOCKS:
++        # topk_among_blocks drops -inf picks: a -inf candidate is never a pick
++        m = m & (v != float("-inf"))
++    return v, m, pos
++
++
++@triton.jit
++def _mc_hist_kernel(
++    scores_ptr,
++    blocks_ptr,
++    lens_ptr,
++    hist_ptr,
++    L,
++    K,
++    NB,
++    SPLIT,
++    stride_sc,
++    stride_bl,
++    P: tl.constexpr,
++    NPASS: tl.constexpr,
++    BLOCKS: tl.constexpr,
++    BS: tl.constexpr,
++    CHUNK: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    # digit P's histogram of the chunk, among the keys that match the first P digits
++    b = tl.program_id(0)
++    c = tl.program_id(1)
++    n = tl.minimum(tl.load(lens_ptr + b).to(tl.int32), L)
++    w = _mc_width(n, NB, BLOCKS, BS)
++    lo = c * CHUNK
++    if (w > SPLIT) & (lo < w):
++        hi = tl.minimum(lo + CHUNK, w)
++        prefix, need = _mc_resolve(hist_ptr, b, K, P, NPASS)
++        shift: tl.constexpr = 24 - 8 * P
++        offs0 = tl.arange(0, BLOCK)
++        h = tl.zeros([256], dtype=tl.int32)
++        for start in range(lo, hi, BLOCK):
++            v, m, pos = _mc_cols(scores_ptr, blocks_ptr, b, start + offs0, hi, n,
++                                 stride_sc, stride_bl, BLOCKS, BS)
++            key = _ord_key(v)
++            if P > 0:
++                m = m & ((key >> (shift + 8)) == prefix)
++            d = ((key >> shift) & 0xFF).to(tl.int32)
++            h += tl.histogram(d, 256, mask=m)
++        tl.atomic_add(hist_ptr + (b * NPASS + P) * 256 + tl.arange(0, 256), h, sem="relaxed")
++
++
++@triton.jit
++def _mc_count_kernel(
++    scores_ptr,
++    blocks_ptr,
++    lens_ptr,
++    hist_ptr,
++    cnt_ptr,
++    L,
++    K,
++    NB,
++    SPLIT,
++    stride_sc,
++    stride_bl,
++    stride_cnt,
++    NPASS: tl.constexpr,
++    BLOCKS: tl.constexpr,
++    BS: tl.constexpr,
++    CHUNK: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    # the chunk's keys above the k-th key and equal to it
++    b = tl.program_id(0)
++    c = tl.program_id(1)
++    n = tl.minimum(tl.load(lens_ptr + b).to(tl.int32), L)
++    w = _mc_width(n, NB, BLOCKS, BS)
++    lo = c * CHUNK
++    if (w > SPLIT) & (lo < w):
++        hi = tl.minimum(lo + CHUNK, w)
++        prefix, need = _mc_resolve(hist_ptr, b, K, NPASS, NPASS)
++        TOPSHIFT: tl.constexpr = 32 - 8 * NPASS
++        offs0 = tl.arange(0, BLOCK)
++        gt = 0 * n
++        eq = 0 * n
++        for start in range(lo, hi, BLOCK):
++            v, m, pos = _mc_cols(scores_ptr, blocks_ptr, b, start + offs0, hi, n,
++                                 stride_sc, stride_bl, BLOCKS, BS)
++            kp = _ord_key(v) >> TOPSHIFT
++            gt += tl.sum((m & (kp > prefix)).to(tl.int32), 0)
++            eq += tl.sum((m & (kp == prefix)).to(tl.int32), 0)
++        tl.store(cnt_ptr + b * stride_cnt + 2 * c, gt)
++        tl.store(cnt_ptr + b * stride_cnt + 2 * c + 1, eq)
++
++
++@triton.jit
++def _mc_emit_kernel(
++    scores_ptr,
++    blocks_ptr,
++    slots_ptr,
++    lens_ptr,
++    hist_ptr,
++    cnt_ptr,
++    out_ptr,
++    L,
++    K,
++    NB,
++    SPLIT,
++    stride_sc,
++    stride_bl,
++    stride_sl,
++    stride_cnt,
++    stride_o,
++    NPASS: tl.constexpr,
++    BLOCKS: tl.constexpr,
++    BS: tl.constexpr,
++    CHUNK: tl.constexpr,
++    MAXC: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    # the chunk's picks at their place in the row's scan-order output: slots for the
++    # full path (scan order is position order), positions for the among-blocks path
++    b = tl.program_id(0)
++    c = tl.program_id(1)
++    n = tl.minimum(tl.load(lens_ptr + b).to(tl.int32), L)
++    w = _mc_width(n, NB, BLOCKS, BS)
++    lo = c * CHUNK
++    if (w > SPLIT) & (lo < w):
++        hi = tl.minimum(lo + CHUNK, w)
++        prefix, need = _mc_resolve(hist_ptr, b, K, NPASS, NPASS)
++        ci = tl.arange(0, MAXC)
++        before = ci < c
++        gt_before = tl.sum(tl.load(cnt_ptr + b * stride_cnt + 2 * ci, mask=before, other=0), 0)
++        tie_carry = tl.sum(tl.load(cnt_ptr + b * stride_cnt + 2 * ci + 1, mask=before, other=0), 0)
++        # ties are taken in scan order, so the chunks before took min(their ties, need)
++        sel_carry = gt_before + tl.minimum(tie_carry, need)
++        TOPSHIFT: tl.constexpr = 32 - 8 * NPASS
++        offs0 = tl.arange(0, BLOCK)
++        for start in range(lo, hi, BLOCK):
++            v, m, pos = _mc_cols(scores_ptr, blocks_ptr, b, start + offs0, hi, n,
++                                 stride_sc, stride_bl, BLOCKS, BS)
++            kp = _ord_key(v) >> TOPSHIFT
++            gtm = m & (kp > prefix)
++            eqm = m & (kp == prefix)
++            eqi = eqm.to(tl.int32)
++            rank = tie_carry + tl.cumsum(eqi, 0) - eqi
++            sel = gtm | (eqm & (rank < need))
++            seli = sel.to(tl.int32)
++            dst = sel_carry + tl.cumsum(seli, 0) - seli
++            if BLOCKS:
++                tl.store(out_ptr + b * stride_o + dst, pos, mask=sel)
++            else:
++                s = tl.load(slots_ptr + b * stride_sl + pos, mask=sel, other=0)
++                tl.store(out_ptr + b * stride_o + dst, s.to(tl.int32), mask=sel)
++            sel_carry += tl.sum(seli, 0)
++            tie_carry += tl.sum(eqi, 0)
++
++
++@triton.jit
++def _emit_sorted(slots_ptr, out_ptr, b, total, K, stride_sl, stride_o, KP: tl.constexpr):
++    # out[b, :total] holds picked positions in scan order: their slots by position, -1 after
++    kk = tl.arange(0, KP)
++    ok = kk < total
++    picked = tl.sort(tl.load(out_ptr + b * stride_o + kk, mask=ok, other=2147483647))
++    s = tl.load(slots_ptr + b * stride_sl + picked, mask=ok, other=0)
++    tl.debug_barrier()
++    tl.store(out_ptr + b * stride_o + kk, tl.where(ok, s.to(tl.int32), -1), mask=kk < K)
++
++
++@triton.jit
++def _mc_blocks_finish_kernel(
++    slots_ptr,
++    lens_ptr,
++    hist_ptr,
++    out_ptr,
++    L,
++    K,
++    NB,
++    SPLIT,
++    stride_sl,
++    stride_o,
++    NPASS: tl.constexpr,
++    BS: tl.constexpr,
++    KP: tl.constexpr,
++):
++    b = tl.program_id(0)
++    n = tl.minimum(tl.load(lens_ptr + b).to(tl.int32), L)
++    if _mc_width(n, NB, True, BS) > SPLIT:
++        total = tl.minimum(K, tl.sum(tl.load(hist_ptr + b * NPASS * 256 + tl.arange(0, 256)), 0))
++        _emit_sorted(slots_ptr, out_ptr, b, total, K, stride_sl, stride_o, KP)
++
++
++@triton.jit
++def _live_topk_blocks_kernel(
++    scores_ptr,
++    slots_ptr,
++    lens_ptr,
++    blocks_ptr,
++    hist_ptr,
++    out_ptr,
++    L,
++    K,
++    NB,
++    SPLIT,
++    stride_sc,
++    stride_sl,
++    stride_bl,
++    stride_o,
++    BS: tl.constexpr,
++    NPASS: tl.constexpr,
++    BLOCK: tl.constexpr,
++    KP: tl.constexpr,
++):
++    b = tl.program_id(0)
++    n = tl.minimum(tl.load(lens_ptr + b).to(tl.int32), L)
++    offs0 = tl.arange(0, BLOCK)
++    bins = tl.arange(0, 256)
++    # The source publishes its finite blocks first (block amax descending, -1 past
++    # the finite ones), and the finite blocks are among the cdiv(n, BS) live ones.
++    F = _mc_width(n, NB, True, BS)
++    if F > SPLIT:
++        # the multi-CTA kernels select this row; clear its histograms for them
++        for p in tl.static_range(NPASS):
++            tl.store(hist_ptr + (b * NPASS + p) * 256 + bins, tl.zeros([256], tl.int32))
++    else:
++        need = K + 0 * n
++        prefix = tl.full([], 0, tl.uint32)
++        for p in tl.static_range(NPASS):
++            shift = 24 - 8 * p
++            h = tl.zeros([256], dtype=tl.int32)
++            for start in range(0, F, BLOCK):
++                v, m, pos = _mc_cols(scores_ptr, blocks_ptr, b, start + offs0, F, n,
++                                     stride_sc, stride_bl, True, BS)
++                key = _ord_key(v)
++                if p > 0:
++                    m = m & ((key >> (shift + 8)) == prefix)
++                d = ((key >> shift) & 0xFF).to(tl.int32)
++                h += tl.histogram(d, 256, mask=m)
++            if p == 0:
++                need = tl.minimum(need, tl.sum(h, 0))
++            c = tl.cumsum(h, 0, reverse=True)
++            dsel = tl.max(tl.where(c >= need, bins, -1), 0)
++            gt = tl.sum(tl.where(bins > dsel, h, 0), 0)
++            need = need - gt
++            prefix = (prefix << 8) | dsel.to(tl.uint32)
++        TOPSHIFT: tl.constexpr = 32 - 8 * NPASS
++        # the picks' positions in flat order into out, then sorted by position
++        tie_carry = 0 * n
++        sel_carry = 0 * n
++        for start in range(0, F, BLOCK):
++            v, m, pos = _mc_cols(scores_ptr, blocks_ptr, b, start + offs0, F, n,
++                                 stride_sc, stride_bl, True, BS)
++            kp = _ord_key(v) >> TOPSHIFT
++            gtm = m & (kp > prefix)
++            eqm = m & (kp == prefix)
++            eqi = eqm.to(tl.int32)
++            rank = tie_carry + tl.cumsum(eqi, 0) - eqi
++            sel = gtm | (eqm & (rank < need))
++            seli = sel.to(tl.int32)
++            dst = sel_carry + tl.cumsum(seli, 0) - seli
++            tl.store(out_ptr + b * stride_o + dst, pos, mask=sel)
++            sel_carry += tl.sum(seli, 0)
++            tie_carry += tl.sum(eqi, 0)
++        tl.debug_barrier()
++        _emit_sorted(slots_ptr, out_ptr, b, sel_carry, K, stride_sl, stride_o, KP)
++
++
++def live_decode_slots(
++    req_to_token: torch.Tensor, req: torch.Tensor, lens: torch.Tensor, ratio: int, lmax: int
++) -> torch.Tensor:
++    """[bs, lmax] int64 pool slots, valid on [0, lens) and zero to the end of the last
++    live 64-tile; the rest is never read (fp4_index_logits_decode skips those tiles)."""
++    bs = req.shape[0]
++    slots = torch.empty((bs, lmax), dtype=torch.int64, device=req.device)
++    if bs == 0 or lmax == 0:
++        return slots
++    assert req_to_token.stride(1) == 1, req_to_token.stride()
++    req, lens = req.contiguous(), lens.contiguous()
++    grid = (bs, triton.cdiv(lmax, _SLOT_BLOCK))
++    _live_slots_kernel[grid](
++        req_to_token,
++        req,
++        lens,
++        slots,
++        lmax,
++        req_to_token.stride(0),
++        slots.stride(0),
++        ratio,
++        BLOCK=_SLOT_BLOCK,
++        TILE=_LOGITS_TILE,
++        num_warps=4,
++    )
++    return slots
++
++
++def _mc_select(scores, blocks, slots, lens, hist, out, k, width, nb, split, chunk, block_size):
++    """The multi-CTA kernels over ``width`` candidate columns a row; their CTAs return
++    at once on rows the one-CTA kernel took (device-side lengths)."""
++    bs = scores.shape[0]
++    L = scores.shape[1]
++    nchunk = triton.cdiv(width, chunk)
++    block = min(_BLOCK, chunk)
++    is_blocks = blocks is not None
++    if not is_blocks:
++        blocks = lens  # unused
++    cnt = torch.empty((bs, 2 * nchunk), dtype=torch.int32, device=scores.device)
++    grid = (bs, nchunk)
++    common = dict(NPASS=_NPASS, BLOCKS=is_blocks, BS=block_size, CHUNK=chunk, BLOCK=block,
++                  num_warps=8)
++    for p in range(_NPASS):
++        _mc_hist_kernel[grid](
++            scores, blocks, lens, hist, L, k, nb, split, scores.stride(0), blocks.stride(0),
++            P=p, **common,
++        )
++    _mc_count_kernel[grid](
++        scores, blocks, lens, hist, cnt, L, k, nb, split,
++        scores.stride(0), blocks.stride(0), cnt.stride(0), **common,
++    )
++    _mc_emit_kernel[grid](
++        scores, blocks, slots, lens, hist, cnt, out, L, k, nb, split,
++        scores.stride(0), blocks.stride(0), slots.stride(0), cnt.stride(0), out.stride(0),
++        MAXC=triton.next_power_of_2(nchunk), **common,
++    )
++    if is_blocks:
++        _mc_blocks_finish_kernel[(bs,)](
++            slots, lens, hist, out, L, k, nb, split, slots.stride(0), out.stride(0),
++            NPASS=_NPASS, BS=block_size, KP=triton.next_power_of_2(k), num_warps=8,
++        )
++
++
++def live_topk_full(
++    scores: torch.Tensor, slots: torch.Tensor, lens: torch.Tensor, k: int, out: torch.Tensor
++) -> None:
++    """``write_decode(scores.topk(k, sorted=False).indices)`` on the live columns:
++    out[:bs, :k] int32 = slots of the picks, ascending position, -1 padded."""
++    bs, L = scores.shape
++    if bs == 0:
++        return
++    assert scores.dtype == torch.float32 and scores.stride(1) == 1 and slots.stride(1) == 1
++    assert out.dtype == torch.int32 and out.stride(1) == 1 and out.shape[1] >= k
++    assert _SPLIT >= k, (_SPLIT, k)
++    lens = lens.contiguous()
++    hist = torch.empty((bs, _NPASS, 256), dtype=torch.int32, device=scores.device)
++    _live_topk_full_kernel[(bs,)](
++        scores,
++        slots,
++        lens,
++        out,
++        hist,
++        L,
++        k,
++        _SPLIT,
++        scores.stride(0),
++        slots.stride(0),
++        out.stride(0),
++        NPASS=_NPASS,
++        BLOCK=_BLOCK,
++        num_warps=8,
++    )
++    if L > _SPLIT:
++        _mc_select(scores, None, slots, lens, hist, out, k, L, 0, _SPLIT, _CHUNK, 1)
++
++
++def live_topk_among_blocks(
++    scores: torch.Tensor,
++    slots: torch.Tensor,
++    lens: torch.Tensor,
++    blocks: torch.Tensor,
++    k: int,
++    block_size: int,
++    out: torch.Tensor,
++) -> None:
++    """``write_decode(topk_among_blocks(...).masked_fill(<0, lmax))`` on the live
++    columns, ties ranked in the published block order as torch does."""
++    bs, L = scores.shape
++    if bs == 0:
++        return
++    assert blocks.shape[0] == bs and blocks.dtype == torch.int32 and blocks.stride(1) == 1
++    assert scores.dtype == torch.float32 and scores.stride(1) == 1 and slots.stride(1) == 1
++    assert out.dtype == torch.int32 and out.stride(1) == 1 and out.shape[1] >= k
++    assert L < 2**31 - 1, L
++    nb = blocks.shape[1]
++    lens = lens.contiguous()
++    hist = torch.empty((bs, _NPASS, 256), dtype=torch.int32, device=scores.device)
++    _live_topk_blocks_kernel[(bs,)](
++        scores,
++        slots,
++        lens,
++        blocks,
++        hist,
++        out,
++        L,
++        k,
++        nb,
++        _SPLIT_BLOCKS,
++        scores.stride(0),
++        slots.stride(0),
++        blocks.stride(0),
++        out.stride(0),
++        BS=block_size,
++        NPASS=_NPASS,
++        BLOCK=_BLOCK,
++        KP=triton.next_power_of_2(k),
++        num_warps=8,
++    )
++    width = min(nb * block_size, triton.cdiv(L, block_size) * block_size)
++    if width > _SPLIT_BLOCKS:
++        _mc_select(scores, blocks, slots, lens, hist, out, k, width, nb, _SPLIT_BLOCKS,
++                   _CHUNK_BLOCKS, block_size)
+diff --git a/python/sglang/srt/layers/attention/dsv4/v41_indexer/dense_blocks.py b/python/sglang/srt/layers/attention/dsv4/v41_indexer/dense_blocks.py
+index 647ce5a4..f1ee7e90 100644
+--- a/python/sglang/srt/layers/attention/dsv4/v41_indexer/dense_blocks.py
++++ b/python/sglang/srt/layers/attention/dsv4/v41_indexer/dense_blocks.py
+@@ -15,6 +15,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+     topk_among_blocks,
+ )
+ from sglang.kernels.ops.attention.dsv4.index_logits import FLAT_LOGITS_WIDTH_ALIGN
++from sglang.kernels.ops.attention.dsv4.live_topk import live_topk_among_blocks
+ 
+ from .scoring import (
+     DeepGEMMPrefillData,
+@@ -137,6 +138,18 @@ class DenseBlocksBackend:
+             select_decode(inputs, d, inputs.indexer.index_topk)
+             return
+         k = min(inputs.indexer.index_topk, d.lmax)
++        if d.live:
++            # KT_IDX_LIVE_TOPK: ties ranked in the published block order, as below
++            live_topk_among_blocks(
++                d.scores,
++                d.slots,
++                d.lens,
++                published.blocks,
++                k,
++                self.block_size,
++                inputs.out_page_indices[: d.bs],
++            )
++            return
+         idx = topk_among_blocks(
+             d.scores, d.lens, published.blocks, k, block_size=self.block_size
+         )
+diff --git a/python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py b/python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py
+index 53be3482..84603dbf 100644
+--- a/python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py
++++ b/python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py
+@@ -18,6 +18,11 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+ )
+ from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import index_q_rope_pack_weights
+ from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
++from sglang.kernels.ops.attention.dsv4.live_topk import (
++    live_decode_slots,
++    live_topk_enabled,
++    live_topk_full,
++)
+ from sglang.kernels.ops.attention.dsv4.topk import (
+     plan_topk_v2,
+     topk_transform_paged_v2,
+@@ -391,6 +396,8 @@ class DecodeScores(msgspec.Struct, frozen=True):
+     lens: torch.Tensor  # [bs]
+     slots: torch.Tensor  # [bs, lmax]
+     scores: torch.Tensor  # [bs, lmax]
++    # KT_IDX_LIVE_TOPK: slots hold [0, lens) only; select with the live kernels
++    live: bool = False
+ 
+ 
+ def prefill_requests(
+@@ -571,14 +578,22 @@ def decode_scores(
+             has_candidate_mask=candidate_mask is not None,
+         )
+     inputs.reset_outputs()
+-    j = torch.arange(lmax, device=pos.device)
+-    valid = j[None, :] < lens[:, None]
+-    slots = req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64) // ratio
+-    slots = slots.masked_fill(~valid, 0)
++    # KT_IDX_LIVE_TOPK: the live positions' slots in one kernel (capacity-sized grid,
++    # early exit past the device-side length); the logits kernel reads no further.
++    live = live_topk_enabled(lmax, pos.device)
++    if live:
++        slots = live_decode_slots(req_to_token, req, lens, ratio, lmax)
++    else:
++        j = torch.arange(lmax, device=pos.device)
++        valid = j[None, :] < lens[:, None]
++        slots = req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64) // ratio
++        slots = slots.masked_fill(~valid, 0)
+     scores = fp4_index_logits_decode(
+         q, weights, slots, lens, table, table.shape[1] // 68
+     )
+-    return DecodeScores(bs=bs, lmax=lmax, lens=lens, slots=slots, scores=scores)
++    return DecodeScores(
++        bs=bs, lmax=lmax, lens=lens, slots=slots, scores=scores, live=live
++    )
+ 
+ 
+ def select_decode(
+@@ -600,6 +615,9 @@ def select_decode(
+             d.ratio,
+             d.has_candidate_mask,
+         )
++    elif d.live:
++        # same picks, order and slots as the topk + sort + gather below
++        live_topk_full(d.scores, d.slots, d.lens, k, inputs.out_page_indices[: d.bs])
+     else:
+         write_decode(inputs, d, d.scores.topk(k, dim=-1, sorted=False).indices)
+ 

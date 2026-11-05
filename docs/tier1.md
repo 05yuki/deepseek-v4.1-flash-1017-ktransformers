@@ -44,6 +44,7 @@ the code" are on as soon as the patch is applied.
 | 24 | [`24-rope-tables.patch`](#24-rope-tables) | +160 / -8 | `wo-a-fp8`, `vision-on-demand`, `kv-vmm`, `prefill-lend` |
 | 25 | [`25-embed-on-host.patch`](#25-embed-on-host) | +88 / -0 | `wo-a-fp8`, `vision-on-demand`, `kv-vmm`, `prefill-lend`, `rope-tables` |
 | 26 | [`26-gguf-lend.patch`](#26-gguf-lend) | +2826 / -38 | `wo-a-fp8`, `vision-on-demand`, `loading`, `placement`, `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan`, `hot-lend`, `stream-mmq`, `cpu-gpu-overlap`, `expert-cache`, `rope-tables` |
+| 27 | [`27-live-topk.patch`](#27-live-topk) | +685 / -5 | none |
 
 ## Effect of each patch
 
@@ -818,3 +819,58 @@ Tier 1's features with a GGUF pack under them (tier 0.5, [gguf.md](gguf.md)):
 All of it is gated on a GGUF pack (`KT_GGUF_V41_DENSE`, or kt-kernel's LLAMAFILE method). With the MXFP4
 checkpoint the patch changes nothing: the plan's tail steps are 0, the lend keeps its pinned copy,
 and the free-memory reads and the swap budget are as before.
+
+## 27 live-topk
+
+The non-paged decode indexer (SM89 and SM12x) selects among the live positions instead of the
+graph capacity. Without the patch each of the eight index layers runs `torch.topk`, a sort and
+gathers over the capacity (1,048,580 columns at ratio 1 on a 1M pool) at every decode step past
+512 tokens of context. With it the slots and the selection read the device-side lengths, so a
+captured graph stays replayable, and the output equals the torch path element for element:
+the same picks, tie rule (`gatherTopK`'s), order and padding. Rows with more than 8,192 live
+columns (4,096 candidate columns among blocks) are selected by one CTA per 4,096 (1,024) columns.
+
+The one-CTA kernels are howl9003's SM89 contribution (#7, before this patch an optional patch).
+Added here: the multi-CTA path, the among-blocks picks sorted by position instead of flagged
+over the row, and -inf candidates never picked among blocks (as `topk_among_blocks`).
+
+Selection of one layer at capacity 1,048,580 (ratio 1, in a graph, one RTX 5070 Ti; the live
+kernels of the optional patch for comparison):
+
+| live positions | 1K | 8K | 32K | 131K | 262K | 524K | 1M |
+|---|---|---|---|---|---|---|---|
+| torch, full (us) | 152 | 161 | 168 | 187 | 227 | 288 | 430 |
+| this patch, full (us) | 21 | 30 | 35 | 58 | 88 | 152 | 295 |
+| torch, among blocks (us) | 178 | 190 | 193 | 215 | 251 | 312 | 457 |
+| this patch, among blocks (us) | 25 | 27 | 35 | 55 | 84 | 146 | 281 |
+| optional patch, among blocks (us) | 19 | 33 | 62 | 129 | 217 | 392 | 785 |
+
+The times include the slots and the logits kernel; the among-blocks selection kernel alone
+holds at 14 us from 16K live positions to 1M.
+
+Two RTX 5070 Ti, the full stack, `KT_IDX_LIVE_TOPK=0` against the default, OFF ON OFF ON. Decode is
+512 greedy tokens after a natural-text prompt read from the prefix cache (`tools/nll-text`), the
+median of three:
+
+| context | OFF | ON | OFF | ON | ON over OFF (means) |
+|---|---|---|---|---|---|
+| 3,898 tokens | 44.19 | 45.50 | 42.32 | 49.48 | +9.8 % |
+| 24,404 tokens | 55.12 | 58.19 | 53.61 | 58.30 | +7.1 % |
+| 122,020 tokens | 43.02 | 41.91 | 46.12 | 49.81 | +2.9 % |
+
+GPU kernel time of 40 decode steps (torch profiler, both GPUs), OFF and ON one launch each: 4K
+context 13.53 to 12.30 ms a step, 35K 14.06 to 13.27, 122K 14.41 to 13.83. The torch top-k chain
+is gone; the new kernels take 0.04 ms a step.
+
+`tools/nll.py` right after launch, the hot lend capped at 16 experts a layer on both: 11,496 of
+11,496 token log-probabilities identical (0.7206 both). Uncapped, the two launches differ in
+hot slots (836 OFF, 839 ON: the live path's graph capture leaves about 20 MB more free), which
+moves the GPU/CPU expert split and with it the bits (+0.0005 nats a token, 3,800 identical).
+
+`tools/test_live_topk.py --gpu` checks the kernels against the torch calls up to the 1M
+capacity, with -inf and NaN logits, and replays captured graphs with new lengths;
+`CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1` runs its CPU part.
+
+- `KT_IDX_LIVE_TOPK`: 1 (on in the code) / unset; `0` keeps the torch path
+- `KT_IDX_LIVE_TOPK_SPLIT`, `KT_IDX_LIVE_TOPK_SPLIT_BLOCKS`: 8192, 4096 / unset
+- `KT_IDX_LIVE_TOPK_FULLKEY`: 0 / unset; `1` resolves all 32 key bits (the indexer's logits are bf16-rounded, so 16 suffice)

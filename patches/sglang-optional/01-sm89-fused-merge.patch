@@ -1,0 +1,197 @@
+diff --git a/python/sglang/kernels/ops/attention/flash_mla_sm120_triton.py b/python/sglang/kernels/ops/attention/flash_mla_sm120_triton.py
+--- a/python/sglang/kernels/ops/attention/flash_mla_sm120_triton.py
++++ b/python/sglang/kernels/ops/attention/flash_mla_sm120_triton.py
+@@ -19,11 +19,14 @@
+ """
+ 
+ import logging
++import os
++from functools import lru_cache
+ from typing import Optional, Tuple
+ 
+ import torch
+ import triton
+ import triton.language as tl
++from triton.language.extra import libdevice
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -237,8 +240,13 @@
+     if not q3.is_contiguous():
+         q3 = q3.contiguous()
+ 
+-    out = torch.zeros(B, H, D, dtype=torch.bfloat16, device=q.device)
+-    lse = torch.full((B, H), float("-inf"), dtype=torch.float32, device=q.device)
++    if _fused_merge_on(q.device.index) and D == _D:
++        # the kernel stores every (row, head): 448 nope + 64 rope values and the lse
++        out = torch.empty(B, H, D, dtype=torch.bfloat16, device=q.device)
++        lse = torch.empty((B, H), dtype=torch.float32, device=q.device)
++    else:
++        out = torch.zeros(B, H, D, dtype=torch.bfloat16, device=q.device)
++        lse = torch.full((B, H), float("-inf"), dtype=torch.float32, device=q.device)
+ 
+     # Round topk for autotune key stability
+     topk_rounded = triton.next_power_of_2(topk)
+@@ -279,6 +287,123 @@
+     return out.unsqueeze(1), lse.unsqueeze(1)
+ 
+ 
++# Fused LSE merge + attention sink (opt-in, KT_SM89_FUSED_MERGE=1, compute capability 8.9).
++# _merge_partial_attn + _apply_attn_sink are ~30 single-CTA torch kernels per layer
++# (35 us at bs=1 in the local r4 trace). This kernel does the same arithmetic per
++# (row, head) in one launch, keeping torch's operation order, dtypes and rounding points:
++#   max_lse = maximum(lse1, lse2)                      (NaN-propagating, as torch.maximum)
++#   w_i = where(lse_i > -1e20, exp(lse_i - max_lse), 0)
++#   total = clamp_min(w1 + w2, 1e-20)                  (NaN-propagating, as torch.clamp)
++#   merged = bf16(((w1 * o1) + (w2 * o2)) / total)     (two products, one add, IEEE div)
++#   lse = max_lse + log(total)
++#   sink: c = logaddexp(lse, sink) (torch's CUDA formula), w = where(lse > -1e20, exp(lse - c), 0)
++#   out = bf16(f32(merged) * w), lse = c
++# exp/log/log1p are libdevice (__nv_expf/__nv_logf/__nv_log1pf, the functions nvcc links
++# for torch's std::exp/log/log1p), FMA contraction and libdevice FTZ are switched off at
++# launch, and the division is div_rn, so every step rounds as the torch kernels do.
++# On SM89 the default sparse decode is sm89_dual_scope (merge and sink in its epilogue);
++# this path is reached only through its portable fallback.
++_FUSED_MERGE = os.environ.get("KT_SM89_FUSED_MERGE", "0") == "1"
++
++
++@lru_cache(maxsize=None)
++def _fused_merge_on(device_index) -> bool:
++    return _FUSED_MERGE and torch.cuda.get_device_capability(device_index) == (8, 9)
++
++
++@triton.jit
++def _logaddexp_torch(a, b):
++    # aten logaddexp_kernel_cuda (real): isinf(a) && a == b ? a : max(a,b) + log1p(exp(-|a-b|))
++    m = tl.maximum(a, b)
++    r = m + libdevice.log1p(libdevice.exp(-tl.abs(a - b)))
++    return tl.where((tl.abs(a) == float("inf")) & (a == b), a, r)
++
++
++@triton.jit
++def _merge_sink_kernel(
++    O1_ptr,
++    L1_ptr,
++    O2_ptr,
++    L2_ptr,
++    SINK_ptr,
++    OUT_ptr,
++    LSE_ptr,
++    H,
++    stride_o1b,
++    stride_o1h,
++    stride_o2b,
++    stride_o2h,
++    stride_ob,
++    stride_oh,
++    D: tl.constexpr,
++    HAS_EXTRA: tl.constexpr,
++    HAS_SINK: tl.constexpr,
++):
++    bid = tl.program_id(0)
++    hid = tl.program_id(1)
++    offs = tl.arange(0, D)
++    lse1 = tl.load(L1_ptr + bid * H + hid)
++    o1 = tl.load(O1_ptr + bid * stride_o1b + hid * stride_o1h + offs)
++    if HAS_EXTRA:
++        lse2 = tl.load(L2_ptr + bid * H + hid)
++        o2 = tl.load(O2_ptr + bid * stride_o2b + hid * stride_o2h + offs)
++        max_lse = tl.maximum(lse1, lse2, propagate_nan=tl.PropagateNan.ALL)
++        w1 = tl.where(lse1 > -1e20, libdevice.exp(lse1 - max_lse), 0.0)
++        w2 = tl.where(lse2 > -1e20, libdevice.exp(lse2 - max_lse), 0.0)
++        total = w1 + w2
++        total = tl.where(total != total, total, tl.maximum(total, 1e-20))
++        num = w1 * o1.to(tl.float32) + w2 * o2.to(tl.float32)
++        merged = tl.math.div_rn(num, tl.zeros([D], tl.float32) + total).to(tl.bfloat16)
++        lse = max_lse + libdevice.log(total)
++    else:
++        merged = o1
++        lse = lse1
++    if HAS_SINK:
++        sink = tl.load(SINK_ptr + hid).to(tl.float32)
++        comb = _logaddexp_torch(lse, sink)
++        w = tl.where(lse > -1e20, libdevice.exp(lse - comb), 0.0)
++        merged = (merged.to(tl.float32) * w).to(tl.bfloat16)
++        lse = comb
++    tl.store(OUT_ptr + bid * stride_ob + hid * stride_oh + offs, merged)
++    tl.store(LSE_ptr + bid * H + hid, lse)
++
++
++def _fused_merge_sink(out, lse, out_extra, lse_extra, attn_sink):
++    """out/out_extra [B, 1, H, D] bf16, lse/lse_extra [B, 1, H] f32 -> (out, lse) as
++    _merge_partial_attn followed by _apply_attn_sink."""
++    B, _, H, D = out.shape
++    o1 = out.view(B, H, D)
++    o2 = out_extra.view(B, H, D) if out_extra is not None else o1
++    l1 = lse.reshape(B, H)
++    l2 = lse_extra.reshape(B, H) if lse_extra is not None else l1
++    sink = attn_sink.contiguous() if attn_sink is not None else l1
++    res = torch.empty_like(o1)
++    res_lse = torch.empty((B, 1, H), dtype=torch.float32, device=out.device)
++    _merge_sink_kernel[(B, H)](
++        o1,
++        l1,
++        o2,
++        l2,
++        sink,
++        res,
++        res_lse,
++        H,
++        o1.stride(0),
++        o1.stride(1),
++        o2.stride(0),
++        o2.stride(1),
++        res.stride(0),
++        res.stride(1),
++        D=D,
++        HAS_EXTRA=out_extra is not None,
++        HAS_SINK=attn_sink is not None,
++        num_warps=4,
++        enable_fp_fusion=False,
++        enable_reflect_ftz=False,
++    )
++    return res.unsqueeze(1), res_lse
++
++
+ def _merge_partial_attn(
+     out1: torch.Tensor,
+     lse1: torch.Tensor,
+@@ -352,7 +477,9 @@
+     )
+ 
+     # Process extra cache (c4 / c128) if present
+-    if extra_k_cache is not None and extra_indices is not None:
++    has_extra = extra_k_cache is not None and extra_indices is not None
++    out_extra = lse_extra = None
++    if has_extra:
+         out_extra, lse_extra = _run_triton_sparse_decode(
+             q,
+             extra_k_cache,
+@@ -360,11 +487,22 @@
+             extra_topk_length,
+             softmax_scale,
+         )
+-        out, lse = _merge_partial_attn(out, lse, out_extra, lse_extra)
+-
+-    # Apply attention sink
+-    if attn_sink is not None:
+-        out, lse = _apply_attn_sink(out, lse, attn_sink)
++
++    if (
++        _fused_merge_on(q.device.index)
++        and (has_extra or attn_sink is not None)
++        and out.shape[-1] == _D
++        and (attn_sink is None or attn_sink.numel() == out.shape[2])
++    ):
++        # KT_SM89_FUSED_MERGE: merge + sink in one launch, same arithmetic as below
++        out, lse = _fused_merge_sink(out, lse, out_extra, lse_extra, attn_sink)
++    else:
++        if has_extra:
++            out, lse = _merge_partial_attn(out, lse, out_extra, lse_extra)
++
++        # Apply attention sink
++        if attn_sink is not None:
++            out, lse = _apply_attn_sink(out, lse, attn_sink)
+ 
+     # Return format matching PyTorch fallback: (out, lse.permute(0,2,1))
+     return out, lse.permute(0, 2, 1)
