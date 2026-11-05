@@ -136,7 +136,7 @@ if [[ "${KT_MXFP4_EXPERT_CACHE_GIB:-0}" != 0 ]]; then
   fi
 fi
 deferred_experts="${KT_DEFERRED_EXPERTS:-0}"  # >0 drops expert work for speed; it hurts the text
-mem_fraction="${SGLANG_MEM_FRACTION:-0.81}"
+mem_fraction="${SGLANG_MEM_FRACTION:-1.0}"
 kv_cache_dtype="${SGLANG_KV_CACHE_DTYPE:-fp8_e4m3}"
 chunked_prefill="${SGLANG_CHUNKED_PREFILL_SIZE:-2048}"
 swa_prefix_tails="${SGLANG_SWA_PREFIX_TAILS:-6}"

@@ -228,7 +228,7 @@ them unchanged, which may not be their best:
   `mxfp4_fp32_moe.py`) and the decode/tensor-core split (`GEMV_MAX_TOKENS`, 8 tokens);
 - `KT_GPU_STREAM_PREFILL` (512 tokens) and `KT_GPU_STREAM_GROUP` (4 experts a group);
 - the hot lend's `KT_KV_HOT_EXTRA` (16 a layer) and `KT_KV_HOT_SPARE_FLOOR_MB` (1024);
-- `SGLANG_MEM_FRACTION` (0.81) and the prefill chunk, which the first launch calibrates.
+- `SGLANG_MEM_FRACTION` (1.0: the pool covers the context and its pages are mapped as used, so the fraction decides nothing) and the prefill chunk, which the first launch calibrates.
 
 ## Optional patches
 
