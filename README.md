@@ -2,7 +2,9 @@
 
 Run [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
 on one machine with a lot of RAM and ordinary GPUs, or on one socket with 256 GB
-([One socket, 256 GB](docs/results.md#one-socket-256-gb)). The 384 routed experts per layer
+([One socket, 256 GB](docs/results.md#one-socket-256-gb)).
+With a GGUF pack of the model, 64 GB of RAM and one 16 GB GPU are enough ([GGUF packs](#gguf-packs)).
+The 384 routed experts per layer
 run on the CPU in MXFP4 through [KTransformers](https://github.com/kvcache-ai/ktransformers)'
 kt-kernel. Attention, the hottest experts and the prefill run on the GPUs through
 [SGLang](https://github.com/sgl-project/sglang). The engram tables (about 200 GB) are
@@ -51,7 +53,7 @@ Serving more than one request at a time and other machines: [docs/serving.md](do
 
 In short, from [docs/requirements.md](docs/requirements.md):
 
-- **RAM:** a 512 GB class machine, or one socket with 256 GB. The server uses about 420 GiB, most of it the CPU experts.
+- **RAM:** a 512 GB class machine, or one socket with 256 GB; 64 GB with a GGUF pack. With the MXFP4 checkpoint the server uses about 420 GiB, most of it the CPU experts.
 - **GPU:** NVIDIA SM89 (RTX 40) or newer, 16 GB a card, one or two cards.
 - **Disk:** about 500 GB on NVMe. The checkpoint is 476 GiB, and its engram rows are read from it while serving.
 - **Software:** Linux, gcc/g++, the libnuma and hwloc headers, and a CUDA 13 toolkit; without one, setup.sh fetches NVIDIA's toolkit wheels.
@@ -66,6 +68,7 @@ One 16 GB GPU and 64 GB of RAM are enough for it.
 `BUILD=IQ2_XXS ./run.sh` downloads the IQ2_XXS build and serves it.
 `GGUF=<dir> ./setup.sh` and `GGUF=<dir> ./serve.sh` take a build already downloaded.
 On the two-GPU machine below, the IQ2_XXS build decodes Japanese prose at 62.6 tok/s.
+On one of its GPUs under a 64 GB memory limit, it decodes Japanese prose at 25.7 tok/s and reads a 35,000-token prompt in 28 s.
 Its NLL is 0.327 above the reference, from the pack's quantization.
 What it needs, how it runs and its results: [docs/gguf.md](docs/gguf.md).
 
