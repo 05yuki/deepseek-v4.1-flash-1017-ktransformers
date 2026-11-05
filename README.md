@@ -10,6 +10,9 @@ kt-kernel. Attention, the hottest experts and the prefill run on the GPUs throug
 [SGLang](https://github.com/sgl-project/sglang). The engram tables (about 200 GB) are
 read straight from the checkpoint on disk, with no extracted copy. The context is up
 to 1M tokens.
+The speed comes without a loss of accuracy: on 24 public-domain texts the served model scores
+within the standard error of DeepSeek's own `inference/model.py` ([Results](#results)).
+Every patch is kept only if the model's log-probabilities stay there.
 
 This repository is everything needed: patches against two public upstream commits, a
 setup script that builds them, a launcher that reads the machine it runs on, and tests.
