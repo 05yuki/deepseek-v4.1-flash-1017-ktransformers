@@ -31,6 +31,33 @@ is applied; one that does not fit stops the setup with nothing applied. If the l
 system paths, pass them in through `CPLUS_INCLUDE_PATH` and `LIBRARY_PATH`. CMake
 flags go in `CMAKE_ARGS`.
 
+### Variables and what it writes
+
+```
+[MODEL=<checkpoint dir> | GGUF=<dir> [BASE=<dir>]] [TIER=0|1|2] [SGLANG_FEATURES=a,b,...] [PREBUILT=<archive>] ./setup.sh
+```
+
+- `MODEL`: the MXFP4 checkpoint. Writes `state/engram-<model>/engram-manifest.json`.
+- `GGUF`: a GGUF pack, its shards and Engram file side by side ([gguf.md](gguf.md)). Writes
+  `state/gguf-<name>/`. `BASE` is a directory with deepseek-ai/DeepSeek-V4.1-Flash-1017's
+  `config.json`, tokenizer and `encoding/`; without it those few files are downloaded.
+- `TIER`: 0, 1 or 2, default 2 (the table above). Changing it re-applies the patches and rebuilds kt-kernel.
+- `SGLANG_FEATURES`: tier-1 features, comma-separated, or `none`; default all. A feature's
+  prerequisites (`patches/sglang-tier1/requires.txt`) must be picked too.
+- `PREBUILT`: an archive or directory from `tools/prebuilt-pack.sh` (below).
+- `PREPARE_ONLY=1`: stops after the trees, the venv and the toolkit choice (for `tools/prebuilt-pack.sh`).
+- `CUDA_HOME`: default `/usr/local/cuda`. Without a usable toolkit, NVIDIA's 13.2 toolkit wheels are
+  installed under `build/` and serve as `CUDA_HOME` through `lib/cuda-home.sh`. That is enough for the
+  run-time JITs and the small builds, not for kt-kernel's CMake build.
+- `KT_CUDA_ARCHS`: default the visible GPUs' compute capability.
+- `CPUINFER_CPU_INSTRUCT`: kt-kernel's CPU target, default `NATIVE` (this machine's ISA).
+- `CMAKE_ARGS`: extra CMake flags for kt-kernel, space separated. Headers and libraries outside the
+  system paths go in through `CPLUS_INCLUDE_PATH` and `LIBRARY_PATH`.
+
+It needs git, a C/C++ compiler, the libnuma and hwloc headers (Debian/Ubuntu: `libnuma-dev libhwloc-dev`)
+and either uv or python3.12. Everything it makes stays inside this directory: `third_party/sglang`,
+`third_party/ktransformers`, `.venv`, `engram-adapter/librow_store.so`, `build/libkv_vmm.so` and `state/`.
+
 ### Prebuilt pieces
 
 `PREBUILT=<archive> ./setup.sh` installs the pieces setup.sh otherwise compiles, from an archive

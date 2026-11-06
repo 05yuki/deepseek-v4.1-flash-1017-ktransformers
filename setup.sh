@@ -1,46 +1,7 @@
 #!/usr/bin/env bash
-# Build everything serve.sh needs, inside this directory:
-#   third_party/sglang         sgl-project/sglang main @ 58484246 + patches/sglang-tier*
-#   third_party/ktransformers  kvcache-ai/ktransformers @ 95009ea (+ patches/kt-kernel-*.patch and
-#                              patches/kt-llamafile-iq2xs.patch from tier 1)
-#   .venv                      Python 3.12, requirements.txt, kt-kernel built for this CPU and GPU
-#   engram-adapter/librow_store.so, build/libkv_vmm.so
-#   state/engram-<model>/engram-manifest.json   when MODEL=<checkpoint dir> is given
-#   state/gguf-<name>/         when GGUF=<dir> is given (docs/gguf.md): config/ (config.json and
-#                              tokenizer for SGLang), engram/engram-manifest.json, experts.json,
-#                              io-probe.json; and the GGUF CUDA kernels (.cache/torch_extensions)
-#
-# usage: [MODEL=<checkpoint dir> | GGUF=<dir> [BASE=<dir>]] [TIER=0|1|2] [SGLANG_FEATURES=a,b,...] ./setup.sh
-#
-# One tree serves both the MXFP4 checkpoint (MODEL) and a GGUF pack of it (GGUF, the shards and the
-# Engram file of ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF side by side). SGLang reads a GGUF
-# pack's architecture and tokenizer from deepseek-ai/DeepSeek-V4.1-Flash-1017: BASE is a directory
-# with its config.json, tokenizer and encoding/; without BASE those few files are downloaded.
-#
-# TIER picks how much of this repository's SGLang changes go in, each tier on top of the ones
-# below it (docs/patches.md):
-#   0  run DeepSeek-V4.1-Flash-1017 correctly on the hybrid MoE, on any GPU; KTransformers as pinned
-#      (tier 0.5, the GGUF format, goes in at every tier; serving a GGUF pack needs tier 1)
-#   1  + speed and memory: streamed prefill, lends, hot experts, the CPU kernels
-#   2  + all-reduce through host memory, for two GPUs without peer access (default)
-# Changing TIER re-applies the patches and rebuilds kt-kernel.
-# Tier 1 is one patch per feature (patches/sglang-tier1/, docs/tier1.md). SGLANG_FEATURES picks
-# some of them, comma-separated (e.g. fp8-decode,engram-row-prefetch), or none; default all. A feature's
-# prerequisites (patches/sglang-tier1/requires.txt) must be picked too.
-# Needs: git, a C/C++ compiler, the CUDA toolkit (CUDA_HOME, default /usr/local/cuda;
-# built and run here with 13.1; without a usable one, NVIDIA's 13.2 toolkit wheels are installed under build/
-# and serve as CUDA_HOME through lib/cuda-home.sh, enough for the run-time JITs and the small
-# builds but not for kt-kernel's CMake build), libnuma and hwloc headers (Debian/Ubuntu: libnuma-dev libhwloc-dev), and either
-# uv or python3.12. Re-running skips the finished steps.
-# PREBUILT=<archive or directory from tools/prebuilt-pack.sh>: installs its kt-kernel wheel (every CPU
-# variant), MMQ extension (one file a GPU arch), kv-vmm, engram row store and hwloc instead of building
-# them; no compiler or CUDA toolkit is needed then (the FlashInfer CUTLASS MoE of the MMQ-off path is
-# not built either). Every file is checked against the archive's manifest.json.
-# PREPARE_ONLY=1 stops after the trees, the venv and the toolkit choice (for tools/prebuilt-pack.sh).
-# Knobs: CUDA_HOME; KT_CUDA_ARCHS (default: the visible GPUs' compute capability);
-# CPUINFER_CPU_INSTRUCT (kt-kernel's CPU target, default NATIVE: this machine's ISA);
-# CMAKE_ARGS (extra CMake flags for kt-kernel, space separated); headers and libraries
-# outside the system paths go in through CPLUS_INCLUDE_PATH / LIBRARY_PATH.
+# Build everything serve.sh needs, inside this directory.
+# usage: [MODEL=<checkpoint dir> | GGUF=<dir> [BASE=<dir>]] [TIER=0|1|2] [SGLANG_FEATURES=a,b,...] [PREBUILT=<archive>] ./setup.sh
+# What it does, every variable and what it writes: docs/setup.md. Re-running skips the finished steps.
 set -Eeuo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$here"
