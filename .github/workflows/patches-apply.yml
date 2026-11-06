@@ -57,6 +57,26 @@ jobs:
       - name: SM89 dispatch contracts (CPU only)
         run: python3 tools/test_sm89_dispatch.py sglang
 
+      - name: CPU tests
+        run: |
+          # no torch needed
+          python3 tools/test_qualify_cache.py
+          python3 tools/lend-transition-fences-test.py
+          # CPU torch and Triton; the Triton kernels run in Triton's interpreter
+          python3 -m venv ../cpu-venv
+          ../cpu-venv/bin/pip install -q --index-url https://download.pytorch.org/whl/cpu torch
+          ../cpu-venv/bin/pip install -q triton numpy
+          ../cpu-venv/bin/python tools/e4m3-emulation-test.py
+          S=sglang/python/sglang/kernels/ops/attention
+          # live top-k (tier 1) against torch's selection rule
+          cat $S/dsv4/live_topk.py tools/test_live_topk.py \
+            | CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 ../cpu-venv/bin/python -
+          # the fused merge+sink (sglang-optional/01) against the torch chain
+          git -C sglang apply --whitespace=nowarn ../patches/sglang-optional/01-sm89-fused-merge.patch
+          cat $S/flash_mla_sm120_triton.py tools/test_merge_sink.py \
+            | CUDA_VISIBLE_DEVICES= TRITON_INTERPRET=1 KT_SM89_FUSED_MERGE=1 ../cpu-venv/bin/python -
+          git -C sglang apply -R --whitespace=nowarn ../patches/sglang-optional/01-sm89-fused-merge.patch
+
       - name: ktransformers and its llama.cpp
         run: |
           git init -q kt && cd kt

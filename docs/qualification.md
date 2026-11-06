@@ -8,6 +8,25 @@ The report names the hardware and software, and nothing that identifies the mach
 The [Results](results.md) come from one machine, so reports from other GPUs and CPUs are welcome.
 Filed reports are listed by tag in [reports/](../reports/README.md), with how to send one.
 
+## Tests
+
+The CI job "patches apply" runs every test that needs no GPU, on each push and once a week.
+The Triton kernels run there in Triton's interpreter on the CPU.
+
+| test | needs | where it runs |
+|---|---|---|
+| `tools/test_sm89_dispatch.py` | the patched SGLang tree | CI |
+| `tools/test_qualify_cache.py` | nothing | CI |
+| `tools/lend-transition-fences-test.py` | nothing | CI |
+| `tools/e4m3-emulation-test.py` | torch | CI |
+| `tools/test_live_topk.py` | torch and Triton; `--gpu` also checks on a GPU | CI on the CPU, by hand on a GPU |
+| `tools/test_merge_sink.py` | the same, with `sglang-optional/01` applied | CI on the CPU, by hand on a GPU |
+| `tools/dsv4-o-fp8-qdq-test.py` | a GPU | `setup.sh`, on the machine it builds |
+| `tools/test_fused_merge_wiring.py` | a GPU | by hand |
+| `tools/mxfp4-fp32-moe-test.py` | a GPU | by hand |
+| `tools/sm89-attention-test.py` | an SM89 GPU | by hand ([sm89.md](sm89.md#checking-an-sm89-card)) |
+| `tools/dsv41-encoding-check.py`, `tools/dsv41-recipe-check.py` | the checkpoint's `encoding/` and tokenizer | by hand |
+
 ## Multi-session prefix-cache qualification
 
 `tools/qualify-cache.py` generates synthetic evidence histories from a seed and freezes

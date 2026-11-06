@@ -38,3 +38,4 @@ bad += int((qdq.e4m3_round_emulated(edge).view(torch.int32) != edge.to(torch.flo
 n += edge.numel()
 print(f"{n} values, {bad} differ (bitwise, signed zero included)")
 print("PASS" if bad == 0 else "FAIL")
+raise SystemExit(1 if bad else 0)
