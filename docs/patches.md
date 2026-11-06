@@ -1,5 +1,10 @@
 # What the patches do
 
+Last move to SGLang main: 2026-11-04, to `58484246` (tag `2026-11-04-1912`).
+When a newer pin breaks a patch, the "patches apply" CI job names it; each patch's commit message on
+[`dsv41-1017-main`](https://github.com/05yuki/sglang-upstream/tree/dsv41-1017-main) says what it changes
+and how it was checked, and `tools/qualify.sh` on one and two GPUs decides whether the move goes out.
+
 `setup.sh` applies the patches up to `TIER` (default 2), each tier on top of the ones below it:
 
 | tier | file | applies to |
