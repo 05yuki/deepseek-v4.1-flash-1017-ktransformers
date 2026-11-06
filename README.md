@@ -16,7 +16,7 @@ Attention, the hottest experts and the prefill run on the GPUs through
 The engram tables (about 200 GB) are read from the checkpoint on disk, with no extracted copy.
 
 This repository is everything needed: patches against two public upstream commits, a setup
-script that builds them, a launcher that reads the machine it runs on, and tests.
+script that builds them, a launcher that reads the machine it runs on, and tests ([which run where](docs/qualification.md#tests)).
 Each tag pins those commits: SGLang main at `58484246` and KTransformers `95009ea` today, with
 torch 2.14.1 on CUDA 13 wheels, FlashInfer 0.7.2 and CUDA toolkit 13.1.
 The recipe follows SGLang main: every few weeks the patches move to a newer commit, are measured
@@ -25,6 +25,16 @@ The SGLang patches are the commits of branch `dsv41-1017-main` of
 [05yuki/sglang-upstream](https://github.com/05yuki/sglang-upstream/tree/dsv41-1017-main), one file
 a commit ([docs/patches.md](docs/patches.md)).
 A patch that SGLang merges is dropped at the next move.
+
+## Which way
+
+| RAM | checkpoint | where to start |
+|---|---|---|
+| 512 GB | the MXFP4 checkpoint (476 GiB) | [Quick start](#quick-start) |
+| 256 GB on one socket | the MXFP4 checkpoint, with an expert cache | [One socket, 256 GB](docs/results.md#one-socket-256-gb) |
+| 64 to 128 GB | a GGUF pack (IQ2_XXS) | [GGUF packs](#gguf-packs) |
+
+Each needs one 16 GB NVIDIA GPU of SM89 (RTX 40) or newer; a GGUF pack also runs on an 8 GB RTX 20.
 
 ## Quick start
 
@@ -54,6 +64,22 @@ The server speaks SGLang's OpenAI-compatible API on `127.0.0.1:8080`.
 Tool calls and the model's thinking come back in their own fields.
 A prefix cache keeps a copy in host memory.
 More than one request at a time, and other machines: [docs/serving.md](docs/serving.md).
+
+## Machines checked
+
+| CPU | GPU | checkpoint | what was checked | where |
+|---|---|---|---|---|
+| 2 × EPYC 7452 (Zen 2), 512 GB | 2 × RTX 5070 Ti 16 GB (SM120) | MXFP4 | each tag since 2026-11-03: `tools/qualify.sh` | [reports/](reports/README.md) |
+| the same | 1 × RTX 5070 Ti | MXFP4 | each tag since 2026-11-03: `tools/qualify.sh` | [reports/](reports/README.md) |
+| the same | 1 and 2 × RTX 5070 Ti | GGUF IQ2_XXS | speed and NLL | [docs/gguf.md](docs/gguf.md) |
+| 2 × EPYC 7543 (Zen 3) | 1 × RTX 4080 SUPER, 32 GB (SM89) | MXFP4 | one tag, by a contributor: check, tool calls, NLL, speed | [docs/sm89.md](docs/sm89.md#validation) |
+| Core i5-9600K, 64 GB | RTX 2070 8 GB (SM75) | GGUF IQ2_XXS | speed and NLL | [docs/gguf.md](docs/gguf.md) |
+| a CPU with AVX-512 | | | not yet | |
+| | a retail RTX 40 card, 16 or 24 GB | | not yet | |
+| | SM90 or SM100 (H100, B200) | | not yet | |
+| | three or more GPUs | | not yet | |
+
+A report from a row that says "not yet", or from any machine not listed, is welcome: `tools/qualify.sh` writes it ([docs/qualification.md](docs/qualification.md)).
 
 ## What it needs
 
@@ -88,13 +114,14 @@ The 64 GB and 128 GB rows are one socket under a memory limit.
 | one GPU, 64 GB | 25.7 tok/s | 28 s |
 
 An RTX 2070 8 GB with a Core i5-9600K and 64 GB decodes at 1.8 tok/s.
+Its NLL is 1.0468, within 0.001 of the same pack on the larger machine.
 Other kinds of text, the expert cache at each RAM size, and how each row was run: [docs/gguf.md](docs/gguf.md).
 
 ## Results
 
 2 × EPYC 7452 (Zen 2), 512 GB DDR4, 2 × RTX 5070 Ti 16 GB, the `serve.sh` defaults with a 1M-token context.
-Decode is Japanese prose, the median of four prompts.
-The prompts are random token ids.
+The decode column is Japanese prose, the median of four prompts.
+The prompt columns use prompts of random token ids.
 
 | setup | decode | 35K prompt | 1M prompt |
 |---|---|---|---|
