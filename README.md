@@ -92,7 +92,9 @@ In short, from [docs/requirements.md](docs/requirements.md):
   The checkpoint is 476 GiB, and its engram rows are read from it while serving.
 - **Software:** Linux, gcc/g++, the libnuma and hwloc headers, and a CUDA 13 toolkit.
   Without a toolkit, `setup.sh` fetches NVIDIA's toolkit wheels.
-- **Host settings,** as root: `transparent_hugepage/shmem_enabled` set to `advise`, `vm.min_free_kbytes = 8388608`, and swap off.
+- **Host settings,** recommended as root for the MXFP4 checkpoint, none needed for a GGUF pack:
+  `transparent_hugepage/shmem_enabled` set to `advise`, `vm.min_free_kbytes = 8388608`, and swap off.
+  Without them the server still starts and says what is missing ([docs/requirements.md](docs/requirements.md)).
 
 ## GGUF packs
 

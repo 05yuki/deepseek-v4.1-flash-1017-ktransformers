@@ -302,6 +302,13 @@ if grep -q '\[never\]' /sys/kernel/mm/transparent_hugepage/shmem_enabled 2>/dev/
   echo "WARNING: shmem THP is 'never'; the expert arenas get 4K pages and pinning them takes most of an hour." >&2
   echo "         echo advise | sudo tee /sys/kernel/mm/transparent_hugepage/shmem_enabled" >&2
 fi
+if [[ "$(cat /proc/sys/vm/min_free_kbytes 2>/dev/null || echo 0)" -lt 8388608 ]]; then
+  echo "note: vm.min_free_kbytes is below 8388608; the CUDA JIT can hit a node-local OOM while the experts fill the nodes" >&2
+  echo "      (sudo sysctl -w vm.min_free_kbytes=8388608)" >&2
+fi
+if [[ -n "$(swapon --noheadings 2>/dev/null)" ]]; then
+  echo "note: swap is on; pressure on one NUMA node can push the server to swap (sudo swapoff -a)" >&2
+fi
 [[ "${SGLANG_SWA_BOUNDED_REPLAY:-0}" == "1" ]] && extra_args+=(--enable-decoder-swa-bounded-replay)
 # before the server reports ready, one fresh prompt of each length: the first streamed prefill of a
 # launch otherwise pays its kernel loads and staging on the first request (SGLANG_WARMUP_PREFILL_LENGTHS=

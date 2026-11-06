@@ -60,12 +60,17 @@ pages on the GPU. If the server runs out of memory at launch, a shorter context
   and `libgomp1` are needed.
   The Python packages are pinned in `requirements.txt` (torch 2.14.1 + cu130): the tested
   venv's `pip freeze`, kept whole so that a build repeats it, measurement tools included.
-- **Host settings.** Set these as root, persistently:
+- **Host settings.** None of them is needed to start: without root, `serve.sh` runs and says
+  which one is missing. With the MXFP4 checkpoint they are recommended, set as root and persistently:
   - `echo advise > /sys/kernel/mm/transparent_hugepage/shmem_enabled`. The expert
-    arenas want 2 MB pages; on 4 KB pages, pinning them takes most of an hour.
+    arenas want 2 MB pages. On 4 KB pages, pinning them can take most of an hour at launch.
   - `vm.min_free_kbytes = 8388608`. Without it, the CUDA JIT can hit a node-local OOM
     while the experts fill the nodes.
-  - Swap off.
+  - Swap off. With swap on, pressure on one NUMA node can push the server's memory to swap
+    while the other node still has room.
+
+  A GGUF pack needs none of them: the RTX 2070 machine of [gguf.md](gguf.md) runs it with
+  swap on and the defaults of the other two.
 - **In a container.** The host settings above are set on the host. The recipe was tested in
   Docker on plain Ubuntu 24.04 and 26.04 images with the NVIDIA Container Toolkit, run as
   `docker run --gpus all --network host --shm-size 32g --ulimit memlock=-1 --cap-add SYS_NICE`.

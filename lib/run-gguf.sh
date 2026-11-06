@@ -75,7 +75,7 @@ GGUF="$GGUF" ./setup.sh
 mkdir -p state
 printf 'GGUF=%s\nBUILD=%s\n' "$GGUF" "$BUILD" > state/run-gguf.env
 
-# the host settings the README asks for, as root; the server runs without them, more slowly or less steadily
+# the host settings recommended for the MXFP4 checkpoint (docs/requirements.md); a pack runs without them
 if [[ "$(cat /proc/sys/vm/min_free_kbytes 2>/dev/null || echo 0)" -lt 8388608 ]]; then
   echo "note: vm.min_free_kbytes is below 8388608 (sudo sysctl -w vm.min_free_kbytes=8388608)" >&2
 fi

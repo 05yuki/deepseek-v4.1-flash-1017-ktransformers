@@ -62,7 +62,9 @@ The GGUF has no vision tower, so the model is served as text only.
   The engram rows, the experts RAM does not hold and the prefill's experts are read from it.
 - **Software:** what the MXFP4 checkpoint needs ([requirements.md](requirements.md)), with a CUDA toolkit: `setup.sh` builds the GGUF kernels for the GPU it runs on.
   The prebuilt archive's kt-kernel has the GGUF backend; the GGUF CUDA kernels are not in it, so `GGUF=<dir> ./setup.sh` builds them.
-- **Host settings:** `vm.min_free_kbytes = 8388608` and swap off.
+- **Host settings:** none needed. The RTX 2070 machine runs the pack with swap on, shmem THP `never` and the
+  default `vm.min_free_kbytes`. `run.sh` notes swap and a low `vm.min_free_kbytes`, which
+  [requirements.md](requirements.md) recommends for the MXFP4 checkpoint.
 
 `GGUF=<dir> ./setup.sh` also writes `state/gguf-<dir name>/`:
 
