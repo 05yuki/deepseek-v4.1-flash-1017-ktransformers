@@ -27,12 +27,12 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
 ---
  .../sglang/srt/layers/moe/kt_kv_hot_lend.py   | 550 +++++++++++
- .../srt/layers/moe/kt_kv_prefill_lend.py      | 916 ++++++++++++++++++
+ .../srt/layers/moe/kt_kv_prefill_lend.py      | 931 ++++++++++++++++++
  .../sglang/srt/layers/moe/kt_prefill_plan.py  | 253 +++++
  python/sglang/srt/managers/schedule_batch.py  |  11 +-
  python/sglang/srt/managers/scheduler.py       |   9 +
  .../srt/mem_cache/kv_cache_configurator.py    |  19 +-
- 6 files changed, 1753 insertions(+), 5 deletions(-)
+ 6 files changed, 1768 insertions(+), 5 deletions(-)
  create mode 100644 python/sglang/srt/layers/moe/kt_kv_hot_lend.py
  create mode 100644 python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
  create mode 100644 python/sglang/srt/layers/moe/kt_prefill_plan.py
@@ -595,10 +595,10 @@ index 00000000..f2a4d736
 +    STATE["spare_held"] = 0
 diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 new file mode 100644
-index 00000000..a1f87d71
+index 00000000..f0b871dc
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
-@@ -0,0 +1,916 @@
+@@ -0,0 +1,931 @@
 +"""The KV pool's free pages lend their physical memory to a streamed prefill
 +(KT_PREFILL_KV_LEND=1, with KT_KV_VMM=1 and the prefill lend KT_PREFILL_LEND=1).
 +
@@ -889,23 +889,36 @@ index 00000000..a1f87d71
 +    return cand, mark, ranges, total
 +
 +
++def _lend_spare(a, min_bytes: int) -> int:
++    """Borrow driver memory without removing KV pages. The caller uses a
++    one-byte minimum only when spare memory already covers the lending floor.
++    Return the existing positive sentinel; STATE["bytes"] counts real KV bytes.
++    """
++    if min_bytes > 1:
++        return 0
++    STATE.update(lent=a.free_pages[:0].clone(), ranges=[], bytes=0, owner="hot")
++    STATE["hot_lends"] += 1
++    return 1
++
++
 +def decode_lend(runner, reserve_tokens: int, min_bytes: int) -> int:
-+    """The hot lend, outside prefill: every free page beyond reserve_tokens (and a
-+    page a running request) leaves the free list and its whole chunks are unmapped,
-+    when that is at least min_bytes. Returns the bytes unmapped (0: nothing lent)."""
++    """Lend free KV pages beyond the reserve, or driver spare memory when the
++    caller's minimum is one byte. A positive return admits hot experts; actual
++    unmapped KV bytes remain in STATE["bytes"], including zero for spare-only.
++    """
 +    if not HOT or STATE["lent"] is not None or runner is None or not _setup(runner):
 +        return 0
 +    a, ps = STATE["alloc"], STATE["ps"]
 +    keep = -(-reserve_tokens // ps) + 1
 +    free = _free_count(a)
 +    if free <= keep:
-+        return 0
++        return _lend_spare(a, min_bytes)
 +    est = sum(max(0, (free - keep) * pb - 2 * c) for _, pb, c, _ in STATE["tensors"])
 +    if est < min_bytes:
-+        return 0
++        return _lend_spare(a, min_bytes)
 +    got = _release_free(keep)
 +    if got is None:
-+        return 0
++        return _lend_spare(a, min_bytes)
 +    cand, _, ranges, total = got
 +    STATE.update(lent=cand, ranges=ranges, bytes=total, owner="hot")
 +    STATE["hot_lends"] += 1
@@ -1048,7 +1061,9 @@ index 00000000..a1f87d71
 +    def ensure(pages: int, why: str) -> None:
 +        # the allocator merges what it freed when its free list runs short: those
 +        # pages count (the paged allocator stages every freed page until then)
-+        if STATE["lent"] is not None and pages > _free_count(a):
++        # A spare-only loan has no KV pages to return. Avoid releasing and
++        # reloading hot experts on each conservative allocation check.
++        if _lent() > 0 and pages > _free_count(a):
 +            STATE["take_backs"] += 1
 +            restore(f"take back for {why} ({pages} pages needed, {_free_count(a)} kept)")
 +

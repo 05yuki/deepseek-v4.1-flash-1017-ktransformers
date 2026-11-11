@@ -61,12 +61,12 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
 ---
  .../layers/attention/deepseek_v4_backend.py   |  50 ++++
- .../srt/layers/moe/kt_kv_prefill_lend.py      |  48 ++-
+ .../srt/layers/moe/kt_kv_prefill_lend.py      |  39 ++-
  python/sglang/srt/layers/moe/kt_kv_vmm.py     |  35 ++-
  .../srt/mem_cache/deepseek_v4_memory_pool.py  |  57 +++-
  python/sglang/srt/mem_cache/dsv41_host_kv.py  | 278 ++++++++++++++++++
  .../srt/model_executor/pool_configurator.py   |  29 ++
- 6 files changed, 487 insertions(+), 10 deletions(-)
+ 6 files changed, 479 insertions(+), 9 deletions(-)
  create mode 100644 python/sglang/srt/mem_cache/dsv41_host_kv.py
 
 diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
@@ -145,7 +145,7 @@ index d97de79c..45518463 100644
              swa_kv_page_size = token_to_kv_pool.get_swa_key_page_size()
              assert swa_k_cache.ndim == 2
 diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
-index 461c5211..b6e6da98 100644
+index 1064021e..d39805a8 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 @@ -159,7 +159,7 @@ def _whole_chunks(tensors, mark, n: int, dev):
@@ -209,40 +209,27 @@ index 461c5211..b6e6da98 100644
      mark = torch.zeros(n + 2, dtype=torch.int32, device=dev)
      mark[cand] = 1
      torch.cuda.synchronize(dev)
-@@ -295,18 +316,31 @@ def decode_lend(runner, reserve_tokens: int, min_bytes: int) -> int:
-     """The hot lend, outside prefill: every free page beyond reserve_tokens (and a
-     page a running request) leaves the free list and its whole chunks are unmapped,
-     when that is at least min_bytes. Returns the bytes unmapped (0: nothing lent)."""
+@@ -308,13 +329,19 @@ def decode_lend(runner, reserve_tokens: int, min_bytes: int) -> int:
+     caller's minimum is one byte. A positive return admits hot experts; actual
+     unmapped KV bytes remain in STATE["bytes"], including zero for spare-only.
+     """
 -    if not HOT or STATE["lent"] is not None or runner is None or not _setup(runner):
 +    if not HOT or STATE["lent"] is not None or runner is None:
          return 0
 +    if not _setup(runner):
-+        if not STATE.get("spare_only") or min_bytes > 1:
++        if not STATE.get("spare_only"):
 +            return 0
-+        STATE.update(lent=STATE["alloc"].free_pages[:0].clone(), ranges=[], bytes=0, owner="hot")
-+        STATE["hot_lends"] += 1
-+        return 1
++        return _lend_spare(STATE["alloc"], min_bytes)
      a, ps = STATE["alloc"], STATE["ps"]
      keep = -(-reserve_tokens // ps) + 1
      free = _free_count(a)
      if free <= keep:
-         return 0
+         return _lend_spare(a, min_bytes)
 +    if STATE.get("dev_pages") is not None:
 +        free = min(free, STATE["dev_pages"])  # only device pages lend
      est = sum(max(0, (free - keep) * pb - 2 * c) for _, pb, c, _ in STATE["tensors"])
--    if est < min_bytes:
-+    if est < min_bytes and not (STATE.get("dev_pages") is not None and min_bytes <= 1):
-         return 0
-     got = _release_free(keep)
-     if got is None:
-+        if STATE.get("dev_pages") is not None and min_bytes <= 1:
-+            # a split pool with no free device page to lend: the driver's spare alone
-+            STATE.update(lent=a.free_pages[:0].clone(), ranges=[], bytes=0, owner="hot")
-+            STATE["hot_lends"] += 1
-+            return 1
-         return 0
-     cand, _, ranges, total = got
-     STATE.update(lent=cand, ranges=ranges, bytes=total, owner="hot")
+     if est < min_bytes:
+         return _lend_spare(a, min_bytes)
 diff --git a/python/sglang/srt/layers/moe/kt_kv_vmm.py b/python/sglang/srt/layers/moe/kt_kv_vmm.py
 index d6a2431f..2646726b 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_vmm.py
