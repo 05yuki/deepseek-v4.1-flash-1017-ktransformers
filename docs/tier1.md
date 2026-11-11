@@ -32,9 +32,9 @@ the code" are on as soon as the patch is applied.
 | 12 | [`12-kv-vmm.patch`](#12-kv-vmm) | +242 / -0 | none |
 | 13 | [`13-prefill-lend.patch`](#13-prefill-lend) | +1664 / -1 | none |
 | 14 | [`14-stream-prefill.patch`](#14-stream-prefill) | +2062 / -14 | `loading`, `placement`, `prefill-lend` |
-| 15 | [`15-kv-lend-plan.patch`](#15-kv-lend-plan) | +1753 / -5 | `kv-vmm`, `prefill-lend` |
+| 15 | [`15-kv-lend-plan.patch`](#15-kv-lend-plan) | +1768 / -5 | `kv-vmm`, `prefill-lend` |
 | 16 | [`16-hot-lend.patch`](#16-hot-lend) | +736 / -34 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan` |
-| 17 | [`17-host-kv.patch`](#17-host-kv) | +487 / -10 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan`, `hot-lend` |
+| 17 | [`17-host-kv.patch`](#17-host-kv) | +479 / -9 | `kv-vmm`, `prefill-lend`, `stream-prefill`, `kv-lend-plan`, `hot-lend` |
 | 18 | [`18-stream-mmq.patch`](#18-stream-mmq) | +1618 / -3 (llama.cpp's kernels come from `lib/llama-mmq.sh`) | `stream-prefill` |
 | 19 | [`19-cpu-gpu-overlap.patch`](#19-cpu-gpu-overlap) | +190 / -2 | `loading`, `placement`, `prefill-lend`, `stream-prefill` |
 | 20 | [`20-expert-cache.patch`](#20-expert-cache) | +200 / -3 | `loading`, `placement`, `prefill-lend`, `stream-prefill`, `kv-vmm`, `kv-lend-plan`, `hot-lend`, `stream-mmq` |
@@ -419,6 +419,17 @@ Files (under `python/sglang/`):
 ## 16 hot-lend
 
 `KT_KV_HOT_LEND=1`: outside prefill the KV pool's free pages hold up to `KT_KV_HOT_EXTRA` more experts a layer on the GPU, on a shadow layer; their routes go to the GPU and to the CPU at weight 0. The experts leave whenever the pool needs the pages or a prefill starts. `KT_KV_HOT_SPARE_FLOOR_MB` lets the slots also use idle driver memory above the floor. A lend needs `KT_KV_HOT_MIN_MB` (256) of free pages and idle driver memory together: with V4.1's KV formats the free pages alone hold half as much, and counting them alone left the slots empty. `KT_KV_HOT_EXTRA=auto` (serve.sh) gives a layer a slot for every non-resident expert in address space only, so how many hold memory follows the free memory at each lend (on two 16 GB cards 14-15 a layer with one resident expert). `KT_KV_HOT_RESERVE` keeps free KV pages back for 65,536 tokens: a new request's pages come from them, instead of every slot being handed back and loaded again for each request. Every rank holds the same slots, the fewest any rank has room for: the CPU runs on rank 0 with its routing.
+
+Retained prefixes can leave fewer free KV pages than `KT_KV_HOT_RESERVE`
+while the driver still has spare memory. That spare can hold hot experts on
+its own: when it covers the caller's minimum, the lend keeps an empty page
+list and returns a positive admission sentinel; its recorded KV bytes stay
+zero. Allocation checks only take back a loan with actual pages to return,
+so a conservative allocation estimate cannot repeatedly release and reload
+experts to reclaim zero pages. A prefill window or cache clear still releases
+spare-only experts. The reserve, driver floor and cross-rank agreement are
+unchanged. `python tools/hot-expert-spare-lending-test.py` checks the lending,
+allocator and release paths without torch or a GPU.
 
 `KT_KV_HOT_DYNAMIC_SLOTS=1`: the slots follow what is routed. Every routed expert is counted on the GPU; every 8 decode steps, outside the CUDA graph, each layer swaps up to 16 of its slots' experts for ones routed more often (counts halved every 256 steps). An expert that loses leaves the slot table at once and runs on the CPU again; the new one is copied in on a side stream straight from kt-kernel's expert memory (the zero-copy mapping `stream-prefill` registers, no host copy) and enters the table on the next round. A round waits for nothing the GPU is still doing: its table updates go up from pinned memory, split by table on the host, and the swapped-out experts leave by `index_fill_`, so the decode forward in flight runs on (on two GPUs a round takes 12 ms of host time instead of 24, decode +7-9%). At the first lend the slots check that experts copied this way match the placement's, byte for byte, and stay with the placement's experts if not (the lend then gives a layer only as many slots as there are banks). With `KT_KV_HOT_DYNAMIC_RESIDENT=1` the resident experts swap too, from one pool with the slots: kt-kernel then loads every expert, so one that leaves a resident row runs on the CPU, and the route tells kt-kernel which routes the GPU takes. When a prefill window opens, before the weights give up their memory, the resident rows are loaded with the placement's first experts again from kt-kernel's expert memory, weights and scales, and the next lend fills them again. Until 2026-10-31 the rows were left to the prefill lend's pinned copy, which holds only tensors of at least 1 MiB: the rows' scales stayed those of the expert swapped in, so every streamed prefill after a swap, and the first forward after it, ran those layers with another expert's scales (eight 1,536-token pieces after an English reply: NLL 0.8362, now 0.5328; 0.5297 on a fresh server). A pool clear (`/flush_cache`) gives the slots back before the SWA lend maps its pages again: until 2026-11-01 the SWA allocator, which the pool clears first, mapped them while the slots still held the memory, and both ranks went down. The route runs as one Triton kernel a layer. Without the dynamic slots the slots hold the placement's next-hottest experts, and the placement in `placements/` was recorded on Japanese prose: it catches 3-6% of the routes of code, JSON or math.
 

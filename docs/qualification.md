@@ -18,6 +18,7 @@ The Triton kernels run there in Triton's interpreter on the CPU.
 | `tools/test_sm89_dispatch.py` | the patched SGLang tree | CI |
 | `tools/test_qualify_cache.py` | nothing | CI |
 | `tools/lend-transition-fences-test.py` | nothing | CI |
+| `tools/hot-expert-spare-lending-test.py` | git | CI |
 | `tools/e4m3-emulation-test.py` | torch | CI |
 | `tools/test_live_topk.py` | torch and Triton; `--gpu` also checks on a GPU | CI on the CPU, by hand on a GPU |
 | `tools/test_merge_sink.py` | the same, with `sglang-optional/01` applied | CI on the CPU, by hand on a GPU |
