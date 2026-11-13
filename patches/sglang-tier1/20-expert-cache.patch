@@ -1,4 +1,4 @@
-From a88e0a51c22087a8f0bc34f423045777ffe22c8b Mon Sep 17 00:00:00 2001
+From 426de06571c79cd7067de2ec0dcb8e0c021afafd Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Fri, 30 Oct 2026 13:17:24 +0900
 Subject: [PATCH] expert-cache: the streamed prefill and the dynamic hot slots
@@ -97,7 +97,7 @@ index 7fba8c33..5d098bf5 100644
      elif roles is None:
          why = f"slot tensors {[(nm, str(L.slots[nm].dtype)) for _, nm in L.names]} are not packed MXFP4 bytes"
 diff --git a/python/sglang/srt/layers/moe/kt_stream_prefill.py b/python/sglang/srt/layers/moe/kt_stream_prefill.py
-index 8227eba0..ebf8bc1e 100644
+index 40ca61d2..cc7cf066 100644
 --- a/python/sglang/srt/layers/moe/kt_stream_prefill.py
 +++ b/python/sglang/srt/layers/moe/kt_stream_prefill.py
 @@ -107,6 +107,12 @@ CPUCHECK = os.environ.get("KT_GPU_STREAM_CPUCHECK", "1") == "1"

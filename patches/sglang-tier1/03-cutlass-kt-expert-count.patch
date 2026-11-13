@@ -1,4 +1,4 @@
-From a71c7d6ef560d659e5f3a54cd83c77505fa1cdb9 Mon Sep 17 00:00:00 2001
+From beae4eae79a876cdabf52a641efbbf00ce8ff6c4 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:34 +0900
 Subject: [PATCH] cutlass-kt-expert-count: CUTLASS MXFP4 MoE takes its expert

@@ -1,7 +1,7 @@
 # Tier 1, one patch per feature
 
 Tier 1 is one patch per feature in `patches/sglang-tier1/`, applied in the order of their numbers on
-SGLang main at `58484246` after tiers 0 and 0.5; tier 2 applies on top. `setup.sh` applies all of them by
+SGLang main at `8c7ec052` after tiers 0 and 0.5; tier 2 applies on top. `setup.sh` applies all of them by
 default; `SGLANG_FEATURES=a,b,...` picks some (the names below), and `serve.sh` turns on only what
 was applied.
 
@@ -822,7 +822,13 @@ and the free-memory reads and the swap budget are as before.
 
 ## 27 live-topk
 
-The non-paged decode indexer (SM89 and SM12x) selects among the live positions instead of the
+Since the move to SGLang main `8c7ec052` this patch acts on SM89 only. On SM100 and newer, SM12x
+included, SGLang main scores the decode indexer with DeepGEMM's paged fp8/fp4 kernel
+(`use_deep_gemm_decode`), which reads the live pages itself, and the torch path below is not taken.
+Decode on two RTX 5070 Ti is the same before and after the move (54.8 against 54.9 tok/s, the
+medians of `tools/bench.py`). The SM12x numbers below are from the pin before it, `58484246`.
+
+The non-paged decode indexer (SM89, and SM12x up to `58484246`) selects among the live positions instead of the
 graph capacity. Without the patch each of the eight index layers runs `torch.topk`, a sort and
 gathers over the capacity (1,048,580 columns at ratio 1 on a 1M pool) at every decode step past
 512 tokens of context. With it the slots and the selection read the device-side lengths, so a

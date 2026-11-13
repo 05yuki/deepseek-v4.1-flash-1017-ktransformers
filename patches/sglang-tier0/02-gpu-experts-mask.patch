@@ -1,4 +1,4 @@
-From 0823e5ae3a0b8485a116a97492502209258b6467 Mon Sep 17 00:00:00 2001
+From 211b0eee2d33f84b97eb70c9221e7d4b2fb6f9ad Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:32 +0900
 Subject: [PATCH] kt: pass the GPU expert mask kt-kernel's inference API takes

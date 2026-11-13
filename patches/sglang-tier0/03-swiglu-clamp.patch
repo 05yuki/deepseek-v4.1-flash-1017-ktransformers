@@ -1,4 +1,4 @@
-From 7763b54b22c77b17e2f37d0ca76de5654adfe2c7 Mon Sep 17 00:00:00 2001
+From 101e33f84e9f5481808ef0c4b573842e422277e8 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:32 +0900
 Subject: [PATCH] kt: pass the model's SwiGLU clamp to the CPU experts

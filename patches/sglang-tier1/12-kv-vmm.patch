@@ -1,4 +1,4 @@
-From fff7f99f22fc567bb66eaeb3296706710d647910 Mon Sep 17 00:00:00 2001
+From 25edd496e46f78720c441c0d1c3f386246e39cfd Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] kv-vmm: the KV pool on remappable memory (CUDA VMM)
@@ -262,7 +262,7 @@ index 00000000..d6a2431f
 +    """Map zeroed chunks wherever t's bytes [off, off + length) have none. -1: no memory."""
 +    return int(_load().kv_vmm_restore(ctypes.c_void_p(t.data_ptr()), off, length))
 diff --git a/python/sglang/srt/utils/torch_memory_saver_adapter.py b/python/sglang/srt/utils/torch_memory_saver_adapter.py
-index cd5c96ed..b6d698a3 100644
+index 613fd033..ca11eb17 100644
 --- a/python/sglang/srt/utils/torch_memory_saver_adapter.py
 +++ b/python/sglang/srt/utils/torch_memory_saver_adapter.py
 @@ -143,6 +143,14 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):

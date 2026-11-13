@@ -17,8 +17,8 @@ The engram tables (about 200 GB) are read from the checkpoint on disk, with no e
 
 This repository is everything needed: patches against two public upstream commits, a setup
 script that builds them, a launcher that reads the machine it runs on, and tests ([which run where](docs/qualification.md#tests)).
-Each tag pins those commits: SGLang main at `58484246` and KTransformers `95009ea` today, with
-torch 2.14.1 on CUDA 13 wheels, FlashInfer 0.7.2 and CUDA toolkit 13.1.
+Each tag pins those commits: SGLang main at `8c7ec052` and KTransformers `95009ea` today, with
+torch 2.14.1 on CUDA 13 wheels, FlashInfer 0.7.4 and CUDA toolkit 13.1.
 The recipe follows SGLang main: every few weeks the patches move to a newer commit, are measured
 again, and go out under a new tag.
 The SGLang patches are the commits of branch `dsv41-1017-main` of

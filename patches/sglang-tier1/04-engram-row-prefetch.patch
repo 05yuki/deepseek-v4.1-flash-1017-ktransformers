@@ -1,4 +1,4 @@
-From 95659447d46db1e25168099d624ab1b994f4594c Mon Sep 17 00:00:00 2001
+From 57fedfad2814833c451a7ebe7de3ec88a3a279ea Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] engram-row-prefetch: start the engram row lookups with the
@@ -31,10 +31,10 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  2 files changed, 74 insertions(+), 7 deletions(-)
 
 diff --git a/python/sglang/srt/layers/engram.py b/python/sglang/srt/layers/engram.py
-index 20e4d172..07741bc0 100644
+index a047cbb2..908ff842 100644
 --- a/python/sglang/srt/layers/engram.py
 +++ b/python/sglang/srt/layers/engram.py
-@@ -1559,6 +1559,12 @@ class Engram(nn.Module):
+@@ -1574,6 +1574,12 @@ class Engram(nn.Module):
              # Nothing to gate, and the MXFP8 quantize behind wkv rejects an
              # empty M.
              return x
@@ -48,7 +48,7 @@ index 20e4d172..07741bc0 100644
          image_ids = input_ids if self.image_token_id is not None else None
          return engram_gate(
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index c6bf678e..3fbe3985 100644
+index 07b86122..361af998 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
 @@ -3,6 +3,7 @@ from __future__ import annotations
@@ -59,7 +59,7 @@ index c6bf678e..3fbe3985 100644
  import time
  from array import array
  from contextlib import contextmanager, nullcontext
-@@ -4021,6 +4022,26 @@ class DeepseekV4Model(nn.Module):
+@@ -4130,6 +4131,26 @@ class DeepseekV4Model(nn.Module):
                  self.engram_layout,
                  image_token_id=_engram_image_token_id(config),
              )
@@ -86,7 +86,7 @@ index c6bf678e..3fbe3985 100644
  
          if not _is_cuda:
              self.use_fused_mhc_post_pre = (
-@@ -4176,6 +4197,37 @@ class DeepseekV4Model(nn.Module):
+@@ -4285,6 +4306,37 @@ class DeepseekV4Model(nn.Module):
                  bcg_deepseek_v4_engram_hash_ids(self.engram_hasher, input_ids, hash_ids)
              else:
                  hash_ids = self.engram_hasher(input_ids, forward_batch)
@@ -124,7 +124,7 @@ index c6bf678e..3fbe3985 100644
          tail = None
          if (
              self.late_layer_start is not None
-@@ -4354,13 +4406,22 @@ class DeepseekV4Model(nn.Module):
+@@ -4463,13 +4515,22 @@ class DeepseekV4Model(nn.Module):
              if engram is not None:
                  # No local name holds the pre-Engram residual: it would stay alive
                  # until the next Engram layer.

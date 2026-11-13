@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$here"
-SGLANG_COMMIT=58484246d26523eaf1a7f16ab524deee288d2120
+SGLANG_COMMIT=8c7ec05287904d88854d9fb5bcbe1a5181282b5e
 KT_COMMIT=95009ea6856c0799e517e93cb12be5e8494bc7ce
 TIER="${TIER:-2}"
 [[ "$TIER" =~ ^[012]$ ]] || { echo "TIER must be 0, 1 or 2 (tiers 2 and 3 of before 10-21 are 1 and 2)" >&2; exit 2; }

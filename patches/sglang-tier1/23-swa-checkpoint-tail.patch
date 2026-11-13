@@ -1,4 +1,4 @@
-From 75e3e8f0b6edeace4c0857c10479f14ffd869898 Mon Sep 17 00:00:00 2001
+From a5d13d138d0728129b4b8796832a1668f2fbcebe Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Tue, 3 Nov 2026 11:00:40 +0900
 Subject: [PATCH] swa-checkpoint-tail: keep the window a later match ends on
@@ -36,36 +36,36 @@ Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
  1 file changed, 16 insertions(+), 2 deletions(-)
 
 diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
-index 39ef5f96..193e39c3 100644
+index d6fc7c15..4524178b 100644
 --- a/python/sglang/srt/mem_cache/unified_radix_cache.py
 +++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
-@@ -1466,7 +1466,14 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -1626,7 +1626,14 @@ class UnifiedRadixCache(BasePrefixCache):
              # The insert stops at page_floor(len(radix_key)), and a bigram key is
              # one shorter than the tokens it spans, so measure the key.
              for comp in self._components_tuple:
 -                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
-+                # A later match of this key stops swa_reprefill_tail_tokens short of its
++                # A later match of this key stops window_reprefill_tail_tokens short of its
 +                # end; keep the window before that point live too, or the match falls
 +                # back to the previous checkpoint.
 +                comp.free_out_of_window_slots(
 +                    req,
-+                    len(radix_key) - 1 - self.swa_reprefill_tail_tokens(req),
++                    len(radix_key) - 1 - self.window_reprefill_tail_tokens(req),
 +                    insert_params,
 +                )
  
          if effective_cache_len <= 0:
              for comp in self._components_tuple:
-@@ -1625,7 +1632,14 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -1795,7 +1802,14 @@ class UnifiedRadixCache(BasePrefixCache):
          )
          if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
              for comp in self._components_tuple:
 -                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
-+                # A later match of this key stops swa_reprefill_tail_tokens short of its
++                # A later match of this key stops window_reprefill_tail_tokens short of its
 +                # end; keep the window before that point live too, or the match falls
 +                # back to the previous checkpoint.
 +                comp.free_out_of_window_slots(
 +                    req,
-+                    len(radix_key) - 1 - self.swa_reprefill_tail_tokens(req),
++                    len(radix_key) - 1 - self.window_reprefill_tail_tokens(req),
 +                    insert_params,
 +                )
  

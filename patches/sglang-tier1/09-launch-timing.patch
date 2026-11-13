@@ -1,4 +1,4 @@
-From 86152cb96c5971ea389d1f4cee58caf1f43f1d68 Mon Sep 17 00:00:00 2001
+From bc53156f53a637d047cb3a0a14e9f82c0fe761e1 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] launch-timing: KT_LAUNCH_TIMING, a timeline of the weight
@@ -425,10 +425,10 @@ index 00000000..0582aba5
 +        log(f"loader not wrapped: {e}")
 +    log("installed")
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index b4de08e3..14101199 100644
+index e1d6861d..d72142f1 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -1339,6 +1339,11 @@ class ModelRunner:
+@@ -1338,6 +1338,11 @@ class ModelRunner:
  
      def load_model(self):
          tic_total = time.perf_counter()

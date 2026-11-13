@@ -1,4 +1,4 @@
-From ea4f64da65d2f104faecd00c8e39b7849dad5be0 Mon Sep 17 00:00:00 2001
+From a54dd35d9d6c24cbb3ce91f8ee14d61e49080a99 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Wed, 28 Oct 2026 16:00:40 +0900
 Subject: [PATCH] stream-mmq: the streamed experts through llama.cpp's MMQ, the
@@ -1614,7 +1614,7 @@ index 00000000..989d09bc
 +
 +}  // namespace sgl_llama_mmq
 diff --git a/python/sglang/srt/layers/moe/kt_stream_prefill.py b/python/sglang/srt/layers/moe/kt_stream_prefill.py
-index 4bc89834..8227eba0 100644
+index 8d0d5e6f..40ca61d2 100644
 --- a/python/sglang/srt/layers/moe/kt_stream_prefill.py
 +++ b/python/sglang/srt/layers/moe/kt_stream_prefill.py
 @@ -72,6 +72,14 @@ USE_GRAPH = os.environ.get("KT_GPU_STREAM_GRAPH", "1") == "1"

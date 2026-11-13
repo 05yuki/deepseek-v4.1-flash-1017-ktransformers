@@ -1,4 +1,4 @@
-From 7f24bf3c045406a8c9a79bb303269be9abf80172 Mon Sep 17 00:00:00 2001
+From d29bf2205822e6e56ae0a1d3535d0114e863dfe1 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] stream-prefill: stream the CPU experts to the GPU for long
@@ -212,7 +212,7 @@ index 9363f0e9..f4d1b094 100644
  
 diff --git a/python/sglang/srt/layers/moe/kt_stream_prefill.py b/python/sglang/srt/layers/moe/kt_stream_prefill.py
 new file mode 100644
-index 00000000..4bc89834
+index 00000000..8d0d5e6f
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_stream_prefill.py
 @@ -0,0 +1,1761 @@
@@ -1592,7 +1592,7 @@ index 00000000..4bc89834
 +    def run(self, method, layer, dispatch_output, physical_ids: torch.Tensor) -> torch.Tensor:
 +        """Sum of the streamed experts' outputs for this layer, [tokens, hidden]."""
 +        from flashinfer import mxfp8_quantize
-+        from sglang.srt.utils.common import next_power_of_2
++        from sglang.srt.utils.triton_utils import next_power_of_2
 +
 +        x = dispatch_output.hidden_states
 +        T = x.shape[0]
@@ -1978,7 +1978,7 @@ index 00000000..4bc89834
 +    kept = max(1, n_groups - cpu_groups)
 +    return min(last, first + kept * streamer.G)
 diff --git a/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py b/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
-index 89965886..34823777 100644
+index 8e11b2a1..22af7327 100644
 --- a/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
 +++ b/python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py
 @@ -11,6 +11,8 @@ from __future__ import annotations
@@ -1990,7 +1990,7 @@ index 89965886..34823777 100644
  import torch
  
  from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
-@@ -154,6 +156,139 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
+@@ -155,6 +157,139 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
      padded_hidden: Optional[int] = None
  
  
@@ -2130,7 +2130,7 @@ index 89965886..34823777 100644
  def _flashinfer_cutlass_fused_moe():
      if not is_flashinfer_available():
          raise RuntimeError(
-@@ -488,6 +623,49 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
+@@ -489,6 +624,49 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
      from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
      from sglang.srt.layers.moe.topk import TopKOutputChecker
  
@@ -2180,7 +2180,7 @@ index 89965886..34823777 100644
      x = dispatch_output.hidden_states
      if x.shape[0] == 0:
          return StandardCombineInput(hidden_states=x)
-@@ -581,6 +759,18 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
+@@ -582,6 +760,18 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
          get_parallel().tp_group, disabled=not is_allocation_symmetric()
      ):
          out = torch.empty(x.shape[0], out_hidden, dtype=output_dtype, device=x.device)
@@ -2199,7 +2199,7 @@ index 89965886..34823777 100644
  
      flashinfer_cutlass_fused_moe(
          input=x,
-@@ -611,6 +801,7 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
+@@ -612,6 +802,7 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
          output=out,
          use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
          **humming_kwargs,

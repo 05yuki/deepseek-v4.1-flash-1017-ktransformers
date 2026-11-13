@@ -1,6 +1,6 @@
 # What the patches do
 
-Last move to SGLang main: 2026-11-04, to `58484246` (tag `2026-11-04-1912`).
+Last move to SGLang main: 2026-11-14, to `8c7ec052`.
 When a newer pin breaks a patch, the "patches apply" CI job names it; each patch's commit message on
 [`dsv41-1017-main`](https://github.com/05yuki/sglang-upstream/tree/dsv41-1017-main) says what it changes
 and how it was checked, and `tools/qualify.sh` on one and two GPUs decides whether the move goes out.
@@ -9,7 +9,7 @@ and how it was checked, and `tools/qualify.sh` on one and two GPUs decides wheth
 
 | tier | file | applies to |
 |---|---|---|
-| 0 | `patches/sglang-tier0/NN-*.patch` | sgl-project/sglang main at `58484246`, one concern each |
+| 0 | `patches/sglang-tier0/NN-*.patch` | sgl-project/sglang main at `8c7ec052`, one concern each |
 | 0.5 | `patches/sglang-tier0.5/01-gguf.patch` | the same, after tier 0, at every tier: the GGUF format ([gguf.md](gguf.md)) |
 | 1 | `patches/sglang-tier1/NN-*.patch` | the same, after tiers 0 and 0.5: one patch per feature ([tier1.md](tier1.md)) |
 | 2 | `patches/sglang-tier2-no-p2p.patch` | the same, after tier 1 |
@@ -36,7 +36,7 @@ and how it was checked, and `tools/qualify.sh` on one and two GPUs decides wheth
 - **Tier 2** is what depends on the machine: two GPUs without peer access.
 
 The SGLang patches are the commits of branch `dsv41-1017-main` of
-[05yuki/sglang-upstream](https://github.com/05yuki/sglang-upstream/tree/dsv41-1017-main) on `58484246`, one
+[05yuki/sglang-upstream](https://github.com/05yuki/sglang-upstream/tree/dsv41-1017-main) on `8c7ec052`, one
 concern a commit, in `git format-patch` form: each file carries its commit message (what the change
 is for, its switch, how it was checked). `git log` on the branch reads as the list below.
 
@@ -45,7 +45,7 @@ A switch marked "on" is on in `serve.sh`.
 ## SGLang tier 0
 
 What 1017 needs to run correctly. Each patch is one concern; its commit message says how
-it was checked. Seven are pull requests to SGLang, one concern each; when one is merged, its
+it was checked. Six are pull requests to SGLang, one concern each; when one is merged, its
 patch goes and the pin moves past it.
 
 | patch | upstream |
@@ -57,8 +57,8 @@ patch goes and the pin moves past it.
 | `05-zero-gpu-experts` | [#45188](https://github.com/sgl-project/sglang/pull/45188) |
 | `06-load-timeout` | [#45184](https://github.com/sgl-project/sglang/pull/45184) |
 | `07-chat-encoding` | dropped 2026-10-25: SGLang main renders DeepSeek-V4.1 prompts through `deepseek-recipe` 0.2.0 ([#45315](https://github.com/sgl-project/sglang/pull/45315)); where that differs from the checkpoint's encoding is under [Chat encoding (dropped)](#chat-encoding-dropped) |
-| `08-sm12x-indexer` | not sent |
-| `09-indexer-score-in-place` | [#45745](https://github.com/sgl-project/sglang/pull/45745) |
+| `08-sm12x-indexer` | dropped 2026-11-14: SGLang main runs the V4.1 indexer through DeepGEMM on SM100 and newer, SM12x included (`sgl-deep-gemm` 0.2.8), so the torch path is no longer forced there |
+| `09-indexer-score-in-place` | dropped 2026-11-14: SGLang main scores the torch path in place ([#45807](https://github.com/sgl-project/sglang/pull/45807)), the change #45745 made |
 | `10-routed-scale-once` | [#45810](https://github.com/sgl-project/sglang/pull/45810) |
 | `11-v41-kv-layout` | [#45851](https://github.com/sgl-project/sglang/pull/45851) |
 | `12-low-ratio-pool-bytes` | dropped 2026-10-28: SGLang main prices the ratio-1/2 entry by its own layout ([#41275](https://github.com/sgl-project/sglang/pull/41275)), the change #45931 made, and counts the pages the pool reserves on top |

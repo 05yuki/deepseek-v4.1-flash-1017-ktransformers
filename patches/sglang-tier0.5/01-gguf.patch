@@ -1,4 +1,4 @@
-From 36a5d8fb9b1efb904b51aeb47e005224c56fba28 Mon Sep 17 00:00:00 2001
+From b3e8a2d8241dc23d6c1bcd838ce7f3d48dd8beb3 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Wed, 4 Nov 2026 20:43:41 +0900
 Subject: [PATCH] gguf: DeepSeek-V4.1 from a GGUF pack, the format on tier 0
@@ -79,10 +79,10 @@ index bc103d3d..a99875df 100644
      else:
          amax = tl.maximum(amax, AMAX_FLOOR) * (1.0 / 6.0)
 diff --git a/python/sglang/kernels/ops/attention/dsv4/triton_sparse_decode/triton_mla_kernels_decode_fused.py b/python/sglang/kernels/ops/attention/dsv4/triton_sparse_decode/triton_mla_kernels_decode_fused.py
-index c0a4f3bc..30fb97b8 100644
+index e0e399ed..84270a02 100644
 --- a/python/sglang/kernels/ops/attention/dsv4/triton_sparse_decode/triton_mla_kernels_decode_fused.py
 +++ b/python/sglang/kernels/ops/attention/dsv4/triton_sparse_decode/triton_mla_kernels_decode_fused.py
-@@ -23,6 +23,33 @@ from sglang.srt.utils.common import is_gfx942_supported
+@@ -23,6 +23,33 @@ from sglang.srt.utils.device import is_gfx942_supported
  # gfx950/MI350 and CUDA store OCP e4m3fn (bias 7).
  _KV_FP8_TY = tl.float8e4b8 if is_gfx942_supported() else tl.float8e4nv
  
@@ -116,7 +116,7 @@ index c0a4f3bc..30fb97b8 100644
  
  def _bucket_total_tokens(total_tokens: int) -> int:
      """Round total_tokens up to the nearest power of 2 for autotune key stability."""
-@@ -219,44 +246,44 @@ def _process_kv_block_aggressive(
+@@ -212,44 +239,44 @@ def _process_kv_block_aggressive(
  
      qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
  
@@ -176,7 +176,7 @@ index c0a4f3bc..30fb97b8 100644
  
      qk = qk * sm_scale
      qk = tl.where(valid[None, :], qk, NEG_INF)
-@@ -268,14 +295,14 @@ def _process_kv_block_aggressive(
+@@ -261,14 +288,14 @@ def _process_kv_block_aggressive(
      l_new = alpha * l_i + tl.sum(p, axis=1)
      p_bf16 = p.to(tl.bfloat16)
  
@@ -224,10 +224,10 @@ index 50f40afa..a832049b 100644
          output = _linear_bf16_fp32_hpc(x, y, min_m=hpc_kernel_min_m)
          if output is not None:
 diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-index ded2e685..d97de79c 100644
+index 4e3d64ff..76631642 100644
 --- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
 +++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
-@@ -255,7 +255,8 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
+@@ -261,7 +261,8 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
  def _use_sm89_sparse_attention() -> bool:
      # Ada has BF16 tensor cores, but cannot run FlashMLA's SM90+ kernels.
      # Match the runtime platform exactly; native SM90/SM100/SM120 paths stay intact.
@@ -380,10 +380,10 @@ index 00000000..187a9665
 +    _loaded = True
 +    logger.info("sgl-kernel ops built for sm_%d%d: %s", *torch.cuda.get_device_capability(), ", ".join(_OPS))
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-index d27675f8..f39af794 100644
+index 46c40cdc..4c73f505 100644
 --- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 +++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-@@ -537,7 +537,19 @@ class FusedMoE(torch.nn.Module):
+@@ -535,7 +535,19 @@ class FusedMoE(torch.nn.Module):
          server_args = get_server_args()
          kt_config = create_kt_config_from_server_args(server_args, layer_id)
          if kt_config is not None:
@@ -2623,10 +2623,10 @@ index 00000000..5b8785b3
 +# kvalues_iq4nl: the IQ4_NL / IQ4_XS non-linear 4-bit values (ggml-quants.c)
 +KVALUES_IQ4NL = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
 diff --git a/python/sglang/srt/layers/quantization/gguf.py b/python/sglang/srt/layers/quantization/gguf.py
-index 666efe32..1b5b4d30 100644
+index b9f0da42..7d087a8e 100644
 --- a/python/sglang/srt/layers/quantization/gguf.py
 +++ b/python/sglang/srt/layers/quantization/gguf.py
-@@ -205,6 +205,89 @@ def dequantize_gguf_weight(
+@@ -206,6 +206,89 @@ def dequantize_gguf_weight(
      return ggml_dequantize(qweight, qweight_type, *shape, dtype)
  
  
@@ -2716,7 +2716,7 @@ index 666efe32..1b5b4d30 100644
  def fused_mul_mat_gguf(
      x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
  ) -> torch.Tensor:
-@@ -219,6 +302,30 @@ def fused_mul_mat_gguf(
+@@ -220,6 +303,30 @@ def fused_mul_mat_gguf(
      # there is no need to call any kernel for fp16/bf16
      if qweight_type in UNQUANTIZED_TYPES:
          return x @ qweight.T
@@ -2747,7 +2747,7 @@ index 666efe32..1b5b4d30 100644
      # enable MMVQ in contiguous batching with batch_size=1
      if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
          y = ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
-@@ -374,6 +481,48 @@ def fused_moe_gguf(
+@@ -375,6 +482,48 @@ def fused_moe_gguf(
      return out_hidden_states
  
  
@@ -2796,7 +2796,7 @@ index 666efe32..1b5b4d30 100644
  def apply_gguf_embedding(
      x: torch.Tensor,
      qweight: torch.Tensor,
-@@ -383,6 +532,14 @@ def apply_gguf_embedding(
+@@ -384,6 +533,14 @@ def apply_gguf_embedding(
  ) -> torch.Tensor:
      if qweight_type in UNQUANTIZED_TYPES:
          return torch.embedding(qweight, x)
@@ -2811,7 +2811,7 @@ index 666efe32..1b5b4d30 100644
      elif qweight_type in DEQUANT_TYPES:
          block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
          x_flat = x.flatten()
-@@ -397,6 +554,12 @@ def apply_gguf_embedding(
+@@ -398,6 +555,12 @@ def apply_gguf_embedding(
          raise NotImplementedError(f"Unsupported GGUF quantization type: {qweight_type}")
  
  
@@ -2824,7 +2824,7 @@ index 666efe32..1b5b4d30 100644
  class GGUFLinearMethod(LinearMethodBase):
      """Linear method for GGUF.
  
-@@ -463,6 +626,15 @@ class GGUFLinearMethod(LinearMethodBase):
+@@ -464,6 +627,15 @@ class GGUFLinearMethod(LinearMethodBase):
          # For MergedColumnParallelLinear and QKVParallelLinear, we need to
          # materialize the padded weight parameter for CUDA Graph compatibility.
          self._create_padded_weight_param(layer)
@@ -2841,10 +2841,10 @@ index 666efe32..1b5b4d30 100644
      def _create_padded_weight_param(self, layer: torch.nn.Module):
          """Create padded weight parameter for GGUF MergedLinear layer."""
 diff --git a/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py b/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
-index 1390153c..e8ae6414 100644
+index dfbbd669..5e642e97 100644
 --- a/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
 +++ b/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py
-@@ -80,7 +80,8 @@ class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
+@@ -125,7 +125,8 @@ class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
  
  
  def maybe_downgrade_dtype_for_legacy_gpu(*, model_config: ModelConfig) -> None:
@@ -2855,10 +2855,10 @@ index 1390153c..e8ae6414 100644
              "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
          )
 diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
-index 4146a420..2ec313af 100644
+index cbb617a1..095230a7 100644
 --- a/python/sglang/srt/model_loader/loader.py
 +++ b/python/sglang/srt/model_loader/loader.py
-@@ -772,8 +772,19 @@ class DefaultModelLoader(BaseModelLoader):
+@@ -805,8 +805,19 @@ class DefaultModelLoader(BaseModelLoader):
          model: nn.Module,
      ) -> Generator[Tuple[str, torch.Tensor], None, None]:
  
@@ -2881,10 +2881,10 @@ index 4146a420..2ec313af 100644
          secondary_weights = cast(
              Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index d81fec0f..c6bf678e 100644
+index 40d6ad1e..07b86122 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -699,6 +699,56 @@ _FREQS_CIS_TO_COS_SIN: dict[
+@@ -705,6 +705,56 @@ _FREQS_CIS_TO_COS_SIN: dict[
  ] = {}
  
  
@@ -2941,7 +2941,7 @@ index d81fec0f..c6bf678e 100644
  def _freqs_cis_to_cos_sin(
      freqs_cis: torch.Tensor, dtype: torch.dtype, device: torch.device
  ) -> Tuple[torch.Tensor, torch.Tensor]:
-@@ -710,8 +760,8 @@ def _freqs_cis_to_cos_sin(
+@@ -716,8 +766,8 @@ def _freqs_cis_to_cos_sin(
      if cached is not None:
          return cached
      fr = torch.view_as_real(freqs_cis)
@@ -2952,7 +2952,7 @@ index d81fec0f..c6bf678e 100644
      _FREQS_CIS_TO_COS_SIN[key] = (cos, sin)
      return cos, sin
  
-@@ -738,6 +788,23 @@ def _fp8_wo_a_einsum(
+@@ -744,6 +794,23 @@ def _fp8_wo_a_einsum(
      return out
  
  
@@ -2976,7 +2976,7 @@ index d81fec0f..c6bf678e 100644
  def _apply_gguf_grouped_wo_a(
      o: torch.Tensor,
      qweight: torch.Tensor,
-@@ -749,6 +816,44 @@ def _apply_gguf_grouped_wo_a(
+@@ -755,6 +822,44 @@ def _apply_gguf_grouped_wo_a(
          from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
  
          matmul_fn = fused_mul_mat_gguf
@@ -3021,7 +3021,7 @@ index d81fec0f..c6bf678e 100644
  
      group_outputs = []
      for group_id in range(o.shape[1]):
-@@ -1085,7 +1190,7 @@ class MqaAttentionBase(nn.Module):
+@@ -1097,7 +1202,7 @@ class MqaAttentionBase(nn.Module):
          quantize_wo_a = fp8 or self.use_npu_arch35_mxfp8_wo_a
          if wo_a_keeps_quant_config is None:
              keep_source_quant = (
@@ -3030,7 +3030,7 @@ index d81fec0f..c6bf678e 100644
              )
              wo_a_quant_config: Optional[QuantizationConfig] = (
                  quant_config if quantize_wo_a or keep_source_quant else None
-@@ -1205,7 +1310,13 @@ class MqaAttentionBase(nn.Module):
+@@ -1217,7 +1322,13 @@ class MqaAttentionBase(nn.Module):
              beta_fast=scaling.get("beta_fast", 32),
              beta_slow=scaling.get("beta_slow", 1),
          )
@@ -3045,7 +3045,7 @@ index d81fec0f..c6bf678e 100644
          self.register_buffer("freqs_cis", freqs_cis, persistent=False)
          self.freqs_cis: torch.Tensor
  
-@@ -1410,6 +1521,9 @@ class MQALayer(MqaAttentionBase):
+@@ -1424,6 +1535,9 @@ class MQALayer(MqaAttentionBase):
              is_neox_style=False,
              device=get_device().device,
          )
@@ -3055,7 +3055,7 @@ index d81fec0f..c6bf678e 100644
  
          if _is_npu:
              rope = Dsv4NpuRoPE.for_freqs(
-@@ -3815,7 +3929,7 @@ class DeepseekV4Model(nn.Module):
+@@ -3924,7 +4038,7 @@ class DeepseekV4Model(nn.Module):
          if self.pp_group.is_first_rank:
              embedding_quant_config = (
                  quant_config

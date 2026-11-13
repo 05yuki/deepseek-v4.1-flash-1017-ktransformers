@@ -1,4 +1,4 @@
-From 1f4a324a37a23b8ec84d500d98280790eafb74e7 Mon Sep 17 00:00:00 2001
+From 23f6b75e9231fb3393e24c14b9b2dc175ab1a497 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] placement: a routing dump to build a placement from a

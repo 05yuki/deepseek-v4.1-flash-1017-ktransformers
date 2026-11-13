@@ -1,4 +1,4 @@
-From e19e37a6be52c4528972f3728805571dd0d2401c Mon Sep 17 00:00:00 2001
+From 31b22e588eb7ec2f9f1b55b8aa5251170a1c91ae Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:32 +0900
 Subject: [PATCH] deepseek-v4: FP8 quantize-dequantize of the attention output
@@ -132,10 +132,10 @@ index 00000000..3a062ae8
 +    v = (f / s).clamp(-448.0, 448.0)
 +    return (v.to(torch.float8_e4m3fn).float() * s).to(x.dtype).reshape(shape)
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index b7b10368..d81fec0f 100644
+index eaddc2e8..40d6ad1e 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -503,6 +503,17 @@ def _wo_a_bf16_bmm_token_major(o: torch.Tensor, wo_a: torch.Tensor) -> torch.Ten
+@@ -509,6 +509,17 @@ def _wo_a_bf16_bmm_token_major(o: torch.Tensor, wo_a: torch.Tensor) -> torch.Ten
      return result
  
  
@@ -153,7 +153,7 @@ index b7b10368..d81fec0f 100644
  def _apply_wo_a_bf16_matmul(
      o: torch.Tensor,
      wo_a: torch.Tensor,
-@@ -3059,6 +3070,10 @@ class MQALayer(MqaAttentionBase):
+@@ -3127,6 +3138,10 @@ class MQALayer(MqaAttentionBase):
                      recipe=recipe,
                  )
              else:
@@ -165,10 +165,10 @@ index b7b10368..d81fec0f 100644
                  if wo_a_weight is not None:
                      if (
 diff --git a/python/sglang/srt/models/deepseek_v4_dspark.py b/python/sglang/srt/models/deepseek_v4_dspark.py
-index 9794208e..64551f3e 100644
+index 5d1da508..f4c56e0f 100644
 --- a/python/sglang/srt/models/deepseek_v4_dspark.py
 +++ b/python/sglang/srt/models/deepseek_v4_dspark.py
-@@ -373,6 +373,14 @@ class DSparkAttention(MqaAttentionBase):
+@@ -357,6 +357,14 @@ class DSparkAttention(MqaAttentionBase):
              self.n_local_groups,
              o.shape[1] * o.shape[2] // self.n_local_groups,
          )
@@ -181,5 +181,5 @@ index 9794208e..64551f3e 100644
 +
 +            o = o_fp8_qdq_(o, _qdq)
          wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-         if self._use_fast_kernel:
+         if not _is_npu:
              o = _apply_wo_a_bf16_matmul(

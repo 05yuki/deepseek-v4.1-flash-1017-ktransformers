@@ -2,12 +2,12 @@
 
 ## What setup.sh does
 
-1. Clones sgl-project/sglang at `58484246` on its main branch and applies the SGLang patches
+1. Clones sgl-project/sglang at `8c7ec052` on its main branch and applies the SGLang patches
    up to `TIER` (default 2), each tier on top of the ones below it:
 
    | `TIER` | patch | what it adds |
    |---|---|---|
-   | 0 | `sglang-tier0/` (eleven patches, one concern each) | what 1017 needs to run correctly on the KTransformers hybrid MoE: the FP8 step below, the SwiGLU clamp passed to the CPU experts, the expert mask kt-kernel takes, `-1` ids kept out of the Marlin MoE, zero GPU experts, a configurable load barrier, the V4.1 indexer on its torch path on SM12x (RTX 50, RTX PRO Blackwell, DGX Spark), which has no DeepGEMM build, its torch scoring done in place, the routed experts scaled by `routed_scaling_factor` once, V4.1's own KV cache formats on SM120 (below), and an automatic [SM89 attention fallback](sm89.md) |
+   | 0 | `sglang-tier0/` (nine patches, one concern each) | what 1017 needs to run correctly on the KTransformers hybrid MoE: the FP8 step below, the SwiGLU clamp passed to the CPU experts, the expert mask kt-kernel takes, `-1` ids kept out of the Marlin MoE, zero GPU experts, a configurable load barrier, the routed experts scaled by `routed_scaling_factor` once, V4.1's own KV cache formats on SM120 (below), and an automatic [SM89 attention fallback](sm89.md) |
    | 1 | `sglang-tier1/` (one patch per feature, [tier1.md](tier1.md); `SGLANG_FEATURES` picks some) | streamed prefill (its experts through llama.cpp's MMQ), the lends, hot experts and placement, the KV pool on remappable memory, the GPU MoE and FP8 kernels (the streamed prefill needs SM89 or newer) |
    | 2 | `sglang-tier2-no-p2p.patch` | all-reduce through pinned host memory, for two GPUs without peer access |
 

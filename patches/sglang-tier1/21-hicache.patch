@@ -1,4 +1,4 @@
-From 12d3fee79c99f0202a6eb8cfd48ad22764edf6a9 Mon Sep 17 00:00:00 2001
+From ee8d4ef476838ec8da63f9b8b800ec1eace9eb5a Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Sun, 1 Nov 2026 10:16:27 +0900
 Subject: [PATCH] hicache: the prefix cache's copy in host memory with the
@@ -50,7 +50,7 @@ Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
  2 files changed, 47 insertions(+), 3 deletions(-)
 
 diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
-index b6e6da98..65fd3f95 100644
+index 99d57487..be374bd3 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 @@ -525,6 +525,8 @@ SWA_TOKENS = int(os.environ.get("KT_PREFILL_SWA_TOKENS", "0") or 0)
@@ -109,10 +109,10 @@ index b6e6da98..65fd3f95 100644
      if over <= 4 * SWA["ps"]:
          return
 diff --git a/python/sglang/srt/mem_cache/memory_pool_host.py b/python/sglang/srt/mem_cache/memory_pool_host.py
-index 96b9889c..3117a805 100644
+index 63a7d7df..4f8aaa3a 100644
 --- a/python/sglang/srt/mem_cache/memory_pool_host.py
 +++ b/python/sglang/srt/mem_cache/memory_pool_host.py
-@@ -82,6 +82,16 @@ from sglang.srt.mem_cache.pool_host.common import (
+@@ -87,6 +87,16 @@ from sglang.srt.mem_cache.pool_host.common import (
  )
  from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
  
@@ -129,7 +129,7 @@ index 96b9889c..3117a805 100644
  # ---- V4 Compressed KV Host Pools ----
  
  
-@@ -380,7 +390,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
+@@ -392,7 +402,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
          self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
              element_size=self.item_bytes * self.dtype.itemsize,
          )
@@ -140,7 +140,7 @@ index 96b9889c..3117a805 100644
          self.staging_buffer = torch.empty(
              (staging_page_capacity, self.layer_num, self.item_bytes),
              dtype=self.dtype,
-@@ -922,7 +934,9 @@ class DeepSeekV4StateHostPool(HostKVCache):
+@@ -965,7 +977,9 @@ class DeepSeekV4StateHostPool(HostKVCache):
          self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
              element_size=self.state_page_bytes * self.dtype.itemsize,
          )

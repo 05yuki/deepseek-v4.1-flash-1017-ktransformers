@@ -1,4 +1,4 @@
-From ee11eefcc57c85b21e45e516d9a6468e412b2630 Mon Sep 17 00:00:00 2001
+From f29f7d342e46e2d75bdb086c71d99ab9a92ec2f0 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] prefill-lend: lend the GPU-resident weights' memory to a
@@ -1692,10 +1692,10 @@ index 00000000..776077ca
 +        _bounce["n"] = nbytes
 +    return _bounce["buf"][:nbytes]
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 8c10d4bb..ddcd808b 100644
+index 65f58177..b768a909 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -6479,6 +6479,11 @@ class Scheduler(
+@@ -6893,6 +6893,11 @@ class Scheduler(
  
  
  def dispatch_event_loop(scheduler: Scheduler):
@@ -1708,10 +1708,10 @@ index 8c10d4bb..ddcd808b 100644
          return role_switch.run_event_loop_supervisor(
              scheduler,
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 14101199..7e849d8b 100644
+index d72142f1..e6d3a43e 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -1915,6 +1915,11 @@ class ModelRunner:
+@@ -1938,6 +1938,11 @@ class ModelRunner:
                  forward_batch,
              ) as recorder_outputs,
          ):
@@ -1724,10 +1724,10 @@ index 14101199..7e849d8b 100644
              if self.enable_elastic_ep:
                  output = self._maybe_rebalance_after_rank_fault(
 diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
-index 2ec313af..5badce28 100644
+index 095230a7..312a7020 100644
 --- a/python/sglang/srt/model_loader/loader.py
 +++ b/python/sglang/srt/model_loader/loader.py
-@@ -319,6 +319,10 @@ def _initialize_model(
+@@ -348,6 +348,10 @@ def _initialize_model(
          model = model_class(**kwargs)
          check_stage_producers(model)
      model.shared_experts_config = shared_experts
@@ -1738,7 +1738,7 @@ index 2ec313af..5badce28 100644
      return model
  
  
-@@ -1108,8 +1112,16 @@ class DefaultModelLoader(BaseModelLoader):
+@@ -1136,8 +1140,16 @@ class DefaultModelLoader(BaseModelLoader):
              # parameters onto device for processing and back off after.
              with device_loading_context(module, target_device):
                  quant_method.process_weights_after_loading(module)
@@ -1756,10 +1756,10 @@ index 2ec313af..5badce28 100644
      def restore_weights_before_loading(model, target_device):
          """Undo in-place quant packing so fresh weights can be loaded."""
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index db81aa5c..dc107fcc 100644
+index 19d52583..fa29c6ab 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -1565,7 +1565,11 @@ class MqaAttentionBase(nn.Module):
+@@ -1577,7 +1577,11 @@ class MqaAttentionBase(nn.Module):
              assert not getattr(meta, "q_pad_captured", False), (
                  "the padded query buffer grew after a CUDA graph captured it"
              )
@@ -1772,7 +1772,7 @@ index db81aa5c..dc107fcc 100644
              if meta is not None:
                  try:
                      meta.q_pad_buffer = buf
-@@ -4510,6 +4514,10 @@ class DeepseekV4Model(nn.Module):
+@@ -4619,6 +4623,10 @@ class DeepseekV4Model(nn.Module):
              if tail is not None and i == self.late_layer_start:
                  if self.tail_writes_source_kv:
                      source = self.layers[i]

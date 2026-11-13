@@ -1,4 +1,4 @@
-From c80e303746292fa28913a9144c00293f91726fa7 Mon Sep 17 00:00:00 2001
+From 9528728bb9e9c8b5f022b2aedcdfb2fc090d2a36 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] hot-lend: more hot experts in the KV pool's free pages
@@ -74,30 +74,64 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
 ---
- .../srt/layers/moe/fused_moe_triton/layer.py  |   7 +
+ .../srt/layers/moe/fused_moe_triton/layer.py  |  26 +-
  python/sglang/srt/layers/moe/kt_ep_wrapper.py |  37 +-
  .../sglang/srt/layers/moe/kt_kv_hot_lend.py   | 718 +++++++++++++++++-
  .../srt/layers/moe/kt_kv_prefill_lend.py      |   8 +
- 4 files changed, 736 insertions(+), 34 deletions(-)
+ 4 files changed, 753 insertions(+), 36 deletions(-)
 
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-index f39af794..47be5895 100644
+index 4c73f505..894a5c74 100644
 --- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 +++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-@@ -1348,6 +1348,13 @@ class FusedMoE(torch.nn.Module):
-         ):
-             if self.quant_method.num_gpu_experts != -1:
-                 if expert_id >= self.quant_method.num_gpu_experts:
-+                    # kt_kv_hot_lend: experts N..N+X-1 load into the layer's shadow
-+                    from sglang.srt.layers.moe import kt_kv_hot_lend
-+
-+                    hot = kt_kv_hot_lend.shadow_param(self.quant_method, self, param, expert_id)
-+                    if hot is not None:
-+                        self._weight_loader_impl(param=hot[0], loaded_weight=loaded_weight,
-+                                                 weight_name=weight_name, shard_id=shard_id, expert_id=hot[1])
-                     return
+@@ -1263,7 +1263,10 @@ class FusedMoE(torch.nn.Module):
+                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
+             return
  
-         self._weight_loader_impl(
+-        for local_expert_id in self._weight_loader_expert_ids(param, expert_id):
++        hot_shadows: list = []
++        for local_expert_id in self._weight_loader_expert_ids(
++            param, expert_id, hot_shadows
++        ):
+             self._weight_loader_impl(
+                 param=param,
+                 loaded_weight=loaded_weight,
+@@ -1271,8 +1274,18 @@ class FusedMoE(torch.nn.Module):
+                 shard_id=shard_id,
+                 expert_id=local_expert_id,
+             )
++        for hot_param, hot_id in hot_shadows:
++            self._weight_loader_impl(
++                param=hot_param,
++                loaded_weight=loaded_weight,
++                weight_name=weight_name,
++                shard_id=shard_id,
++                expert_id=hot_id,
++            )
+ 
+-    def _weight_loader_expert_ids(self, param: torch.nn.Parameter, expert_id: int):
++    def _weight_loader_expert_ids(
++        self, param: torch.nn.Parameter, expert_id: int, hot_shadows=None
++    ):
+         """Resolve destinations before online loaders allocate a source tensor."""
+         global_expert_location_metadata = (
+             get_global_expert_location_metadata() if self.uses_expert_location else None
+@@ -1324,6 +1337,15 @@ class FusedMoE(torch.nn.Module):
+             if isinstance(self.quant_method, KTEPWrapperMethod):
+                 if self.quant_method.num_gpu_experts != -1:
+                     if expert_id >= self.quant_method.num_gpu_experts:
++                        if hot_shadows is not None:
++                            # kt_kv_hot_lend: experts N..N+X-1 load into the layer's shadow
++                            from sglang.srt.layers.moe import kt_kv_hot_lend
++
++                            hot = kt_kv_hot_lend.shadow_param(
++                                self.quant_method, self, param, expert_id
++                            )
++                            if hot is not None:
++                                hot_shadows.append(hot)
+                         continue
+             yield expert_id
+ 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 index f4d1b094..4e26649c 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
@@ -1123,7 +1157,7 @@ index f2a4d736..7fba8c33 100644
      for L in LAYERS:
          if L.k:
 diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
-index a1f87d71..461c5211 100644
+index b8dc4260..f92e9383 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 @@ -48,6 +48,9 @@ from sglang.srt.layers.moe import kt_kv_vmm
@@ -1146,7 +1180,7 @@ index a1f87d71..461c5211 100644
      if STATE["lent"] is not None and STATE.get("owner") == "hot":
          restore(why)
  
-@@ -907,6 +913,8 @@ def _wrap_swa(a) -> None:
+@@ -909,6 +915,8 @@ def _wrap_swa(a) -> None:
          return orig["available_size"]() + _lent() * a.page_size
  
      def clear():

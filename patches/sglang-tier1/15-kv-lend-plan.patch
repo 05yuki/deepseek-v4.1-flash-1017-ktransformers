@@ -1,4 +1,4 @@
-From 884ec9737daada024c396bda86db784a441e9bcb Mon Sep 17 00:00:00 2001
+From e159932e31c676299bb38ee74aaa58331b576050 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] kv-lend-plan: lend the KV pool's free pages to prefill, plan
@@ -27,12 +27,12 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
 Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
 ---
  .../sglang/srt/layers/moe/kt_kv_hot_lend.py   | 550 +++++++++++
- .../srt/layers/moe/kt_kv_prefill_lend.py      | 916 ++++++++++++++++++
+ .../srt/layers/moe/kt_kv_prefill_lend.py      | 918 ++++++++++++++++++
  .../sglang/srt/layers/moe/kt_prefill_plan.py  | 253 +++++
  python/sglang/srt/managers/schedule_batch.py  |  11 +-
  python/sglang/srt/managers/scheduler.py       |   9 +
  .../srt/mem_cache/kv_cache_configurator.py    |  19 +-
- 6 files changed, 1753 insertions(+), 5 deletions(-)
+ 6 files changed, 1755 insertions(+), 5 deletions(-)
  create mode 100644 python/sglang/srt/layers/moe/kt_kv_hot_lend.py
  create mode 100644 python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
  create mode 100644 python/sglang/srt/layers/moe/kt_prefill_plan.py
@@ -595,10 +595,10 @@ index 00000000..f2a4d736
 +    STATE["spare_held"] = 0
 diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 new file mode 100644
-index 00000000..a1f87d71
+index 00000000..b8dc4260
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
-@@ -0,0 +1,916 @@
+@@ -0,0 +1,918 @@
 +"""The KV pool's free pages lend their physical memory to a streamed prefill
 +(KT_PREFILL_KV_LEND=1, with KT_KV_VMM=1 and the prefill lend KT_PREFILL_LEND=1).
 +
@@ -1347,7 +1347,7 @@ index 00000000..a1f87d71
 +    the lent pages counted it never does (MiMo kept ~1 GB a cached 24K prompt and
 +    the weights could not come back after the fifth). The cache gives back the
 +    excess, least recently used first, as it would under pressure (sglang's
-+    tree_cache.evict with swa_num_tokens)."""
++    tree_cache.evict with window_num_tokens)."""
 +    a, tree, budget = SWA["alloc"], SWA.get("tree"), SWA.get("budget")
 +    if a is None or tree is None or not budget:
 +        return
@@ -1357,7 +1357,9 @@ index 00000000..a1f87d71
 +    try:
 +        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 +
-+        res = tree.evict(EvictParams(swa_num_tokens=int(over)))
++        names = tree.token_to_kv_pool_allocator.window_pool_names()
++        res = tree.evict(EvictParams(window_num_tokens=dict.fromkeys(names, int(over))))
++        gave = sum(res.window_num_tokens_evicted.values())
 +    except Exception as e:  # a cache without SWA eviction: nothing to trim
 +        if not SWA.get("trim_off"):
 +            SWA["trim_off"] = True
@@ -1366,7 +1368,7 @@ index 00000000..a1f87d71
 +    SWA["trims"] = SWA.get("trims", 0) + 1
 +    if SWA["trims"] <= 3 or SWA["trims"] in (10, 100) or CHECK:
 +        _log(f"SWA trim ({why}): {over} tokens over the {budget}-token budget, the cache gave back "
-+             f"{getattr(res, 'swa_num_tokens_evicted', '?')}")
++             f"{gave}")
 +
 +
 +def swa_map(short: int, why: str, defer: bool = False) -> None:
@@ -1775,10 +1777,10 @@ index 00000000..a2b878d9
 +              + f", cap {chunk})", flush=True)
 +    return c
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index 695b4ab3..c9ec0d15 100644
+index 34471892..032d92fe 100644
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -3550,11 +3550,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -3621,11 +3621,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                          if req.extend_batch_idx < 2:
                              continue
                          else:
@@ -1798,10 +1800,10 @@ index 695b4ab3..c9ec0d15 100644
                      else:
                          self._evict_swa(req, pre_len)
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index ddcd808b..8825d056 100644
+index b768a909..46dca8e4 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -3675,6 +3675,10 @@ class Scheduler(
+@@ -3842,6 +3842,10 @@ class Scheduler(
              req.storage_prefetch_retry_attempts = 0
              req.storage_prefetch_last_match_len = None
              req.staged_prefetch_plan = None
@@ -1812,7 +1814,7 @@ index ddcd808b..8825d056 100644
          if self.disaggregation_mode == DisaggregationMode.NULL:
              if self._abort_on_queued_limit(req):
                  return
-@@ -4380,6 +4384,11 @@ class Scheduler(
+@@ -4583,6 +4587,11 @@ class Scheduler(
              dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
              if dynamic_size is not None:
                  chunked_prefill_size = dynamic_size
@@ -1825,10 +1827,10 @@ index ddcd808b..8825d056 100644
          # Prefill policy
          # Get BLOCK_M from the backend for tile-budget admission logic
 diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
-index c938f548..97405fde 100644
+index dbd8fa9d..4f0f901f 100644
 --- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
 +++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
-@@ -551,7 +551,11 @@ class KVCacheConfigurator:
+@@ -604,7 +604,11 @@ class KVCacheConfigurator:
              )
              config = self.memory_pool_config
          else:
@@ -1841,7 +1843,7 @@ index c938f548..97405fde 100644
  
          sizes = self._derive_pool_sizes(config=config)
  
-@@ -569,6 +573,10 @@ class KVCacheConfigurator:
+@@ -622,6 +626,10 @@ class KVCacheConfigurator:
                  # A draft worker shares the target's allocator, and with it
                  # the target's state.
                  pools.token_to_kv_pool_allocator.state = state
@@ -1852,8 +1854,8 @@ index c938f548..97405fde 100644
  
          swa_max_total_num_tokens = sizes.swa_max_total_num_tokens
          alloc = pools.token_to_kv_pool_allocator
-@@ -654,6 +662,15 @@ class KVCacheConfigurator:
-         if is_deepseek_v4(self.model_config.hf_config):
+@@ -709,6 +717,15 @@ class KVCacheConfigurator:
+         if uses_compressed_kv_attention(self.model_config.hf_config):
              c4_state_dtype, c128_state_dtype = _get_dsv4_compress_state_dtypes()
  
 +        if swa_max_total_num_tokens is not None and not self.is_draft_worker:

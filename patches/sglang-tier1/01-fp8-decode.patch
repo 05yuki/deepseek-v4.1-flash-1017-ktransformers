@@ -1,4 +1,4 @@
-From 2ec6741a7eb721b2bd601645718051e246d3430e Mon Sep 17 00:00:00 2001
+From 0657999f4cf3c51cfc6de51eb54f6a25cc41e6b9 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 22:56:28 +0900
 Subject: [PATCH] fp8-decode: block-FP8 GEMV and split-K for decode-sized dense
@@ -24,18 +24,18 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  create mode 100644 python/sglang/kernels/ops/quantization/fp8_block_gemv.py
 
 diff --git a/python/sglang/kernels/ops/gemm/fp8_kernel.py b/python/sglang/kernels/ops/gemm/fp8_kernel.py
-index 21178fa9..ab0af6be 100644
+index 68c5c71d..fc422cd7 100644
 --- a/python/sglang/kernels/ops/gemm/fp8_kernel.py
 +++ b/python/sglang/kernels/ops/gemm/fp8_kernel.py
-@@ -23,6 +23,7 @@ from sglang.srt.utils.custom_op import register_custom_op
+@@ -20,6 +20,7 @@ from sglang.srt.utils.custom_op import register_custom_op
+ 
  _is_cuda = is_cuda()
- _is_hip = is_hip()
  _is_gfx1250 = is_gfx1250_supported()
 +_FP8_GEMV = os.environ.get("SGLANG_FP8_GEMV", "1") == "1"
  logger = logging.getLogger(__name__)
  
  
-@@ -773,6 +774,9 @@ def w8a8_mxfp8_matmul_deepgemm(
+@@ -571,6 +572,9 @@ def w8a8_mxfp8_matmul_deepgemm(
      return C
  
  
@@ -45,7 +45,7 @@ index 21178fa9..ab0af6be 100644
  def w8a8_block_fp8_matmul_triton(
      A: torch.Tensor,
      B: torch.Tensor,
-@@ -802,6 +806,21 @@ def w8a8_block_fp8_matmul_triton(
+@@ -600,6 +604,21 @@ def w8a8_block_fp8_matmul_triton(
  
      block_n, block_k = block_size
  
@@ -54,7 +54,7 @@ index 21178fa9..ab0af6be 100644
 +    if (
 +        M <= 4
 +        and _FP8_GEMV
-+        and not _is_hip
++        and not get_platform().is_hip
 +        and not _is_gfx1250
 +        and As.dtype == torch.float
 +        and Bs.dtype == torch.float
@@ -67,7 +67,7 @@ index 21178fa9..ab0af6be 100644
      configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
      if configs:
          # If an optimal configuration map has been found, look up the
-@@ -819,9 +838,39 @@ def w8a8_block_fp8_matmul_triton(
+@@ -633,9 +652,39 @@ def w8a8_block_fp8_matmul_triton(
              "num_stages": 3,
          }
  
@@ -80,7 +80,7 @@ index 21178fa9..ab0af6be 100644
 +    skinny = (
 +        not configs
 +        and M <= 16
-+        and not _is_hip
++        and not get_platform().is_hip
 +        and not _is_gfx1250
 +        and os.environ.get("SGLANG_FP8_SKINNY", "1") == "1"
 +    )
