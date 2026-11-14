@@ -39,11 +39,12 @@ fi
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 mkdir -p third_party build state
 step() { printf '\n== %s\n' "$*"; }
-# a step's marker file holds what it built: the tier or variant and a hash of the patches, so a
-# changed patch is applied (and kt-kernel rebuilt) again
+# a step's marker file holds what it built: the tier or variant, a hash of the patches and the
+# pinned commit, so a changed patch or a moved pin is checked out and applied (and kt-kernel
+# rebuilt) again. The tier stays the first field: serve.sh reads it from there
 built_as() { [[ -f "$1" && "$(cat "$1")" == "$2" ]]; }
 patch_hash() { (cd "$here/patches" && cat "$@") | sha256sum | cut -c1-12; }
-sglang_state="$TIER $(patch_hash "${sglang_patches[@]}" llama-mmq.patch llama-mmq.sha256)"
+sglang_state="$TIER $(patch_hash "${sglang_patches[@]}" llama-mmq.patch llama-mmq.sha256) ${SGLANG_COMMIT:0:12}"
 kt_variant=pinned
 kt_patches=(kt-kernel-tree.patch kt-kernel-llama-cpp.patch kt-kernel-load-prefetch.py kt-kernel-gguf.patch kt-llamafile-iq2xs.patch)
 if [[ " ${features[*]} " == *" cpu-gpu-overlap "* ]]; then
@@ -93,7 +94,7 @@ step "KTransformers @ ${KT_COMMIT:0:8}, $kt_variant"
 if [[ ! -d third_party/ktransformers/.git ]]; then
   git clone --filter=blob:none https://github.com/kvcache-ai/ktransformers.git third_party/ktransformers
 fi
-if ! built_as third_party/ktransformers/.dsv41-1017-patched "$kt_variant"; then
+if ! built_as third_party/ktransformers/.dsv41-1017-patched "$kt_variant ${KT_COMMIT:0:12}"; then
   git -C third_party/ktransformers checkout --quiet --force "$KT_COMMIT"
   git -C third_party/ktransformers clean -fdq
   git -C third_party/ktransformers submodule update --init --force --quiet third_party/llama.cpp third_party/pybind11
@@ -111,7 +112,7 @@ if ! built_as third_party/ktransformers/.dsv41-1017-patched "$kt_variant"; then
     apply_checked third_party/ktransformers "$here/patches/kt-llamafile-iq2xs.patch"
     apply_checked third_party/ktransformers/third_party/llama.cpp "$here/patches/kt-kernel-llama-cpp.patch"
   fi
-  echo "$kt_variant" > third_party/ktransformers/.dsv41-1017-patched
+  echo "$kt_variant ${KT_COMMIT:0:12}" > third_party/ktransformers/.dsv41-1017-patched
 fi
 
 step "Python environment (.venv)"
