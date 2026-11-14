@@ -74,8 +74,8 @@ More than one request at a time, and other machines: [docs/serving.md](docs/serv
 | the same | 1 and 2 × RTX 5070 Ti | GGUF IQ2_XXS | speed and NLL | [docs/gguf.md](docs/gguf.md) |
 | 2 × EPYC 7543 (Zen 3) | 1 × RTX 4080 SUPER, 32 GB (SM89) | MXFP4 | one tag, by a contributor: check, tool calls, NLL, speed | [docs/sm89.md](docs/sm89.md#validation) |
 | Core i5-9600K, 64 GB | RTX 2070 8 GB (SM75) | GGUF IQ2_XXS | speed and NLL | [docs/gguf.md](docs/gguf.md) |
-| a CPU with AVX-512 | | | not yet | |
-| | a retail RTX 40 card, 16 or 24 GB | | not yet | |
+| 2 × Xeon Platinum 8573C (AVX-512; the CPU kernel runs AVX2), 751 GB | 1 × RTX 4090 24 GB (SM89) | MXFP4 | one tag, by a contributor: `tools/qualify.sh` | [report](reports/2026-11-05-0936/rtx4090-x1-xeon8573c-u2604.md) |
+| | a retail RTX 40 card with 16 GB | | not yet | |
 | | SM90 or SM100 (H100, B200) | | not yet | |
 | | three or more GPUs | | not yet | |
 

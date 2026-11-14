@@ -2,7 +2,8 @@
 
 Each tag's reports live under `reports/<tag>/`, one Markdown file per machine and GPU set.
 A report is the unedited output of `tools/qualify.sh` run on a clean checkout of that tag.
-A checkout with local changes writes `-dirty` after the tag, and such a report is not filed here.
+A checkout with local changes writes `-dirty` after the tag.
+Such a report is filed when the changes do not reach loading, attention or the MoE path, and the report names them.
 
 | tag | machine | answer | tool calls | NLL minus reference | 35K prompt from the cache | decode median | first 35K prefill | report |
 |---|---|---|---|---|---|---|---|---|
@@ -12,6 +13,7 @@ A checkout with local changes writes `-dirty` after the tag, and such a report i
 | 2026-11-14-1234 | 1 × RTX 5070 Ti, 2 × EPYC 7452, Ubuntu 26.04 | pass | 4 of 4 | +0.0037 (SE 0.0033) | 1.9 s again | 39.4 tok/s | 27.6 s | [report](2026-11-14-1234/rtx5070ti-x1-epyc7452-u2604.md) |
 | 2026-11-05-0936 | 2 × RTX 5070 Ti, 2 × EPYC 7452, Ubuntu 26.04 | pass | 4 of 4 | +0.0029 (SE 0.0043) | 1.9 s again | 53.9 tok/s | 21.9 s | [report](2026-11-05-0936/rtx5070ti-x2-epyc7452-u2604.md) |
 | 2026-11-05-0936 | 1 × RTX 5070 Ti, 2 × EPYC 7452, Ubuntu 26.04 | pass | 4 of 4 | -0.0011 (SE 0.0047) | 2.0 s again | 39.1 tok/s | 28.7 s | [report](2026-11-05-0936/rtx5070ti-x1-epyc7452-u2604.md) |
+| 2026-11-05-0936 (+12, `serve.sh` changed) | 1 × RTX 4090, 2 × Xeon Platinum 8573C, Ubuntu 26.04, by a contributor | pass | 4 of 4 | +0.0002 (SE 0.0032) | 1.4 s again | 49.7 tok/s | 33.1 s | [report](2026-11-05-0936/rtx4090-x1-xeon8573c-u2604.md) |
 | 2026-11-05-0048 | 2 × RTX 5070 Ti, 2 × EPYC 7452, Ubuntu 26.04 | pass | 4 of 4 | +0.0031 (SE 0.0034) | 1.9 s again | 52.1 tok/s | 21.2 s | [report](2026-11-05-0048/rtx5070ti-x2-epyc7452-u2604.md) |
 | 2026-11-05-0048 | 1 × RTX 5070 Ti, 2 × EPYC 7452, Ubuntu 26.04 | pass | 4 of 4 | -0.0007 (SE 0.0046) | 2.0 s again | 38.2 tok/s | 29.0 s | [report](2026-11-05-0048/rtx5070ti-x1-epyc7452-u2604.md) |
 | 2026-11-04-1912 | 2 × RTX 5070 Ti, 2 × EPYC 7452, Ubuntu 26.04 | pass | 4 of 4 | +0.0028 (SE 0.0045) | 1.9 s again | 53.8 tok/s | 21.2 s | [report](2026-11-04-1912/rtx5070ti-x2-epyc7452-u2604.md) |
