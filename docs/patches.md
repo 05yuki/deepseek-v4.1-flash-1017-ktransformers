@@ -19,7 +19,7 @@ and how it was checked, and `tools/qualify.sh` on one and two GPUs decides wheth
 | 1 | `patches/llama-mmq.patch` | 33 files of llama.cpp `23b0202`, for the `stream-mmq` feature (`lib/llama-mmq.sh` fetches them and checks them against `patches/llama-mmq.sha256`) |
 | 1 | `patches/kt-kernel-cpu-handoff.patch` | after the tree patch, with the `cpu-gpu-overlap` feature |
 | 1 | `patches/kt-kernel-expert-cache.patch` | after the tree patch, with the `expert-cache` feature |
-| 1 | `patches/kt-kernel-gguf.patch`, `patches/kt-llamafile-iq2xs.patch` | after the tree patch (and the two above): kt-kernel's LLAMAFILE backend for a GGUF pack's experts |
+| 1 | `patches/kt-kernel-gguf.patch`, `patches/kt-llamafile-iq2xs.patch`, `patches/kt-llamafile-iquants.patch`, `patches/kt-llamafile-iq4lut.patch`, `patches/kt-kernel-gguf-kernel-guard.patch` | after the tree patch (and the two above), in this order: kt-kernel's LLAMAFILE backend for a GGUF pack's experts, its x86 kernels, and the check at load |
 | - | `patches/sglang-dsv4-o-fp8-qdq.py`, `patches/dsv4_o_fp8_qdq.py` | another SGLang tree, on their own (tier 0 already has them) |
 | - | `patches/sglang-optional/NN-*.patch` | the full stack, by hand; `setup.sh` never applies them (below) |
 

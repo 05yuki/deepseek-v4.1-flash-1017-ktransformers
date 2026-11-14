@@ -19,6 +19,9 @@ The GGUF code is in these patches, on top of the MXFP4 recipe's ([patches.md](pa
 | `patches/sglang-tier1/26-gguf-lend.patch` | tier 1's lends, streamed prefill and hot slots with a GGUF pack ([tier1.md](tier1.md#26-gguf-lend)) |
 | `patches/kt-kernel-gguf.patch` | kt-kernel's LLAMAFILE backend for the GGUF experts (tier 1) |
 | `patches/kt-llamafile-iq2xs.patch` | IQ2_XS in kt-kernel's x86 kernels (tier 1) |
+| `patches/kt-llamafile-iquants.patch` | IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL and Q2_0 in the same kernels (tier 1) |
+| `patches/kt-llamafile-iq4lut.patch` | the IQ4_LUT repacks in the same kernels (tier 1) |
+| `patches/kt-kernel-gguf-kernel-guard.patch` | the load stops on an expert type the build has no kernel for (tier 1) |
 
 Serving a GGUF pack needs tier 1 (kt-kernel's GGUF backend) with `gguf-lend` and `stream-mmq`.
 Nothing in these patches runs for the MXFP4 checkpoint: the GGUF code takes a GGUF pack only
@@ -190,6 +193,17 @@ below.
 
 `kt-llamafile-iq2xs.patch` adds IQ2_XS to the x86 kernels kt-kernel uses (iqk's matrix
 multiplication, from ik_llama.cpp); the pack's IQ2_XS tensors run there.
+
+`kt-llamafile-iquants.patch` adds IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL and Q2_0 to the same kernels.
+It also replaces the AVX2 IQ4_XS kernel: the old one saturated 16-bit sums.
+Other GGUF packs (another model's, another quantizer's) use these types.
+
+`kt-llamafile-iq4lut.patch` adds the IQ4_LUT types.
+kt-kernel repacks IQ2_S, IQ3_XXS and IQ3_S experts to them at load, for decode.
+
+`kt-kernel-gguf-kernel-guard.patch` runs one block of zeros through each expert tensor's kernel at load.
+A type the build has no kernel for stops the load with the type's name.
+There is no slower path behind the kernels.
 
 ## Drive reads
 

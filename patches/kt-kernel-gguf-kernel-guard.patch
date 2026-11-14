@@ -1,0 +1,49 @@
+--- a/kt-kernel/operators/llamafile/moe.hpp	2026-11-10 10:17:49.806618701 +0900
++++ b/kt-kernel/operators/llamafile/moe.hpp	2026-11-10 10:17:49.808220102 +0900
+@@ -790,8 +790,16 @@
+       return true;
+     }
+     const long k = cols / ggml_blck_size((ggml_type)type);
+-    return llamafile_sgemm(m, n, k, A, k, B, k, C, ldc, 0, 1, GGML_TASK_TYPE_COMPUTE, type,
+-                           ggml_internal_get_type_traits((ggml_type)type).vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT);
++    if (!llamafile_sgemm(m, n, k, A, k, B, k, C, ldc, 0, 1, GGML_TASK_TYPE_COMPUTE, type,
++                         ggml_internal_get_type_traits((ggml_type)type).vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT))
++        [[unlikely]] {
++      // the probe at load passed this type; a false here is a shape the kernel does not take
++      fprintf(stderr, "[kt-kernel] LLAMAFILE: no kernel took tensor %d (type %s, %ld x %ld, %ld columns)\n", t,
++              ggml_type_name((ggml_type)type), m, n, cols);
++      fflush(stderr);
++      std::abort();
++    }
++    return true;
+   }
+   // fills the bases of the experts in ids (unique, not skipped) from the cache; false when the cache is off
+   std::vector<std::shared_ptr<std::atomic<int>>> kt_left_;  // per expert: its reads still in flight
+@@ -1085,6 +1093,27 @@
+       config_.gate_type = kernel_gate_type_;
+       config_.up_type = kernel_up_type_;
+     }
++    kt_probe_kernels();
++  }
++
++  // one block of zeros through each tensor's kernel: a type this build cannot multiply stops the load here
++  void kt_probe_kernels() {
++    static const char* names[3] = {"gate", "up", "down"};
++    for (int t = 0; t < 3; ++t) {
++      const ggml_type type = (ggml_type)kt_type(t);
++      const ggml_type act = ggml_internal_get_type_traits(type).vec_dot_type;
++      const long cols = (long)kt_cols(t);
++      const long k = cols / ggml_blck_size(type);
++      std::vector<uint8_t> a((size_t)cols * ggml_type_size(type) / ggml_blck_size(type) + 64, 0);
++      std::vector<uint8_t> b((size_t)cols * ggml_type_size(act) / ggml_blck_size(act) + 64, 0);
++      float c[8] = {0};
++      if (!llamafile_sgemm(1, 1, k, a.data(), k, b.data(), k, c, 1, 0, 1, GGML_TASK_TYPE_COMPUTE, type, act,
++                           GGML_TYPE_F32, GGML_PREC_DEFAULT)) {
++        throw std::runtime_error(std::string("kt-kernel LLAMAFILE: this build has no CPU kernel for the ") + names[t] +
++                                 " weights' type " + ggml_type_name(type) + " (activations " + ggml_type_name(act) +
++                                 "); rebuild kt-kernel with that type's kernel in third_party/llamafile");
++      }
++    }
+   }
+ 
+   void warm_up() {

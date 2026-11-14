@@ -46,7 +46,7 @@ built_as() { [[ -f "$1" && "$(cat "$1")" == "$2" ]]; }
 patch_hash() { (cd "$here/patches" && cat "$@") | sha256sum | cut -c1-12; }
 sglang_state="$TIER $(patch_hash "${sglang_patches[@]}" llama-mmq.patch llama-mmq.sha256) ${SGLANG_COMMIT:0:12}"
 kt_variant=pinned
-kt_patches=(kt-kernel-tree.patch kt-kernel-llama-cpp.patch kt-kernel-load-prefetch.py kt-kernel-gguf.patch kt-llamafile-iq2xs.patch)
+kt_patches=(kt-kernel-tree.patch kt-kernel-llama-cpp.patch kt-kernel-load-prefetch.py kt-kernel-gguf.patch kt-llamafile-iq2xs.patch kt-llamafile-iquants.patch kt-llamafile-iq4lut.patch kt-kernel-gguf-kernel-guard.patch)
 if [[ " ${features[*]} " == *" cpu-gpu-overlap "* ]]; then
   kt_patches+=(kt-kernel-cpu-handoff.patch)
 fi
@@ -107,9 +107,14 @@ if ! built_as third_party/ktransformers/.dsv41-1017-patched "$kt_variant ${KT_CO
     if [[ " ${features[*]} " == *" expert-cache "* ]]; then
       apply_checked third_party/ktransformers "$here/patches/kt-kernel-expert-cache.patch"
     fi
-    # the GGUF experts: kt-kernel's LLAMAFILE backend, and IQ2_XS in its x86 kernels
+    # the GGUF experts: kt-kernel's LLAMAFILE backend, then its x86 kernels for IQ2_XS, for the other
+    # i-quants (IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, Q2_0) and for the IQ4_LUT repacks, then the check at load
+    # that stops on a type this build has no kernel for
     apply_checked third_party/ktransformers "$here/patches/kt-kernel-gguf.patch"
     apply_checked third_party/ktransformers "$here/patches/kt-llamafile-iq2xs.patch"
+    apply_checked third_party/ktransformers "$here/patches/kt-llamafile-iquants.patch"
+    apply_checked third_party/ktransformers "$here/patches/kt-llamafile-iq4lut.patch"
+    apply_checked third_party/ktransformers "$here/patches/kt-kernel-gguf-kernel-guard.patch"
     apply_checked third_party/ktransformers/third_party/llama.cpp "$here/patches/kt-kernel-llama-cpp.patch"
   fi
   echo "$kt_variant ${KT_COMMIT:0:12}" > third_party/ktransformers/.dsv41-1017-patched

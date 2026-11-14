@@ -1,0 +1,127 @@
+--- a/third_party/llamafile/iqk_mul_mat.inc	2026-11-10 10:17:49.800561308 +0900
++++ b/third_party/llamafile/iqk_mul_mat.inc	2026-11-10 10:17:49.803465429 +0900
+@@ -3462,6 +3462,88 @@
+         for (int iy = 0; iy < nrc_y; ++iy) info.store(ix, iy, hsum_float_8(accd[iy]));
+     }
+ }
++
++// kt IQ4_LUT3S / 3X / 2S (decode repack of IQ3_S / IQ3_XXS / IQ2_S): the
++// IQ4_XS kernel shape with the source grid's signed magnitude LUT and int8
++// scales per 16 weights.
++template <const int8_t* LUT>
++struct DequantizerIQ4LUT final : public BaseDequantizer<block_iq4_lut> {
++    DequantizerIQ4LUT(const void * vx, size_t bx) : BaseDequantizer(vx, bx) {
++        // KT_IQ4LUT_BIAS (default on): the LUT carries +64 so the products need no
++        // sign trick; the kernel takes 64 * scales . bsums back out (kt-kernel-iq4lut-bias.py)
++        static const bool use_bias = [] {
++            const char * e = getenv("KT_IQ4LUT_BIAS");
++            return !(e && e[0] == '0');
++        }();
++        biased = use_bias;
++        auto v = _mm_loadu_si128((const __m128i *)LUT);
++        if (biased) v = _mm_add_epi8(v, _mm_set1_epi8(64));
++        values = MM256_SET_M128I(v, v);
++        for (int j = 0; j < 2; ++j) for (int k = 0; k < 4; ++k) {
++            const char a = (char)(2*(4*j+k)), b = a + 1;
++            shuf[4*j+k] = _mm_set_epi8(b, b, b, b, b, b, b, b, a, a, a, a, a, a, a, a);
++        }
++    }
++    inline void new_block(int i) {
++        d = GGML_FP16_TO_FP32(x[i].d);
++        sc = _mm_loadu_si128((const __m128i *)x[i].scales);
++    }
++    inline void prepare(int i, int j) {
++        bits.prepare16(x[i].qs, j);
++        for (int k = 0; k < 4; ++k) bits.values[k] = _mm256_shuffle_epi8(values, bits.values[k]);
++    }
++    // values[k] is sub-block 4j+k in order: lanes 0-7 take its first-16 scale, 8-15 the second
++    inline void set_scales(int j, __m256i * scales) const {
++        for (int k = 0; k < 4; ++k) scales[k] = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(sc, shuf[4*j+k]));
++    }
++    Q4Bits bits;
++    __m128i sc;
++    __m128i shuf[8];
++    __m256i values;
++    bool biased;
++};
++
++template <typename Deq, int nrc_y>
++static void mul_mat_iq4lut_q8_K(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
++    assert(n % QK_K == 0);
++    const int nb = n / QK_K;
++    Q8<nrc_y> q8(info);
++    Deq deq(vx, bx);
++    __m256  accd[nrc_y];
++    __m256i scales[4];
++    for (int ix = 0; ix < nrc_x; ++ix) {
++        for (int iy = 0; iy < nrc_y; ++iy) accd[iy] = _mm256_setzero_ps();
++        deq.new_row(ix);
++        for (int i = 0; i < nb; ++i) {
++            deq.new_block(i);
++            __m256i sumi[nrc_y];
++            for (int j = 0; j < QK_K/128; ++j) {
++                deq.prepare(i, j);
++                deq.set_scales(j, scales);
++                if (deq.biased) multiply_add(deq.bits, scales, j, i, q8, sumi);
++                else multiply_add_signed(deq.bits, scales, j, i, q8, sumi);
++            }
++            if (deq.biased) {
++                // the +64 of every weight: 64 * sum over the 16-element groups of scale * bsum
++                const __m256i sc16 = _mm256_cvtepi8_epi16(deq.sc);
++                for (int iy = 0; iy < nrc_y; ++iy) {
++                    const __m256i bias = _mm256_madd_epi16(sc16, q8.load_bsums(iy, i));
++                    sumi[iy] = _mm256_sub_epi32(sumi[iy], _mm256_slli_epi32(bias, 6));
++                }
++            }
++            for (int iy = 0; iy < nrc_y; ++iy) {
++                const __m256 vd = _mm256_set1_ps(deq.d*q8.scale(iy, i));
++                accd[iy] = _mm256_fmadd_ps(vd, _mm256_cvtepi32_ps(sumi[iy]), accd[iy]);
++            }
++        }
++        for (int iy = 0; iy < nrc_y; ++iy) info.store(ix, iy, hsum_float_8(accd[iy]));
++    }
++}
++using DequantizerIQ4LUT3S = DequantizerIQ4LUT<kvalues_iq4lut3s>;
++using DequantizerIQ4LUT3X = DequantizerIQ4LUT<kvalues_iq4lut3x>;
++using DequantizerIQ4LUT2S = DequantizerIQ4LUT<kvalues_iq4lut2s>;
++template <typename Deq> inline constexpr bool is_iq4lut_v =
++    std::is_same_v<Deq, DequantizerIQ4LUT3S> || std::is_same_v<Deq, DequantizerIQ4LUT3X> || std::is_same_v<Deq, DequantizerIQ4LUT2S>;
+ #endif  // !HAVE_FANCY_SIMD
+ 
+ template <typename Dequantizer> void MulMat::set_functions(MulMat& m) {
+@@ -3497,6 +3579,16 @@
+             m.funcs[7] = mul_mat_iq4_nl_q8_0_T<8>;
+         }
+ #ifndef HAVE_FANCY_SIMD
++        else if constexpr (is_iq4lut_v<Dequantizer>) {
++            m.funcs[0] = mul_mat_iq4lut_q8_K<Dequantizer, 1>;
++            m.funcs[1] = mul_mat_iq4lut_q8_K<Dequantizer, 2>;
++            m.funcs[2] = mul_mat_iq4lut_q8_K<Dequantizer, 3>;
++            m.funcs[3] = mul_mat_iq4lut_q8_K<Dequantizer, 4>;
++            m.funcs[4] = mul_mat_iq4lut_q8_K<Dequantizer, 5>;
++            m.funcs[5] = mul_mat_iq4lut_q8_K<Dequantizer, 6>;
++            m.funcs[6] = mul_mat_iq4lut_q8_K<Dequantizer, 7>;
++            m.funcs[7] = mul_mat_iq4lut_q8_K<Dequantizer, 8>;
++        }
+         else if constexpr (std::is_same_v<Dequantizer, DequantizerIQ4XS_Signed>) {
+             m.funcs[0] = mul_mat_iq4xs_q8_K_signed<1>;
+             m.funcs[1] = mul_mat_iq4xs_q8_K_signed<2>;
+@@ -3940,6 +4032,18 @@
+             assert (ne00 % QK_K == 0);
+             MulMat::set_functions<DequantizerIQ3S>(mm);
+             break;
++        case GGML_TYPE_IQ4_LUT3S:
++        case GGML_TYPE_IQ4_LUT3X:
++        case GGML_TYPE_IQ4_LUT2S:
++            assert (ne00 % QK_K == 0);
++#ifdef HAVE_FANCY_SIMD
++            return false;  // no AVX-512 kernel; the vec_dot fallback serves it
++#else
++            if (typeA == GGML_TYPE_IQ4_LUT3S) MulMat::set_functions<DequantizerIQ4LUT3S>(mm);
++            else if (typeA == GGML_TYPE_IQ4_LUT3X) MulMat::set_functions<DequantizerIQ4LUT3X>(mm);
++            else MulMat::set_functions<DequantizerIQ4LUT2S>(mm);
++            break;
++#endif
+         case GGML_TYPE_IQ4_NL:
+             assert (ne00 % QK4_NL == 0);
+             MulMat::set_functions<IQ4_NL_Unpacker>(mm);
