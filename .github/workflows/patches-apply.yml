@@ -62,6 +62,7 @@ jobs:
           # no torch needed
           python3 tools/test_qualify_cache.py
           python3 tools/lend-transition-fences-test.py
+          python3 tools/hot-expert-spare-lending-test.py
           # CPU torch and Triton; the Triton kernels run in Triton's interpreter
           python3 -m venv ../cpu-venv
           ../cpu-venv/bin/pip install -q --index-url https://download.pytorch.org/whl/cpu torch

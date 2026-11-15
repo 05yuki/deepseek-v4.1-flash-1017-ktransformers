@@ -1,4 +1,4 @@
-From ee8d4ef476838ec8da63f9b8b800ec1eace9eb5a Mon Sep 17 00:00:00 2001
+From 7331d239a54f4a953f0dfcd114a49db6dd680464 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Sun, 1 Nov 2026 10:16:27 +0900
 Subject: [PATCH] hicache: the prefix cache's copy in host memory with the
@@ -50,10 +50,10 @@ Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
  2 files changed, 47 insertions(+), 3 deletions(-)
 
 diff --git a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
-index 99d57487..be374bd3 100644
+index 32433356..a41a2091 100644
 --- a/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
 +++ b/python/sglang/srt/layers/moe/kt_kv_prefill_lend.py
-@@ -525,6 +525,8 @@ SWA_TOKENS = int(os.environ.get("KT_PREFILL_SWA_TOKENS", "0") or 0)
+@@ -533,6 +533,8 @@ SWA_TOKENS = int(os.environ.get("KT_PREFILL_SWA_TOKENS", "0") or 0)
  SWA_KEEP = int(os.environ.get("KT_PREFILL_SWA_LEND_KEEP", "4096"))  # tokens kept mapped outside prefill
  SWA_MIN = int(os.environ.get("KT_PREFILL_SWA_LEND_MIN_MB", "64")) << 20  # smallest lend worth a sync
  SWA_SLACK = 1024  # tokens mapped beyond an allocation's shortfall
@@ -62,7 +62,7 @@ index 99d57487..be374bd3 100644
  SWA = {"alloc": None, "tensors": None, "lent": None, "bytes": 0, "lends": 0, "maps": 0, "ticks": 0}
  
  
-@@ -770,9 +772,29 @@ def _defer_ok() -> bool:
+@@ -778,9 +780,29 @@ def _defer_ok() -> bool:
  
  
  def bind_tree(scheduler) -> None:
@@ -93,7 +93,7 @@ index 99d57487..be374bd3 100644
  
  
  def _swa_in_use(a) -> int:
-@@ -790,6 +812,14 @@ def swa_trim(why: str) -> None:
+@@ -798,6 +820,14 @@ def swa_trim(why: str) -> None:
      a, tree, budget = SWA["alloc"], SWA.get("tree"), SWA.get("budget")
      if a is None or tree is None or not budget:
          return
