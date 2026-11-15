@@ -16,7 +16,7 @@ Say the GPU, the CPU, the memory, the tag and how the number was taken.
 
 ## A bug
 
-Open an issue with the launch line, the tag and the part of the server log around the failure.
+Open an issue with the "Bug" template: the launch line, the tag and the part of the server log around the failure.
 `serve.sh` prints the log's path when it starts.
 A suspected cause helps but is not needed.
 
@@ -49,9 +49,46 @@ python3 tools/lend-transition-fences-test.py
 The CI job `apply` also applies every patch to the pinned SGLang commit.
 The full list of tests, and what each needs, is in [docs/qualification.md](docs/qualification.md#tests).
 
-If your change touches what the model computes, say how its output was compared: `tools/nll.py` against `tools/nll-ref-1017.json` is the measure this repository uses.
-If it changes speed, give the number before and after on the same machine, and say which machine.
 A change you could not run on a GPU is still welcome. Say so, and we run it on ours.
+
+## The smallest check for your change
+
+You do not need the whole of `tools/qualify.sh` for every change.
+Pick the row that matches what you touched.
+The rows from the NLL down run against a server started with `./serve.sh`.
+
+| what you changed | the check | what it tells |
+|---|---|---|
+| a tool, a document, a test | the two CPU tests above | nothing else is needed |
+| a patch file | the CPU tests, and CI's `apply` | the whole set still applies to the pinned SGLang commit |
+| launching, loading, a switch's default | `MODEL=<dir> tools/check.sh` | the server comes up and answers one request; it starts and stops the server itself |
+| what the model computes | `python tools/nll.py score <dir> served.json`, then `python tools/nll.py compare tools/nll-ref-1017.json served.json` | how far the served model is from the reference implementation |
+| decode speed | `python tools/bench.py` | the median of four 1,024-token requests |
+| prefill speed | `python tools/bench.py --prefill-only --lengths 35000` | one 35,000-token prompt of random ids |
+| the prefix cache | the same prompt twice, or [tools/qualify-cache.py](docs/qualification.md#multi-session-prefix-cache-qualification) | the second read comes from the cache |
+| tool calls, the chat template | `python tools/tool-call-check.py` | calls, streamed calls and results round-trip |
+
+Two things make a number mean something:
+
+- Compare on one machine, before and after. Say which machine.
+- Launches of one build differ by about 0.002 to 0.005 in NLL, because the experts held on the GPU differ. A difference inside that is no difference.
+
+A probe of the prefix cache has to generate a few tokens past the prompt.
+A request that ends inside its prefill is stored differently from one that decodes.
+
+To see one tier 1 feature's effect, turn it off with its switch in [docs/tier1.md](docs/tier1.md), where it has one, and run the same row again.
+
+## Labels
+
+| label | meaning |
+|---|---|
+| `qualification` | a `tools/qualify.sh` report |
+| `data point` | a measurement taken another way |
+| `bug` | something fails or computes wrongly |
+| `fixed in main` | the fix is on `main` and waits for the next tag; the issue closes with the tag's name |
+| `question` | a question about a machine or a configuration |
+| `enhancement` | a new feature or kernel |
+| `hardware we lack` | we cannot run this here; a result from a machine that can is what moves it |
 
 ## What happens next
 
