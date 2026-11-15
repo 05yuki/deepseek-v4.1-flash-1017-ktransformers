@@ -1,4 +1,4 @@
-From d5671a3ffc208260b4137611737dfc6ade6d1a99 Mon Sep 17 00:00:00 2001
+From 1c836560d9cb63c9e012336312da1ec68ba8cbf5 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Thu, 29 Oct 2026 21:20:02 +0900
 Subject: [PATCH] cpu-gpu-overlap: the shared expert forks after the CPU
@@ -43,7 +43,7 @@ Claude-Session: https://claude.ai/code/session_01GYXChrDp1ydY24uuGvf2k2
  create mode 100644 python/sglang/srt/layers/moe/kt_handoff_pack.py
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 4e26649c..e0ccb123 100644
+index 33c5e823..a790959d 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -7,6 +7,7 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
@@ -66,7 +66,7 @@ index 4e26649c..e0ccb123 100644
  from sglang.srt.layers.moe.kt_stream_prefill import stream_prefill_for
  from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
  from sglang.srt.runtime_context import (
-@@ -447,9 +453,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -453,9 +459,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          # <prefix>-rank<r>.pt every 30 s. SGLang's expert distribution recorder
          # never sees the V4 router's ids (09-13); this does.
          # Submit forward task to CPU (non-blocking)

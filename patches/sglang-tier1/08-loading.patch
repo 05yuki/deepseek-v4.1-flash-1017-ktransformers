@@ -1,4 +1,4 @@
-From 53521b30b7880abf9dbd3b2a2804d78f17699541 Mon Sep 17 00:00:00 2001
+From 29df4fa820456505cfe34932da79863e6fedc0ca Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:35 +0900
 Subject: [PATCH] loading: skip the CPU-only experts in the GPU loader, read
@@ -30,10 +30,10 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  3 files changed, 250 insertions(+), 2 deletions(-)
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index b46d5456..3b7d2af1 100644
+index 4aa6682b..174d9067 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-@@ -38,6 +38,42 @@ except ImportError:
+@@ -39,6 +39,42 @@ except ImportError:
      KTRANSFORMERS_AVAILABLE = False
  
  
@@ -76,7 +76,7 @@ index b46d5456..3b7d2af1 100644
  @dataclass
  class KTConfig:
      """Configuration for KTransformers heterogeneous computing CPU part.
-@@ -257,7 +293,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -263,7 +299,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                  chunked_prefill_size=self.kt_config.chunked_prefill_size,
                  method=self.kt_config.method,
                  max_deferred_experts_per_token=layer_max_deferred,
@@ -93,7 +93,7 @@ index b46d5456..3b7d2af1 100644
              )
  
      def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-@@ -267,7 +312,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -273,7 +318,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
              layer: The MoE layer module
          """
          # 1. Process GPU weights
@@ -106,7 +106,7 @@ index b46d5456..3b7d2af1 100644
              self.gpu_method.process_weights_after_loading(layer)
  
          # 2. Load CPU weights using KT wrapper
-@@ -284,6 +333,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -290,6 +339,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                  .physical_to_logical_map_cpu[self.kt_config.layer_idx]
                  .contiguous()
              )

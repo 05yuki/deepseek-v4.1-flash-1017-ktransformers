@@ -1,0 +1,45 @@
+From 55b8b9b19a18dbff35e4b7e87470648d90e13089 Mon Sep 17 00:00:00 2001
+From: 05yuki <ceu.azul.samu@gmail.com>
+Date: Sun, 15 Nov 2026 13:02:03 +0900
+Subject: [PATCH] kt: a draft model's MoE layers stay out of the KT wrapper
+
+With --kt-weight-path set, every FusedMoE was wrapped, the draft's too. A DSPARK
+draft then had its GPU expert parameters sized by --kt-num-gpu-experts and its
+weight load indexed past them (IndexError in _weight_loader_impl).
+
+create_kt_config_from_server_args returns None inside draft_model_build_scope:
+the draft keeps its own quant method and loads all its experts from the
+checkpoint.
+
+Reported in 05yuki/deepseek-v4.1-flash-1017-ktransformers#15.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AAxFWpfZtGstqL9XQCStqw
+---
+ python/sglang/srt/layers/moe/kt_ep_wrapper.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+index b46d5456..4aa6682b 100644
+--- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
++++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+@@ -17,6 +17,7 @@ from sglang.srt.arg_groups.model_override_base import model_config_of
+ from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+ from sglang.srt.runtime_context import (
+     get_exec,
++    get_flags,
+     get_parallel,
+     get_schedule,
+ )
+@@ -78,6 +79,11 @@ def create_kt_config_from_server_args(
+     """
+     if get_exec().moe.kt_weight_path is None:
+         return None
++    # A draft model built in draft_model_build_scope (DSPARK, DFLASH) reads its own
++    # experts from the checkpoint. --kt-weight-path holds the target's layers and
++    # --kt-num-gpu-experts sizes the target's GPU side; neither describes the draft.
++    if get_flags().moe.in_speculative_scope:
++        return None
+ 
+     num_layers = getattr(
+         model_config_of(server_args).hf_config, "num_hidden_layers", None

@@ -1,4 +1,4 @@
-From 6dd06ebaf96e481ad49ff1899d57aaa6be8dd26b Mon Sep 17 00:00:00 2001
+From c4c3b43b1a910cce7cc2e3a3a7d527add3c2cb0f Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Wed, 4 Nov 2026 20:44:04 +0900
 Subject: [PATCH] gguf-lend: the lends, the streamed prefill and the hot cache
@@ -32,7 +32,7 @@ With a GGUF pack the calibration server (KT_PREFILL_LEND_CALIBRATING=1) skips th
  create mode 100644 python/sglang/srt/layers/moe/kt_stream_prefill_gguf_nvme.py
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index e0ccb123..e3ef36bd 100644
+index a790959d..e14d8452 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -14,12 +14,17 @@ from typing import TYPE_CHECKING, Optional
@@ -53,7 +53,7 @@ index e0ccb123..e3ef36bd 100644
  from sglang.srt.layers.moe.kt_stream_prefill import stream_prefill_for
  from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
  from sglang.srt.runtime_context import (
-@@ -330,7 +335,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -336,7 +341,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
              gpu_mask = torch.zeros(num_experts, dtype=torch.bool)
              # kt_kv_hot_lend's dynamic resident rows: kt-kernel loads every expert, the
              # routes say what it computes (-1 for what the GPU takes)
@@ -64,7 +64,7 @@ index e0ccb123..e3ef36bd 100644
                  gpu_mask[: self.num_gpu_experts] = True
              KT_LAYERS[self.kt_config.layer_idx] = self
              self.wrapper = KTMoEWrapper(
-@@ -399,6 +406,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -405,6 +412,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
              from sglang.srt.layers.moe.kt_stream_prefill import stream_prefill_init_early
  
              stream_prefill_init_early(self, layer)
@@ -72,7 +72,7 @@ index e0ccb123..e3ef36bd 100644
  
      def create_moe_runner(
          self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
-@@ -439,7 +447,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -445,7 +453,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
              "Only SiLU activation is supported."
          )
  
@@ -81,7 +81,7 @@ index e0ccb123..e3ef36bd 100644
              return
  
          x = dispatch_output.hidden_states
-@@ -484,7 +492,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -490,7 +498,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          Returns:
              CPU expert computation results
          """
@@ -90,7 +90,7 @@ index e0ccb123..e3ef36bd 100644
              return torch.zeros_like(x)
  
          # Wait for CPU computation and retrieve results
-@@ -570,6 +578,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -576,6 +584,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          # their slots, and to the CPU at weight 0
          hot = kt_kv_hot_lend.route(self, dispatch_output) if streamer is None else None
  
@@ -110,7 +110,7 @@ index e0ccb123..e3ef36bd 100644
          # Step 1: Submit CPU expert computation (non-blocking)
          if streamer is None and self.tp_rank == 0:
              self.submit(layer, hot[0] if hot is not None else dispatch_output)
-@@ -608,7 +629,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -614,7 +635,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          # experts (--kt-num-gpu-experts 0, every slot given to the streamer
          # and the KV pool) there is nothing to run and the FlashInfer MXFP4
          # runner refuses a zero-expert workspace (09-16).
@@ -122,7 +122,7 @@ index e0ccb123..e3ef36bd 100644
              gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
              output = gpu_combine_input.hidden_states
              if streamer is not None and _hot_check:
-@@ -622,7 +646,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -628,7 +652,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
  
          # Step 4: Synchronize CPU results and merge with GPU results
          if streamer is not None:

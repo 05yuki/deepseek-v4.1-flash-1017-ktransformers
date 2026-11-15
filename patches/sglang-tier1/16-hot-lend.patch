@@ -1,4 +1,4 @@
-From 4fd288f50e1f209e1c6a94d02355615c6ca7e1ac Mon Sep 17 00:00:00 2001
+From c120264748fe1832bd20518705ed87ff3eba0060 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] hot-lend: more hot experts in the KV pool's free pages
@@ -133,10 +133,10 @@ index 4c73f505..894a5c74 100644
              yield expert_id
  
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index f4d1b094..4e26649c 100644
+index 8aacaec7..33c5e823 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-@@ -308,6 +308,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -314,6 +314,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
              params_dtype=params_dtype,
              **extra_weight_attrs,
          )
@@ -149,7 +149,7 @@ index f4d1b094..4e26649c 100644
  
          # 2. Initialize KT wrapper for CPU experts
          # CPU experts: num_gpu_experts to num_experts-1
-@@ -316,7 +322,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -322,7 +328,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
              # GPU-resident experts instead of num_gpu_experts (SFT-only).
              # GPU experts occupy ordinals 0..num_gpu_experts-1 (see above).
              gpu_mask = torch.zeros(num_experts, dtype=torch.bool)
@@ -161,7 +161,7 @@ index f4d1b094..4e26649c 100644
              KT_LAYERS[self.kt_config.layer_idx] = self
              self.wrapper = KTMoEWrapper(
                  layer_idx=self.kt_config.layer_idx,
-@@ -373,6 +382,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -379,6 +388,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
              )
              _drop_checkpoint_cache(self.kt_config.layer_idx, getattr(self.kt_config, "num_layers", 0) or 0)
              self.wrapper.load_weights(physical_to_logical_map_cpu)
@@ -172,7 +172,7 @@ index f4d1b094..4e26649c 100644
          # Last layer loaded on this rank: optionally build the streamer and
          # pin every layer's arenas now (KT_GPU_STREAM_EARLY_INIT).
          num_layers = getattr(self.kt_config, "num_layers", None)
-@@ -501,6 +514,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -507,6 +520,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          # experts are streamed to the GPU in groups instead of computed here
          # (kt_stream_prefill.py). The ids are taken before the mask below
          # mutates them in place.
@@ -183,7 +183,7 @@ index f4d1b094..4e26649c 100644
          streamer = stream_prefill_for(self, layer, x.shape[0])
          cpu_share = False
          if streamer is not None:
-@@ -514,9 +531,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -520,9 +537,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                  # Everything below the cutoff is streamed or resident: send it
                  # to GPU expert 0 at weight 0, which kt-kernel skips.
                  theirs = physical_ids < cutoff
@@ -196,7 +196,7 @@ index f4d1b094..4e26649c 100644
                          topk_weights=torch.where(
                              theirs, torch.zeros_like(topk_output.topk_weights), topk_output.topk_weights
                          ),
-@@ -525,15 +544,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -531,15 +550,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                  self.submit(layer, cpu_do)
                  cpu_share = True
  
@@ -221,7 +221,7 @@ index f4d1b094..4e26649c 100644
  
          # Create modified dispatch output for GPU computation
          if _gpu_mask_zero:
-@@ -569,6 +595,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -575,6 +601,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                  hot_reference_check(self, layer, x, physical_ids, topk_output.topk_weights, output, streamer)
          else:
              output = torch.zeros_like(x)
@@ -230,7 +230,7 @@ index f4d1b094..4e26649c 100644
  
          # Step 4: Synchronize CPU results and merge with GPU results
          if streamer is not None:
-@@ -579,6 +607,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -585,6 +613,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
              cpu_output = self.sync(x)
              output = output + cpu_output
  

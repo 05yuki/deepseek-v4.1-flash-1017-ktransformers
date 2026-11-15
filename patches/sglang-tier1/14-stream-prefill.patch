@@ -1,4 +1,4 @@
-From d29bf2205822e6e56ae0a1d3535d0114e863dfe1 Mon Sep 17 00:00:00 2001
+From 13ab56f009307f97281e25db77e4184fd9a40431 Mon Sep 17 00:00:00 2001
 From: 05yuki <ceu.azul.samu@gmail.com>
 Date: Mon, 19 Oct 2026 16:44:36 +0900
 Subject: [PATCH] stream-prefill: stream the CPU experts to the GPU for long
@@ -53,7 +53,7 @@ Claude-Session: https://claude.ai/code/session_01C2UBZdnrDZSBh8yQz8rc9g
  create mode 100644 python/sglang/srt/layers/moe/kt_stream_prefill.py
 
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 9363f0e9..f4d1b094 100644
+index ff1cba90..8aacaec7 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Optional
@@ -64,7 +64,7 @@ index 9363f0e9..f4d1b094 100644
  from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
  from sglang.srt.runtime_context import (
      get_exec,
-@@ -153,7 +154,12 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
+@@ -159,7 +160,12 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
  
  _routing_dump_prefix = os.environ.get("KT_ROUTING_DUMP")
  _gpu_mask_zero = os.environ.get("KT_GPU_MASK_ZERO") == "1"
@@ -77,7 +77,7 @@ index 9363f0e9..f4d1b094 100644
  
  
  def _routing_count(device, layer_idx, topk_ids, rank):
-@@ -184,10 +190,12 @@ def _routing_count(device, layer_idx, topk_ids, rank):
+@@ -190,10 +196,12 @@ def _routing_count(device, layer_idx, topk_ids, rank):
  
  
  def _kt_swiglu_kwargs(layer: torch.nn.Module) -> dict:
@@ -94,7 +94,7 @@ index 9363f0e9..f4d1b094 100644
      if os.environ.get("KT_SWIGLU_CLAMP", "1") == "0":
          return {}
      cfg = getattr(layer, "moe_runner_config", None)
-@@ -197,7 +205,7 @@ def _kt_swiglu_kwargs(layer: torch.nn.Module) -> dict:
+@@ -203,7 +211,7 @@ def _kt_swiglu_kwargs(layer: torch.nn.Module) -> dict:
      if getattr(cfg, "gemm1_alpha", None) is not None or getattr(cfg, "gemm1_clamp_limit", None) is not None:
          raise RuntimeError(
              "KT_SWIGLU_CLAMP: this layer uses gemm1_alpha/gemm1_clamp_limit, which "
@@ -103,7 +103,7 @@ index 9363f0e9..f4d1b094 100644
          )
      return {"swiglu_limit": float(limit)}
  
-@@ -309,6 +317,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -315,6 +323,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
              # GPU experts occupy ordinals 0..num_gpu_experts-1 (see above).
              gpu_mask = torch.zeros(num_experts, dtype=torch.bool)
              gpu_mask[: self.num_gpu_experts] = True
@@ -111,7 +111,7 @@ index 9363f0e9..f4d1b094 100644
              self.wrapper = KTMoEWrapper(
                  layer_idx=self.kt_config.layer_idx,
                  num_experts=num_experts,
-@@ -364,6 +373,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -370,6 +379,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
              )
              _drop_checkpoint_cache(self.kt_config.layer_idx, getattr(self.kt_config, "num_layers", 0) or 0)
              self.wrapper.load_weights(physical_to_logical_map_cpu)
@@ -125,7 +125,7 @@ index 9363f0e9..f4d1b094 100644
  
      def create_moe_runner(
          self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
-@@ -481,9 +497,37 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -487,9 +503,37 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          if _routing_dump_prefix and self.tp_rank == 0:
              _routing_count(x.device, self.kt_config.layer_idx, topk_output.topk_ids, self.tp_rank)
  
@@ -164,7 +164,7 @@ index 9363f0e9..f4d1b094 100644
              self.submit(layer, dispatch_output)
  
          # Step 2: Prepare GPU computation by masking CPU expert IDs
-@@ -495,10 +539,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -501,10 +545,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          if _gpu_mask_zero:
              # KT_GPU_MASK_ZERO=1: the Marlin MoE path cannot take -1 ids (its
              # alignment kernels index weights with them: illegal address at
@@ -180,7 +180,7 @@ index 9363f0e9..f4d1b094 100644
              m = masked_topk_ids < 0
              masked_topk_output = topk_output._replace(
                  topk_ids=torch.where(m, torch.zeros_like(masked_topk_ids), masked_topk_ids).to(torch.int64),
-@@ -512,15 +557,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -518,15 +563,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
  
          # Step 3: Execute GPU expert computation (any quantization method)
          # This runs in parallel with CPU computation. With no resident GPU

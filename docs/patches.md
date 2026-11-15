@@ -63,6 +63,7 @@ patch goes and the pin moves past it.
 | `11-v41-kv-layout` | [#45851](https://github.com/sgl-project/sglang/pull/45851) |
 | `12-low-ratio-pool-bytes` | dropped 2026-10-28: SGLang main prices the ratio-1/2 entry by its own layout ([#41275](https://github.com/sgl-project/sglang/pull/41275)), the change #45931 made, and counts the pages the pool reserves on top |
 | `13-sm89-attention` | [SM89 fallback and validation](sm89.md) |
+| `14-draft-no-kt` | not sent. A DSPARK or DFLASH draft model loads its own experts from the checkpoint; the KT wrapper sized them by `--kt-num-gpu-experts` and the load failed ([#15](https://github.com/05yuki/deepseek-v4.1-flash-1017-ktransformers/issues/15)) |
 
 ### KTransformers wrapper
 
